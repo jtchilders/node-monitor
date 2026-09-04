@@ -21,6 +21,14 @@ Design constraints (see PLANNING.md sections 4.2, 4.2a, 14.2):
 * **Exit codes** (PLANNING.md 14.2): 0 ok, 2 bad args, 3 /proc unreadable,
   4 self-abort on timeout.
 
+TEST-ONLY: the `NODE_MONITOR_PROC_ROOT` environment variable overrides the
+proc filesystem root (see `PROC_ROOT` below). It exists so the subprocess
+tests can point a real invocation of this file at a synthetic tree on a
+macOS dev machine that has no `/proc`. Production never sets it; the daemon
+never passes it. Do not use it as a CLI flag -- the daemon builds the ssh
+command line, and a flag risks being set by accident in production, whereas
+an env var reads as obviously test-only.
+
 Privacy: the node is a shared ALCF login node with no expectation of user
 privacy (PLANNING.md 5.6), and real usernames are retained deliberately. Raw
 argv is nonetheless dropped by default (`--drop-raw-args`, PLANNING.md
@@ -52,7 +60,13 @@ MIN_PYTHON = (3, 9)
 # alternative -- threading a root argument through every reader -- would add
 # a parameter to functions whose signatures are otherwise self-documenting,
 # to serve a need that exists only in tests.
-PROC_ROOT = "/proc"
+#
+# Read once at import time from NODE_MONITOR_PROC_ROOT so that the in-process
+# tests (which monkeypatch this module attribute directly) and the subprocess
+# tests (which cannot reach a module attribute, only the process env) share
+# one override mechanism. Unset in production -- the daemon never sets this
+# var -- so PROC_ROOT is "/proc" on every real login node.
+PROC_ROOT = os.environ.get("NODE_MONITOR_PROC_ROOT", "/proc")
 
 
 def _proc(*parts):
@@ -410,7 +424,7 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
       "pids_seen": 0,
       "stat_unreadable": 0,
       "stat_unparseable": 0,
-      "cmdline_unreadable": 0,
+      "kernel_thread": 0,
       "cmdline_empty": 0,
       "owner_unresolved": 0,
       "vanished": 0,
@@ -446,15 +460,24 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
 
       raw_cmdline = _read_text(proc_dir + "/cmdline")
       if raw_cmdline is None:
-         coverage["cmdline_unreadable"] += 1
-         cmdline = ""
-      else:
-         cmdline = raw_cmdline.replace("\x00", " ").strip()
-         if not cmdline:
-            # Kernel threads have an empty cmdline. They are not user
-            # behavior and are excluded from the census entirely.
-            coverage["cmdline_empty"] += 1
-            continue
+         # Unreadable is indistinguishable here from "file absent": _read_text
+         # collapses EACCES/EPERM (denied) and ENOENT/ESRCH (absent) into the
+         # same None, and on Linux /proc/<pid>/cmdline is normally
+         # world-readable, so a denial would be rare and its distinct cause
+         # is not worth inventing a probe into file existence to detect. Both
+         # outcomes get the same conservative treatment as an empty cmdline
+         # below: exclude the row, count it as a kernel thread.
+         coverage["kernel_thread"] += 1
+         continue
+      cmdline = raw_cmdline.replace("\x00", " ").strip()
+      if not cmdline:
+         # Kernel threads have a cmdline file that exists but reads empty.
+         # Same meaning as the file being absent above: not user behavior,
+         # excluded from the census, counted the same way so an analyst
+         # cannot tell the two apart from coverage alone -- because on this
+         # node, neither could we.
+         coverage["cmdline_empty"] += 1
+         continue
 
       try:
          state = tail[0]

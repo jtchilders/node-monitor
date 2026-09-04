@@ -37,6 +37,37 @@ def proc_root(tmp_path, monkeypatch):
    return _build
 
 
+@pytest.fixture
+def fake_proc_env(tmp_path):
+   """Build a synthetic /proc tree plus the env var to point a real
+   subprocess invocation of the probe at it.
+
+   The in-process `proc_root` fixture above monkeypatches the module
+   attribute, which a child process started by `subprocess.run` cannot see.
+   `NODE_MONITOR_PROC_ROOT` is the only channel that reaches a subprocess,
+   which is exactly why it exists (see remote_probe.py's module docstring).
+   This is what lets TestExitCodes and TestPayloadContract run on macOS,
+   which has no real /proc, while still exercising the real subprocess exit
+   codes and stdout contract -- not a monkeypatched in-process call.
+
+   Populated with enough processes to give TestPayloadContract a non-empty
+   `processes` list: an interactive shell, a vscode-server node process (a
+   daemon, no tty), an sshd session, and a kernel thread (absent cmdline)
+   to prove exclusion survives the real CLI path too.
+   """
+   root = str(tmp_path / "proc")
+   fake_proc.write_proc(root, [
+      {"pid": 2, "comm": "kthreadd", "cmdline": None},
+      {"pid": 100, "comm": "bash", "cmdline": "-bash", "tty_nr": 34816},
+      {"pid": 200, "comm": "node", "tty_nr": 0, "ppid": 1,
+       "cmdline": "/home/u/.vscode-server/bin/a/node server-main.js"},
+      {"pid": 300, "comm": "sshd", "cmdline": "sshd: someuser@pts/12"},
+   ])
+   env = dict(os.environ)
+   env["NODE_MONITOR_PROC_ROOT"] = root
+   return env
+
+
 # --------------------------------------------------------------------------
 # /proc/<pid>/stat parsing -- the highest-risk parser in the probe
 # --------------------------------------------------------------------------
@@ -161,7 +192,7 @@ class TestCensus:
       assert by_pid[200]["behavior"] == "daemon"
 
    def test_kernel_threads_excluded(self, proc_root):
-      """Empty cmdline = kernel thread. Not user behavior; must not appear.
+      """Absent cmdline = kernel thread. Not user behavior; must not appear.
 
       Counting them would add hundreds of phantom 'other' processes per node.
       """
@@ -172,7 +203,53 @@ class TestCensus:
       rows, coverage = probe._collect_processes(
          {0: "root"}, drop_raw_args=True, deadline=None)
       assert [row["pid"] for row in rows] == [100]
+      assert coverage["kernel_thread"] == 1
+      assert coverage["pids_seen"] == 2
+
+   def test_empty_cmdline_file_also_excluded(self, proc_root):
+      """cmdline file present but empty is the same signal as file absent.
+
+      On a real Linux node a kernel thread's cmdline file exists and reads
+      empty; the test fixture's 'absent' case simulates the same thing a
+      different way. Both must be excluded, and this project keeps them in
+      separate coverage buckets (kernel_thread vs cmdline_empty) only
+      because the fixture can express both shapes -- not because an analyst
+      is meant to draw a distinction between them.
+      """
+      proc_root([
+         {"pid": 3, "comm": "kworker", "cmdline": ""},
+         {"pid": 100, "comm": "bash", "cmdline": "-bash"},
+      ])
+      rows, coverage = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert [row["pid"] for row in rows] == [100]
       assert coverage["cmdline_empty"] == 1
+      assert coverage["pids_seen"] == 2
+
+   def test_denied_cmdline_treated_as_kernel_thread(self, proc_root, monkeypatch):
+      """EACCES on cmdline is indistinguishable from absent here -- and rare.
+
+      /proc/<pid>/cmdline is normally world-readable on Linux, so a real
+      denial would be unusual. _read_text collapses denial and absence into
+      the same None; rather than invent a way to tell them apart, the probe
+      picks the conservative reading (exclude, count as kernel_thread).
+      """
+      root = proc_root([
+         {"pid": 100, "comm": "bash", "cmdline": "-bash"},
+         {"pid": 300, "comm": "secret", "cmdline": "secret"},
+      ])
+      real_read = probe._read_text
+
+      def denying_read(path):
+         if path.endswith(os.path.join("300", "cmdline")):
+            return None
+         return real_read(path)
+
+      monkeypatch.setattr(probe, "_read_text", denying_read)
+      rows, coverage = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert [row["pid"] for row in rows] == [100]
+      assert coverage["kernel_thread"] == 1
       assert coverage["pids_seen"] == 2
 
    def test_raw_args_dropped_by_default(self, proc_root):
@@ -286,20 +363,32 @@ class TestArgs:
 
 
 class TestExitCodes:
-   def _run(self, args, stdin=""):
+   def _run(self, args, stdin="", env=None):
       return subprocess.run(
          [sys.executable, PROBE_PATH] + args,
-         input=stdin, capture_output=True, text=True, timeout=60)
+         input=stdin, capture_output=True, text=True, timeout=60, env=env)
 
-   def test_success_emits_one_json_line(self):
-      result = self._run(["--loop", "counter"])
-      assert result.returncode == 0
+   def test_success_emits_one_json_line(self, fake_proc_env):
+      result = self._run(["--loop", "counter"], env=fake_proc_env)
+      assert result.returncode == 0, result.stderr
       lines = [line for line in result.stdout.split("\n") if line.strip()]
       assert len(lines) == 1, "probe must emit exactly one line"
       json.loads(lines[0])
 
    def test_bad_args_exit_2(self):
       assert self._run(["--loop", "bogus"]).returncode == 2
+
+   def test_bad_proc_root_exit_3(self, tmp_path):
+      """Confirms the exit-3 contract without depending on a real /proc.
+
+      Points the probe at a directory that exists but has no uptime file --
+      the same failure mode a denied/unmounted /proc produces on Linux.
+      """
+      env = dict(os.environ)
+      env["NODE_MONITOR_PROC_ROOT"] = str(tmp_path / "empty")
+      os.makedirs(env["NODE_MONITOR_PROC_ROOT"])
+      result = self._run(["--loop", "counter"], env=env)
+      assert result.returncode == 3
 
    def test_version_flag(self):
       result = self._run(["--version"])
@@ -313,15 +402,15 @@ class TestExitCodes:
 # --------------------------------------------------------------------------
 
 class TestPayloadContract:
-   def _payload(self, loop):
+   def _payload(self, loop, env):
       result = subprocess.run(
          [sys.executable, PROBE_PATH, "--loop", loop],
-         capture_output=True, text=True, timeout=60)
+         capture_output=True, text=True, timeout=60, env=env)
       assert result.returncode == 0, result.stderr
       return json.loads(result.stdout)
 
-   def test_counter_payload_shape(self):
-      payload = self._payload("counter")
+   def test_counter_payload_shape(self, fake_proc_env):
+      payload = self._payload("counter", fake_proc_env)
       for key in ("probe_version", "loop", "hostname_fqdn", "uptime_sec",
                   "monotonic_sec", "wall_clock_utc", "probe_self_seconds",
                   "counters", "python_version", "drop_raw_args"):
@@ -329,25 +418,25 @@ class TestPayloadContract:
       assert payload["loop"] == "counter"
       assert payload["probe_version"] == probe.PROBE_VERSION
 
-   def test_counter_loop_emits_no_processes(self):
+   def test_counter_loop_emits_no_processes(self, fake_proc_env):
       """The counter loop must stay cheap.
 
       If it ever starts walking /proc, the two loops cost the same and the
       whole two-cadence design is pointless.
       """
-      payload = self._payload("counter")
+      payload = self._payload("counter", fake_proc_env)
       assert "processes" not in payload
       assert "census_coverage" not in payload
 
-   def test_census_payload_has_processes_and_coverage(self):
-      payload = self._payload("census")
+   def test_census_payload_has_processes_and_coverage(self, fake_proc_env):
+      payload = self._payload("census", fake_proc_env)
       assert isinstance(payload["processes"], list)
-      assert payload["processes"], "census on a live host found no processes"
+      assert payload["processes"], "census on the fake proc found no processes"
       coverage = payload["census_coverage"]
       assert coverage["pids_seen"] >= len(payload["processes"])
 
-   def test_process_row_fields(self):
-      payload = self._payload("census")
+   def test_process_row_fields(self, fake_proc_env):
+      payload = self._payload("census", fake_proc_env)
       required = {
          "pid", "ppid", "uid", "username", "comm", "category", "behavior",
          "activity", "activity_confidence", "project_path_hint",
@@ -358,30 +447,30 @@ class TestPayloadContract:
          missing = required - set(row)
          assert not missing, "row missing %s" % missing
 
-   def test_identity_pair_present(self):
+   def test_identity_pair_present(self, fake_proc_env):
       """Delta math keys on (pid, start_time_ticks), never pid alone.
 
       A reused PID with lower cumulative CPU than its predecessor yields a
       negative delta that gets silently clamped to zero.
       """
-      payload = self._payload("census")
+      payload = self._payload("census", fake_proc_env)
       for row in payload["processes"][:20]:
          assert isinstance(row["pid"], int)
          assert isinstance(row["start_time_ticks"], int)
 
-   def test_no_raw_cmdline_by_default(self):
-      payload = self._payload("census")
+   def test_no_raw_cmdline_by_default(self, fake_proc_env):
+      payload = self._payload("census", fake_proc_env)
       assert payload["drop_raw_args"] is True
       for row in payload["processes"]:
          assert "cmdline" not in row
 
-   def test_stdout_is_pure_json(self):
+   def test_stdout_is_pure_json(self, fake_proc_env):
       """Anything else on stdout makes the daemon's parse fail.
 
       Lmod and XALT both print to stdout on some ALCF shells.
       """
       result = subprocess.run(
          [sys.executable, PROBE_PATH, "--loop", "counter"],
-         capture_output=True, text=True, timeout=60)
+         capture_output=True, text=True, timeout=60, env=fake_proc_env)
       assert result.stdout.count("\n") == 1
       json.loads(result.stdout)
