@@ -8,6 +8,7 @@ denial, coverage accounting, and the JSON contract the daemon depends on.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -588,6 +589,38 @@ class TestHwinfoLoop:
             "forbidden instantaneous-frequency field found: %s" % forbidden)
       # Confirm the allowed static field is exactly the one we expect.
       assert "cpu_max_freq_khz" in payload["hardware"]
+
+   def test_hanging_nvidia_smi_self_aborts_exit_4_not_0(self, tmp_path):
+      """A wedged nvidia-smi must not let the probe report success past
+      its own SIGALRM budget.
+
+      Regression for review run #14: the broad `except Exception` around
+      the nvidia-smi subprocess call also caught the probe's own
+      ProbeTimeout, so a hanging nvidia-smi under a short --max-seconds
+      returned exit 0 with a full JSON line instead of the required
+      exit-4 self-abort. Reproduced here with a fake nvidia-smi that
+      sleeps far longer than the global budget.
+      """
+      bin_dir = tmp_path / "fake-bin"
+      bin_dir.mkdir()
+      fake_nvidia_smi = bin_dir / "nvidia-smi"
+      # Absolute path to the real sleep(1) -- replacing PATH wholesale with
+      # bin_dir (matching the "PATH has only nvidia-smi on it" fixture
+      # convention used elsewhere in this class) means a bare "sleep" in the
+      # script would fail to resolve and exit immediately instead of hanging.
+      sleep_bin = shutil.which("sleep") or "/bin/sleep"
+      fake_nvidia_smi.write_text("#!/bin/sh\n%s 10\n" % sleep_bin)
+      fake_nvidia_smi.chmod(0o755)
+      env = self._hwinfo_env(tmp_path)
+      env["PATH"] = str(bin_dir)
+      result = subprocess.run(
+         [sys.executable, PROBE_PATH, "--loop", "hwinfo",
+          "--max-seconds", "0.1"],
+         capture_output=True, text=True, timeout=60, env=env)
+      assert result.returncode == 4, (
+         "expected exit 4 (self-abort) got %r; stdout=%r stderr=%r"
+         % (result.returncode, result.stdout, result.stderr))
+      assert result.stdout == ""
 
 
 # --------------------------------------------------------------------------

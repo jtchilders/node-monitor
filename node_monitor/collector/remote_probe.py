@@ -553,10 +553,17 @@ def _collect_gpus_nvidia_smi():
       result = _subprocess.run(
          [binary, "--query-gpu=name", "--format=csv,noheader"],
          capture_output=True, text=True, timeout=3)
+   except ProbeTimeout:
+      # The probe's own SIGALRM self-abort must win over "swallow nvidia-smi
+      # failures" -- otherwise a hung nvidia-smi can eat the global timeout
+      # and the probe reports success (exit 0) after the deadline instead of
+      # honoring the required exit-4 self-abort contract.
+      raise
    except Exception:
-      # Anything -- hang, missing driver, permission -- must not surface as
-      # a probe failure. Login nodes normally have no GPU and no nvidia-smi;
-      # [] is the expected answer, not a degraded one.
+      # Anything else -- ordinary hang covered by our own timeout=3, missing
+      # driver, permission -- must not surface as a probe failure. Login
+      # nodes normally have no GPU and no nvidia-smi; [] is the expected
+      # answer, not a degraded one.
       return []
    if result.returncode != 0:
       return []
