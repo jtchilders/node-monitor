@@ -6,6 +6,7 @@ focus on the failure modes that are silent: comm-field parsing, permission
 denial, coverage accounting, and the JSON contract the daemon depends on.
 """
 
+import errno
 import json
 import os
 import shutil
@@ -731,6 +732,49 @@ class TestHwinfoCollectors:
       monkeypatch.setattr(
          probe, "_collect_gpus_nvidia_smi", lambda: [])
       assert probe._collect_gpus() == []
+
+   def test_collect_net_ifaces_survives_unallowlisted_oserror(
+         self, tmp_path, monkeypatch):
+      """The broad catch in _collect_net_ifaces() must turn ANY read
+      failure into null, not just the errno values _read_text() already
+      allowlists (EACCES/EPERM/ENOENT/ESRCH/EINVAL/EIO/ENXIO). Forces
+      _read_text() to raise an OSError outside that allowlist (EBUSY) to
+      prove the handler here -- not _read_text()'s own allowlist -- is
+      what protects this call site.
+      """
+      sys_root = str(tmp_path / "sys")
+      fake_proc.write_sys_hwinfo(
+         sys_root, net_speeds={"hsn0": 200000, "ens10f1": None})
+      monkeypatch.setattr(probe, "SYS_ROOT", sys_root)
+      real_read_text = probe._read_text
+
+      def _raising_read_text(path):
+         if path.endswith(os.path.join("hsn0", "speed")):
+            raise OSError(errno.EBUSY, "device or resource busy")
+         return real_read_text(path)
+
+      monkeypatch.setattr(probe, "_read_text", _raising_read_text)
+      net_ifaces = probe._collect_net_ifaces()
+      assert net_ifaces["hsn0"] is None
+      assert net_ifaces["ens10f1"] is None
+
+   def test_collect_net_ifaces_reraises_probe_timeout(
+         self, tmp_path, monkeypatch):
+      """ProbeTimeout must win over the broad "read failed -> null" catch,
+      same pattern required of _collect_gpus_nvidia_smi (remote_probe.py
+      :556) -- a hung/erroring speed read must not swallow the probe's own
+      SIGALRM self-abort.
+      """
+      sys_root = str(tmp_path / "sys")
+      fake_proc.write_sys_hwinfo(sys_root, net_speeds={"hsn0": 200000})
+      monkeypatch.setattr(probe, "SYS_ROOT", sys_root)
+
+      def _timing_out_read_text(path):
+         raise probe.ProbeTimeout()
+
+      monkeypatch.setattr(probe, "_read_text", _timing_out_read_text)
+      with pytest.raises(probe.ProbeTimeout):
+         probe._collect_net_ifaces()
 
    def test_collect_gpus_nvidia_smi_hang_yields_empty(self, monkeypatch):
       """A hanging/failing nvidia-smi must never propagate -- [] always."""

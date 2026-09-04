@@ -510,6 +510,15 @@ def _collect_net_ifaces():
    the real interfaces (a bonding-driver control node, not a NIC), so it is
    skipped rather than treated as an interface with an unreadable speed --
    including it under any key would misrepresent it as a network device.
+
+   A `speed` file can also exist and still fail to read -- `lo` and other
+   down/unsupported interfaces return EINVAL, and other errno values are
+   possible beyond the allowlist `_read_text()` already treats as routine.
+   The broad catch below turns any such failure into null rather than a
+   probe-wide crash, same as a missing file. `ProbeTimeout` is re-raised
+   ahead of it -- same pattern as `_collect_gpus_nvidia_smi` at
+   remote_probe.py:556 -- so the probe's own SIGALRM self-abort still wins
+   over "swallow the read failure".
    """
    base = _sys("class", "net")
    try:
@@ -521,7 +530,12 @@ def _collect_net_ifaces():
       iface_dir = os.path.join(base, name)
       if not os.path.isdir(iface_dir):
          continue
-      text = _read_text(os.path.join(iface_dir, "speed"))
+      try:
+         text = _read_text(os.path.join(iface_dir, "speed"))
+      except ProbeTimeout:
+         raise
+      except Exception:
+         text = None
       if text is None:
          out[name] = None
          continue
