@@ -150,6 +150,15 @@ def write_proc_hwinfo(root, cpuinfo=None, meminfo=None, osrelease="6.4.0\n",
    return root
 
 
+# Sentinels for write_sys_hwinfo's net_speeds values. Ordinary values are an
+# int (readable speed) or None (directory exists, no speed file -- already
+# handled by plain ENOENT). These two model the two fleet-observed hazards
+# neither of those covers -- see polaris-login-02 enumeration in the task
+# write-up for _collect_net_ifaces.
+IFACE_AS_FILE = "fake-proc-iface-as-file"
+IFACE_UNREADABLE_SPEED = "fake-proc-iface-unreadable-speed"
+
+
 def write_sys_hwinfo(root, cpu_max_freq_khz=2000000, numa_nodes=2,
                       net_speeds=None):
    """Materialize the /sys subtree the hwinfo loop reads.
@@ -173,10 +182,30 @@ def write_sys_hwinfo(root, cpu_max_freq_khz=2000000, numa_nodes=2,
    net_dir = os.path.join(root, "class", "net")
    os.makedirs(net_dir, exist_ok=True)
    for name, speed in (net_speeds or {"bond0": 1000, "ens10f0": 1000}).items():
-      iface_dir = os.path.join(net_dir, name)
-      os.makedirs(iface_dir, exist_ok=True)
+      iface_path = os.path.join(net_dir, name)
+      if speed is IFACE_AS_FILE:
+         # bonding_masters on the real fleet: a plain bonding-driver control
+         # file that sits directly under /sys/class/net alongside the real
+         # interface directories, not an interface itself. Written as a
+         # regular file, not a directory, so a caller that assumes every
+         # listdir() entry is an interface dir gets NotADirectoryError when
+         # it tries to open <this>/speed.
+         with open(iface_path, "w") as handle:
+            handle.write("bond0\n")
+         continue
+      os.makedirs(iface_path, exist_ok=True)
+      if speed is IFACE_UNREADABLE_SPEED:
+         # lo and down/unsupported interfaces: the speed file EXISTS but the
+         # kernel returns EINVAL on read. os.path.exists() would say yes and
+         # be wrong -- mode 000 reproduces "present but unreadable" without
+         # needing to fake a specific kernel errno.
+         speed_path = os.path.join(iface_path, "speed")
+         with open(speed_path, "w") as handle:
+            handle.write("0\n")
+         os.chmod(speed_path, 0o000)
+         continue
       if speed is not None:
-         with open(os.path.join(iface_dir, "speed"), "w") as handle:
+         with open(os.path.join(iface_path, "speed"), "w") as handle:
             handle.write("%d\n" % speed)
       # speed is left absent (not written as "?") when None -- the real
       # kernel returns EINVAL on read for a down/unbonded interface, which

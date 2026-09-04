@@ -504,6 +504,12 @@ def _collect_net_ifaces():
    Some interfaces report speed as "?" at the kernel/ethtool layer -- bond
    members with no active slave, unplugged NICs. That is stored as null
    here, not the literal string, so the column stays numeric.
+
+   Measured on polaris-login-02: not every /sys/class/net entry is an
+   interface directory. `bonding_masters` is a plain FILE living alongside
+   the real interfaces (a bonding-driver control node, not a NIC), so it is
+   skipped rather than treated as an interface with an unreadable speed --
+   including it under any key would misrepresent it as a network device.
    """
    base = _sys("class", "net")
    try:
@@ -512,7 +518,10 @@ def _collect_net_ifaces():
       return {}
    out = {}
    for name in names:
-      text = _read_text(os.path.join(base, name, "speed"))
+      iface_dir = os.path.join(base, name)
+      if not os.path.isdir(iface_dir):
+         continue
+      text = _read_text(os.path.join(iface_dir, "speed"))
       if text is None:
          out[name] = None
          continue

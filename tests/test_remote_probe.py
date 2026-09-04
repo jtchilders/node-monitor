@@ -483,7 +483,7 @@ class TestPayloadContract:
 
 class TestHwinfoLoop:
    def _hwinfo_env(self, tmp_path, cpu_max_freq_khz=2000000,
-                    nvidia_gpus=None, no_sys=False):
+                    nvidia_gpus=None, no_sys=False, net_speeds=None):
       proc_root = str(tmp_path / "proc")
       sys_root = str(tmp_path / "sys")
       fake_proc.write_proc(proc_root, [])
@@ -492,7 +492,8 @@ class TestHwinfoLoop:
       env["NODE_MONITOR_PROC_ROOT"] = proc_root
       if not no_sys:
          fake_proc.write_sys_hwinfo(
-            sys_root, cpu_max_freq_khz=cpu_max_freq_khz)
+            sys_root, cpu_max_freq_khz=cpu_max_freq_khz,
+            net_speeds=net_speeds)
          env["NODE_MONITOR_SYS_ROOT"] = sys_root
       else:
          env["NODE_MONITOR_SYS_ROOT"] = str(tmp_path / "sys-does-not-exist")
@@ -589,6 +590,46 @@ class TestHwinfoLoop:
             "forbidden instantaneous-frequency field found: %s" % forbidden)
       # Confirm the allowed static field is exactly the one we expect.
       assert "cpu_max_freq_khz" in payload["hardware"]
+
+   def test_net_ifaces_survives_bonding_masters_and_unreadable_speed(
+         self, tmp_path):
+      """Regression for the crash observed on all 3 reachable Polaris login
+      nodes: `_collect_net_ifaces()` assumed every /sys/class/net entry is
+      an interface directory containing a readable `speed` file. Neither
+      holds on the real fleet:
+
+      - `bonding_masters` is a plain FILE living alongside the interface
+        dirs, not an interface -- opening `<it>/speed` raised
+        NotADirectoryError and crashed the whole probe (exit non-zero,
+        traceback on stdout instead of the required JSON line).
+      - `lo` (and other down/unsupported interfaces) has a `speed` file
+        that EXISTS but raises OSError on read; `os.path.exists()` alone
+        cannot distinguish "readable" from "present but errors".
+
+      Fails on unpatched `_collect_net_ifaces()` with the same
+      NotADirectoryError traceback that killed the probe on
+      polaris-login-02; must pass after the fix.
+      """
+      env = self._hwinfo_env(tmp_path, net_speeds={
+         "hsn0": 200000,
+         "bonding_masters": fake_proc.IFACE_AS_FILE,
+         "lo": fake_proc.IFACE_UNREADABLE_SPEED,
+         "ens10f1": None,
+      })
+      result = subprocess.run(
+         [sys.executable, PROBE_PATH, "--loop", "hwinfo"],
+         capture_output=True, text=True, timeout=60, env=env)
+      assert result.returncode == 0, (
+         "probe crashed instead of emitting JSON; stderr=%r" % result.stderr)
+      lines = [line for line in result.stdout.split("\n") if line.strip()]
+      assert len(lines) == 1, "probe must emit exactly one line"
+      net_ifaces = json.loads(lines[0])["hardware"]["net_ifaces"]
+      assert net_ifaces["hsn0"] == 200000
+      assert net_ifaces["lo"] is None
+      assert net_ifaces["ens10f1"] is None
+      assert "bonding_masters" not in net_ifaces, (
+         "bonding_masters is a control file, not an interface -- it must "
+         "not appear in net_ifaces at all")
 
    def test_hanging_nvidia_smi_self_aborts_exit_4_not_0(self, tmp_path):
       """A wedged nvidia-smi must not let the probe report success past
