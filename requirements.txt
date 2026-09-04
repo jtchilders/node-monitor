@@ -1,0 +1,15 @@
+# Core dependencies for node_monitor
+# Daemon-side only. The remote probe (node_monitor/collector/remote_probe.py)
+# MUST remain stdlib-only and py3.6-compatible (login nodes ship python 3.6.15).
+pyyaml>=6.0
+click>=8.0.0
+tabulate>=0.9.0
+python-dateutil>=2.8.0
+
+# Database
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+
+# Development and testing
+pytest>=7.0.0
+pytest-cov>=4.0.0

@@ -1,0 +1,49 @@
+# node_monitor example configuration.
+# Copy to config.yaml and edit. config.yaml is gitignored: it names hosts and
+# may carry DB connection details. Never commit it.
+#
+# This file is illustrative and intentionally contains NO IP addresses --
+# hostnames only. The daemon refuses to start on unknown keys.
+
+system: polaris
+
+nodes:
+  - polaris-login-01.hsn.cm.polaris.alcf.anl.gov
+  - polaris-login-02.hsn.cm.polaris.alcf.anl.gov
+  - polaris-login-04.hsn.cm.polaris.alcf.anl.gov
+
+collection:
+  census_interval_sec: 60
+  counter_interval_sec: 60
+  rollup_interval_sec: 60
+
+backoff:
+  on_node_load:
+    enabled: false
+    load_threshold_ratio: 1.5
+    consecutive_polls: 3
+    recovery_polls: 5
+    max_interval_sec: 300
+  on_probe_cost:
+    enabled: true
+    max_probe_seconds: 2.0
+    consecutive_polls: 3
+    recovery_polls: 5
+    max_interval_sec: 300
+
+ssh:
+  census_timeout_sec: 20
+  counter_timeout_sec: 15
+  connect_timeout_sec: 8
+  require_mux: true
+
+database:
+  # Loopback only. Credentials belong in the environment or a 0600 file,
+  # never here.
+  host: 127.0.0.1
+  port: 5432
+  dbname: CHANGEME
+  schema: node_monitor
+
+safety:
+  min_free_disk_pct: 10
