@@ -72,6 +72,26 @@ PROC_ROOT = os.environ.get("NODE_MONITOR_PROC_ROOT", "/proc")
 def _proc(*parts):
    return os.path.join(PROC_ROOT, *parts)
 
+
+# Root of the sysfs tree. Same rationale and override mechanism as PROC_ROOT
+# above -- the hwinfo loop needs a handful of /sys facts (cpufreq, NUMA node
+# count, per-interface link speed) that have no /proc equivalent, and this
+# lets the subprocess tests point both roots at one synthetic tree on macOS.
+# Unset in production, so SYS_ROOT is "/sys" on every real login node.
+SYS_ROOT = os.environ.get("NODE_MONITOR_SYS_ROOT", "/sys")
+
+
+def _sys(*parts):
+   return os.path.join(SYS_ROOT, *parts)
+
+
+# /etc/os-release is neither under /proc nor /sys, so it has no ROOT-style
+# test override -- it is a fixed OS file, not something the daemon's process
+# view depends on. Kept as a module attribute (not inlined) purely so
+# in-process tests can monkeypatch it the same way they monkeypatch
+# PROC_ROOT.
+OS_RELEASE_PATH = "/etc/os-release"
+
 # --------------------------------------------------------------------------
 # Classification
 #
@@ -341,6 +361,249 @@ def _collect_node_counters():
 
 
 # --------------------------------------------------------------------------
+# Hardware inventory (hwinfo loop only)
+#
+# Everything here is physical-and-static, not a time series: total RAM,
+# socket/core counts, kernel release. Collecting it once and storing it,
+# instead of re-reading it every 60 s like the counter loop does, is the
+# whole point of this loop (PLANNING.md -- see the hwinfo task write-up).
+#
+# One field that LOOKS static is deliberately absent: instantaneous CPU MHz
+# from /proc/cpuinfo. Measured on the real fleet it is a live DVFS reading
+# that differs across cores and samples taken seconds apart, so it has no
+# business in a table whose contract is "read once, trust until reboot".
+# `cpu_max_freq_khz` below is the nominal ceiling from sysfs, not that.
+# --------------------------------------------------------------------------
+
+def _collect_cpuinfo():
+   """cpu_model / cpu_logical / sockets / cores_per_socket from /proc/cpuinfo.
+
+   sockets and cores_per_socket come back None (not 0) when the fields are
+   absent -- e.g. inside some containers -- so the daemon can tell "no
+   sockets" (impossible) apart from "this platform doesn't expose it".
+   """
+   text = _read_text(_proc("cpuinfo"))
+   out = {"cpu_model": None, "cpu_logical": 0, "sockets": None,
+          "cores_per_socket": None}
+   if text is None:
+      return out
+   physical_ids = set()
+   for line in text.split("\n"):
+      key, sep, rest = line.partition(":")
+      if not sep:
+         continue
+      key = key.strip()
+      value = rest.strip()
+      if key == "processor":
+         out["cpu_logical"] += 1
+      elif key == "model name" and out["cpu_model"] is None:
+         out["cpu_model"] = value
+      elif key == "physical id":
+         physical_ids.add(value)
+      elif key == "cpu cores" and out["cores_per_socket"] is None:
+         try:
+            out["cores_per_socket"] = int(value)
+         except ValueError:
+            pass
+   if physical_ids:
+      out["sockets"] = len(physical_ids)
+   return out
+
+
+def _collect_cpu_max_freq_khz():
+   """Nominal max CPU frequency from sysfs -- NOT /proc/cpuinfo MHz.
+
+   /proc/cpuinfo's per-core MHz is an instantaneous DVFS reading (measured on
+   the real fleet: three samples 2s apart on one node produced 133/110/97
+   distinct values across 256 cores). cpuinfo_max_freq is the fixed hardware
+   ceiling instead, which is what makes it safe to store once. Absent sysfs
+   file -- e.g. some virtualized platforms -- means NULL, never a fallback
+   to the live reading.
+   """
+   text = _read_text(_sys(
+      "devices", "system", "cpu", "cpu0", "cpufreq", "cpuinfo_max_freq"))
+   if text is None:
+      return None
+   try:
+      return int(text.strip())
+   except ValueError:
+      return None
+
+
+def _collect_numa_nodes():
+   base = _sys("devices", "system", "node")
+   try:
+      entries = os.listdir(base)
+   except (IOError, OSError):
+      return 0
+   pattern = re.compile(r"^node\d+$")
+   return sum(1 for entry in entries if pattern.match(entry))
+
+
+def _collect_hw_meminfo():
+   """mem_total_kb / swap_total_kb / hugepage_size_kb from /proc/meminfo.
+
+   Separate from _collect_meminfo (node counters) because that function's
+   output shape is tied to the counter/census payload contract; conflating
+   the two would make an accidental hwinfo change ripple into the counters
+   the daemon deltas every 60s.
+   """
+   wanted = {"MemTotal": "mem_total_kb", "SwapTotal": "swap_total_kb",
+             "Hugepagesize": "hugepage_size_kb"}
+   out = dict.fromkeys(wanted.values())
+   text = _read_text(_proc("meminfo"))
+   if text is None:
+      return out
+   for line in text.split("\n"):
+      key, _, rest = line.partition(":")
+      if key in wanted:
+         value = rest.split()
+         if value and value[0].isdigit():
+            out[wanted[key]] = int(value[0])
+   return out
+
+
+def _collect_kernel_release():
+   return _read_first_line(_proc("sys", "kernel", "osrelease"))
+
+
+def _collect_os_pretty_name():
+   text = _read_text(OS_RELEASE_PATH)
+   if text is None:
+      return None
+   for line in text.split("\n"):
+      key, sep, rest = line.partition("=")
+      if sep and key.strip() == "PRETTY_NAME":
+         return rest.strip().strip('"')
+   return None
+
+
+def _collect_net_fs_mounts():
+   """Count of lustre/nfs/nfs4 rows in /proc/mounts.
+
+   Just a count, not the mount table itself: this project's central
+   hypothesis is that the login-node bottleneck is network-filesystem
+   metadata ops, and the count is the denominator an analyst needs, not the
+   mount points (which are already known from the fleet's static config).
+   """
+   text = _read_text(_proc("mounts"))
+   if text is None:
+      return 0
+   fs_types = ("lustre", "nfs", "nfs4")
+   count = 0
+   for line in text.split("\n"):
+      fields = line.split()
+      if len(fields) >= 3 and fields[2] in fs_types:
+         count += 1
+   return count
+
+
+def _collect_net_ifaces():
+   """iface -> link speed (Mb/s), or None when unreadable.
+
+   Some interfaces report speed as "?" at the kernel/ethtool layer -- bond
+   members with no active slave, unplugged NICs. That is stored as null
+   here, not the literal string, so the column stays numeric.
+   """
+   base = _sys("class", "net")
+   try:
+      names = os.listdir(base)
+   except (IOError, OSError):
+      return {}
+   out = {}
+   for name in names:
+      text = _read_text(os.path.join(base, name, "speed"))
+      if text is None:
+         out[name] = None
+         continue
+      try:
+         out[name] = int(text.strip())
+      except ValueError:
+         out[name] = None
+   return out
+
+
+def _collect_boot_id():
+   return _read_first_line(_proc("sys", "kernel", "random", "boot_id"))
+
+
+def _collect_btime():
+   text = _read_text(_proc("stat"))
+   if text is None:
+      return None
+   for line in text.split("\n"):
+      if line.startswith("btime "):
+         parts = line.split()
+         if len(parts) >= 2:
+            try:
+               return int(parts[1])
+            except ValueError:
+               return None
+   return None
+
+
+def _collect_gpus_nvidia_smi():
+   """Query nvidia-smi for GPU names. [] on any failure -- see _collect_gpus."""
+   import shutil
+   import subprocess as _subprocess
+   binary = shutil.which("nvidia-smi")
+   if binary is None:
+      return []
+   try:
+      result = _subprocess.run(
+         [binary, "--query-gpu=name", "--format=csv,noheader"],
+         capture_output=True, text=True, timeout=3)
+   except Exception:
+      # Anything -- hang, missing driver, permission -- must not surface as
+      # a probe failure. Login nodes normally have no GPU and no nvidia-smi;
+      # [] is the expected answer, not a degraded one.
+      return []
+   if result.returncode != 0:
+      return []
+   return [line.strip() for line in result.stdout.split("\n") if line.strip()]
+
+
+def _collect_gpus():
+   """GPU inventory. [] is the normal answer on login nodes, not an error.
+
+   Tries the /proc/driver/nvidia path first (cheap, no subprocess) and only
+   shells out to nvidia-smi if that is absent, so a GPU-less node -- the
+   common case here -- never pays for a subprocess at all.
+   """
+   base = _proc("driver", "nvidia", "gpus")
+   try:
+      entries = sorted(os.listdir(base))
+   except (IOError, OSError):
+      entries = []
+   if entries:
+      return entries
+   return _collect_gpus_nvidia_smi()
+
+
+def _collect_hardware():
+   cpuinfo = _collect_cpuinfo()
+   meminfo = _collect_hw_meminfo()
+   return {
+      "cpu_model": cpuinfo["cpu_model"],
+      "cpu_logical": cpuinfo["cpu_logical"],
+      "sockets": cpuinfo["sockets"],
+      "cores_per_socket": cpuinfo["cores_per_socket"],
+      "cpu_max_freq_khz": _collect_cpu_max_freq_khz(),
+      "numa_nodes": _collect_numa_nodes(),
+      "mem_total_kb": meminfo["mem_total_kb"],
+      "swap_total_kb": meminfo["swap_total_kb"],
+      "hugepage_size_kb": meminfo["hugepage_size_kb"],
+      "kernel_release": _collect_kernel_release(),
+      "os_pretty_name": _collect_os_pretty_name(),
+      "net_fs_mounts": _collect_net_fs_mounts(),
+      "net_ifaces": _collect_net_ifaces(),
+      "boot_id": _collect_boot_id(),
+      "btime": _collect_btime(),
+      "gpus": _collect_gpus(),
+   }
+
+
+# --------------------------------------------------------------------------
 # Process census (census loop only)
 # --------------------------------------------------------------------------
 
@@ -600,8 +863,9 @@ def _parse_args(argv):
       arg = argv[index]
       if arg == "--loop":
          index += 1
-         if index >= len(argv) or argv[index] not in ("census", "counter"):
-            raise ValueError("--loop must be 'census' or 'counter'")
+         if index >= len(argv) or argv[index] not in (
+               "census", "counter", "hwinfo"):
+            raise ValueError("--loop must be 'census', 'counter' or 'hwinfo'")
          opts["loop"] = argv[index]
       elif arg == "--max-seconds":
          index += 1
@@ -669,16 +933,25 @@ def main(argv):
       if uptime_line is None:
          sys.stderr.write("%s unreadable\n" % _proc("uptime"))
          return 3
-      payload["uptime_sec"] = float(uptime_line.split()[0])
-      payload["counters"] = _collect_node_counters()
 
-      if opts["loop"] == "census":
-         uid_names = _resolve_uid_names(_distinct_uids())
-         rows, coverage = _collect_processes(
-            uid_names, opts["drop_raw_args"], deadline)
-         payload["processes"] = rows
-         payload["census_coverage"] = coverage
-         payload["counters"].update(_collect_session_counts(rows))
+      if opts["loop"] == "hwinfo":
+         # Deliberately skips uptime_sec/counters: those exist for the
+         # census/counter cadence the daemon deltas every 60s, and the whole
+         # point of hwinfo is to be far cheaper than that. The uptime read
+         # above is kept anyway, purely as the same /proc-sanity probe the
+         # other loops use, so all three loops share one exit-3 contract.
+         payload["hardware"] = _collect_hardware()
+      else:
+         payload["uptime_sec"] = float(uptime_line.split()[0])
+         payload["counters"] = _collect_node_counters()
+
+         if opts["loop"] == "census":
+            uid_names = _resolve_uid_names(_distinct_uids())
+            rows, coverage = _collect_processes(
+               uid_names, opts["drop_raw_args"], deadline)
+            payload["processes"] = rows
+            payload["census_coverage"] = coverage
+            payload["counters"].update(_collect_session_counts(rows))
    except ProbeTimeout:
       signal.alarm(0)
       sys.stderr.write(

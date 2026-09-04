@@ -474,3 +474,197 @@ class TestPayloadContract:
          capture_output=True, text=True, timeout=60, env=fake_proc_env)
       assert result.stdout.count("\n") == 1
       json.loads(result.stdout)
+
+
+# --------------------------------------------------------------------------
+# hwinfo loop -- the static hardware inventory
+# --------------------------------------------------------------------------
+
+class TestHwinfoLoop:
+   def _hwinfo_env(self, tmp_path, cpu_max_freq_khz=2000000,
+                    nvidia_gpus=None, no_sys=False):
+      proc_root = str(tmp_path / "proc")
+      sys_root = str(tmp_path / "sys")
+      fake_proc.write_proc(proc_root, [])
+      fake_proc.write_proc_hwinfo(proc_root, nvidia_gpus=nvidia_gpus)
+      env = dict(os.environ)
+      env["NODE_MONITOR_PROC_ROOT"] = proc_root
+      if not no_sys:
+         fake_proc.write_sys_hwinfo(
+            sys_root, cpu_max_freq_khz=cpu_max_freq_khz)
+         env["NODE_MONITOR_SYS_ROOT"] = sys_root
+      else:
+         env["NODE_MONITOR_SYS_ROOT"] = str(tmp_path / "sys-does-not-exist")
+      return env
+
+   def _run(self, env):
+      result = subprocess.run(
+         [sys.executable, PROBE_PATH, "--loop", "hwinfo"],
+         capture_output=True, text=True, timeout=60, env=env)
+      assert result.returncode == 0, result.stderr
+      lines = [line for line in result.stdout.split("\n") if line.strip()]
+      assert len(lines) == 1, "probe must emit exactly one line"
+      return json.loads(lines[0])
+
+   def test_hwinfo_payload_shape(self, tmp_path):
+      env = self._hwinfo_env(tmp_path)
+      payload = self._run(env)
+      for key in ("probe_version", "loop", "hostname_fqdn",
+                  "wall_clock_utc", "probe_self_seconds", "python_version"):
+         assert key in payload, "missing %s" % key
+      assert payload["loop"] == "hwinfo"
+      assert "hardware" in payload
+      hw = payload["hardware"]
+      required = {
+         "cpu_model", "cpu_logical", "sockets", "cores_per_socket",
+         "cpu_max_freq_khz", "numa_nodes", "mem_total_kb", "swap_total_kb",
+         "hugepage_size_kb", "kernel_release", "os_pretty_name",
+         "net_fs_mounts", "net_ifaces", "boot_id", "btime", "gpus",
+      }
+      missing = required - set(hw)
+      assert not missing, "hardware payload missing %s" % missing
+
+   def test_hwinfo_loop_has_no_counters_or_processes(self, tmp_path):
+      """hwinfo must stay cheap -- no per-60s counters, no process walk."""
+      env = self._hwinfo_env(tmp_path)
+      payload = self._run(env)
+      assert "counters" not in payload
+      assert "processes" not in payload
+      assert "census_coverage" not in payload
+
+   def test_hwinfo_values(self, tmp_path):
+      env = self._hwinfo_env(tmp_path)
+      hw = self._run(env)["hardware"]
+      assert hw["cpu_model"] == "AMD EPYC 7713 64-Core Processor"
+      assert hw["cpu_logical"] == 2
+      assert hw["sockets"] == 2
+      assert hw["cores_per_socket"] == 64
+      assert hw["numa_nodes"] == 2
+      assert hw["net_fs_mounts"] == 2
+      assert hw["net_ifaces"] == {"bond0": 1000, "ens10f0": 1000}
+      assert hw["boot_id"] == "abc-123"
+      assert hw["btime"] == 1700000000
+      assert hw["kernel_release"] == "6.4.0"
+
+   def test_cpu_max_freq_khz_read_from_sysfs(self, tmp_path):
+      env = self._hwinfo_env(tmp_path, cpu_max_freq_khz=2098489)
+      hw = self._run(env)["hardware"]
+      assert hw["cpu_max_freq_khz"] == 2098489
+
+   def test_cpu_max_freq_khz_null_when_sysfs_absent(self, tmp_path):
+      """Absent sysfs file -> NULL. Must NEVER fall back to /proc/cpuinfo
+      MHz -- that field is a live DVFS reading, not a hardware fact."""
+      env = self._hwinfo_env(tmp_path, no_sys=True)
+      hw = self._run(env)["hardware"]
+      assert hw["cpu_max_freq_khz"] is None
+
+   def test_missing_nvidia_smi_yields_empty_gpus(self, tmp_path, monkeypatch):
+      monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+      os.makedirs(str(tmp_path / "empty-bin"), exist_ok=True)
+      env = self._hwinfo_env(tmp_path)
+      env["PATH"] = str(tmp_path / "empty-bin")
+      result = subprocess.run(
+         [sys.executable, PROBE_PATH, "--loop", "hwinfo"],
+         capture_output=True, text=True, timeout=60, env=env)
+      assert result.returncode == 0, result.stderr
+      payload = json.loads(result.stdout)
+      assert payload["hardware"]["gpus"] == []
+
+   def test_nvidia_gpus_from_proc_driver(self, tmp_path):
+      env = self._hwinfo_env(tmp_path, nvidia_gpus=["0000:01:00.0"])
+      hw = self._run(env)["hardware"]
+      assert hw["gpus"] == ["0000:01:00.0"]
+
+   def test_no_instantaneous_frequency_field_anywhere(self, tmp_path):
+      """The specific mistake this task exists to prevent: cpu MHz is a
+      live per-core DVFS reading (measured on the real fleet: 133/110/97
+      distinct values across 256 cores in samples 2s apart) and must never
+      appear in the static hardware payload under any name."""
+      env = self._hwinfo_env(tmp_path)
+      payload = self._run(env)
+      raw = json.dumps(payload).lower()
+      for forbidden in ("cpu_mhz", "\"mhz\"", "cur_freq", "curfreq"):
+         assert forbidden not in raw, (
+            "forbidden instantaneous-frequency field found: %s" % forbidden)
+      # Confirm the allowed static field is exactly the one we expect.
+      assert "cpu_max_freq_khz" in payload["hardware"]
+
+
+# --------------------------------------------------------------------------
+# In-process hwinfo collectors (proc_root fixture, no subprocess)
+# --------------------------------------------------------------------------
+
+class TestHwinfoCollectors:
+   def test_collect_cpuinfo(self, proc_root):
+      root = proc_root([])
+      fake_proc.write_proc_hwinfo(root)
+      cpuinfo = probe._collect_cpuinfo()
+      assert cpuinfo["cpu_model"] == "AMD EPYC 7713 64-Core Processor"
+      assert cpuinfo["cpu_logical"] == 2
+      assert cpuinfo["sockets"] == 2
+      assert cpuinfo["cores_per_socket"] == 64
+
+   def test_collect_cpuinfo_absent_sockets_is_none(self, proc_root):
+      root = proc_root([])
+      fake_proc.write_proc_hwinfo(
+         root, cpuinfo="processor\t: 0\nmodel name\t: Some CPU\n")
+      cpuinfo = probe._collect_cpuinfo()
+      assert cpuinfo["sockets"] is None
+      assert cpuinfo["cores_per_socket"] is None
+
+   def test_collect_net_fs_mounts_counts_only_network_fs(self, proc_root):
+      root = proc_root([])
+      fake_proc.write_proc_hwinfo(root, mounts=(
+         "/dev/sda1 / ext4 rw 0 0\n"
+         "tmpfs /tmp tmpfs rw 0 0\n"
+         "srv:/a /a nfs rw 0 0\n"
+         "srv:/b /b nfs4 rw 0 0\n"
+         "mds@o2ib:/fs /lus lustre rw 0 0\n"))
+      assert probe._collect_net_fs_mounts() == 3
+
+   def test_collect_boot_id_strips_newline(self, proc_root):
+      root = proc_root([])
+      fake_proc.write_proc_hwinfo(root, boot_id="deadbeef-1234\n")
+      assert probe._collect_boot_id() == "deadbeef-1234"
+
+   def test_collect_btime(self, proc_root):
+      root = proc_root([])
+      fake_proc.write_proc_hwinfo(
+         root, stat_line="cpu  1 2 3 4\nbtime 1699999999\n")
+      assert probe._collect_btime() == 1699999999
+
+   def test_collect_os_pretty_name(self, proc_root, tmp_path, monkeypatch):
+      root = proc_root([])
+      fake_proc.write_proc_hwinfo(root)
+      os_release = tmp_path / "os-release"
+      os_release.write_text(
+         'NAME="SLES"\nPRETTY_NAME="SUSE Linux Enterprise Server 15 SP7"\n')
+      monkeypatch.setattr(probe, "OS_RELEASE_PATH", str(os_release))
+      assert probe._collect_os_pretty_name() == (
+         "SUSE Linux Enterprise Server 15 SP7")
+
+   def test_collect_os_pretty_name_null_when_absent(
+         self, proc_root, tmp_path, monkeypatch):
+      root = proc_root([])
+      fake_proc.write_proc_hwinfo(root)
+      monkeypatch.setattr(
+         probe, "OS_RELEASE_PATH", str(tmp_path / "does-not-exist"))
+      assert probe._collect_os_pretty_name() is None
+
+   def test_collect_gpus_empty_without_nvidia(self, proc_root, monkeypatch):
+      root = proc_root([])
+      fake_proc.write_proc_hwinfo(root)
+      monkeypatch.setattr(
+         probe, "_collect_gpus_nvidia_smi", lambda: [])
+      assert probe._collect_gpus() == []
+
+   def test_collect_gpus_nvidia_smi_hang_yields_empty(self, monkeypatch):
+      """A hanging/failing nvidia-smi must never propagate -- [] always."""
+      import subprocess as sp
+
+      def _raising_run(*args, **kwargs):
+         raise sp.TimeoutExpired(cmd="nvidia-smi", timeout=3)
+
+      monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/nvidia-smi")
+      monkeypatch.setattr(sp, "run", _raising_run)
+      assert probe._collect_gpus_nvidia_smi() == []

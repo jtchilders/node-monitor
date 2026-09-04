@@ -16,6 +16,10 @@ collection:
   census_interval_sec: 60
   counter_interval_sec: 60
   rollup_interval_sec: 60
+  # Days between forced hwinfo re-verification, absent a reboot or a missing
+  # row (both of which always trigger a refresh regardless of this value).
+  # Cheap insurance against a hardware swap that never bumped boot_id.
+  hardware_refresh_days: 30
 
 backoff:
   on_node_load:
