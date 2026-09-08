@@ -95,41 +95,54 @@ OS_RELEASE_PATH = "/etc/os-release"
 # --------------------------------------------------------------------------
 # Classification
 #
-# Applied ON THE NODE so raw argv never leaves it. Order matters: the first
-# matching rule wins, most specific first. Every regex is anchored against
-# the process name and the full command line separately -- a bare `claude`
-# and `/soft/.../bin/claude --resume` must both classify.
+# Applied ON THE NODE so raw argv never leaves it. Resolution is explicit
+# highest-priority-wins: each rule carries a numeric `priority` as its third
+# tuple element, and `_resolve_rule` picks the highest-priority match, not
+# the first one encountered in source order. This is deliberate -- a broad
+# rule (e.g. "ide-remote"/"vscode-remote-server" matching any vscode-server
+# path) and a narrow rule (e.g. "ai-coding-agent"/"claude-code" matching a
+# Claude Code VS Code extension path under that same vscode-server tree)
+# can both match the same cmdline, and the narrow rule must win regardless
+# of which one happens to be written first or reordered later. Every regex
+# is anchored against the process name and the full command line
+# separately -- a bare `claude` and `/soft/.../bin/claude --resume` must
+# both classify.
 # --------------------------------------------------------------------------
 
 _CATEGORY_RULES = [
    ("ide-remote", re.compile(
       r"vscode-server|vscode_server|\.vscode-server|cursor-server|"
-      r"\.cursor-server|jetbrains|remote-dev-server|code-server")),
+      r"\.cursor-server|jetbrains|remote-dev-server|code-server"), 10),
+   # Priority 20 (> ide-remote's 10): a Claude Code / Codex marker must beat
+   # a broad IDE-path marker even when both appear in the same cmdline, e.g.
+   # .vscode-server/extensions/anthropic.claude-code-*/bin/claude. Measured
+   # live-Polaris impact of getting this wrong (2026-09-04): ~24% undercount
+   # of AI-agent processes, 9 distinct users reported instead of 12.
    ("ai-coding-agent", re.compile(
       r"(^|/)(claude|codex|opencode|aider|gemini|cline|goose)( |$)|"
       r"-m\s+(claude|codex|opencode|aider|gemini|cline|goose)[_.\s]|"
       r"anthropic\.claude-code|openai\.chatgpt|claude-code|claude_code|"
-      r"copilot-language")),
-   ("jupyter", re.compile(r"jupyter|ipykernel|jupyter-lab|jupyterhub")),
+      r"copilot-language"), 20),
+   ("jupyter", re.compile(r"jupyter|ipykernel|jupyter-lab|jupyterhub"), 10),
    ("pbs-client", re.compile(
       r"(^|/)(qstat|qsub|qdel|qhold|qrls|qalter|pbsnodes|pbs_[a-z]+|"
-      r"mpiexec|mpirun|aprun|srun)( |$)")),
+      r"mpiexec|mpirun|aprun|srun)( |$)"), 10),
    ("data-xfer/vcs", re.compile(
       r"(^|/)(git|git-[a-z-]+|rsync|scp|sftp|globus|globus-url-copy|curl|"
-      r"wget|tar|gzip|gunzip|bzip2|xz|zip|unzip|hsi|htar)( |$)")),
+      r"wget|tar|gzip|gunzip|bzip2|xz|zip|unzip|hsi|htar)( |$)"), 10),
    # --- The four rules below were unspecified in the plan (finding B-2).
    # --- They are first drafts and MUST be validated against the captured
    # --- cmdline corpus before any published number depends on them.
    ("fs-scan", re.compile(
       r"(^|/)(find|du|ncdu|updatedb|locate|stat|ls)( |$)|"
-      r"(^|/)lfs( |$).*(find|df)|(^|/)mlocate")),
+      r"(^|/)lfs( |$).*(find|df)|(^|/)mlocate"), 10),
    ("compute/build", re.compile(
       r"(^|/)(make|gmake|cmake|ninja|gcc|g\+\+|cc|c\+\+|clang|clang\+\+|"
       r"nvcc|ftn|CC|ld|ar|ranlib|cargo|rustc|go|javac|configure|conda|pip|"
-      r"pip3|spack|python|python[0-9.]*)( |$)")),
+      r"pip3|spack|python|python[0-9.]*)( |$)"), 10),
    ("shell/session", re.compile(
       r"(^|/)(sshd|bash|zsh|tcsh|csh|ksh|sh|screen|tmux|systemd|"
-      r"\(sd-pam\)|dbus-daemon|dbus-launch|login|su|sudo)( |:|$)|^-")),
+      r"\(sd-pam\)|dbus-daemon|dbus-launch|login|su|sudo)( |:|$)|^-"), 10),
 ]
 
 _DEFAULT_CATEGORY = "other"
@@ -140,26 +153,30 @@ _BEHAVIOR_BATCH = "batch"
 _BEHAVIOR_DAEMON = "daemon"
 
 _ACTIVITY_RULES = [
-   ("vscode-remote-server", re.compile(r"vscode-server|code-server")),
-   ("cursor-remote-server", re.compile(r"cursor-server")),
-   ("claude-code", re.compile(r"claude-code|anthropic\.claude-code|(^|/)claude( |$)")),
-   ("codex-cli", re.compile(r"(^|/)codex( |$)|openai\.chatgpt")),
-   ("jupyter-kernel", re.compile(r"ipykernel")),
-   ("jupyter-server", re.compile(r"jupyter")),
-   ("torch-distributed", re.compile(r"torch\.distributed|torchrun")),
-   ("mpi-launch", re.compile(r"(^|/)(mpiexec|mpirun|aprun|srun)( |$)")),
+   ("vscode-remote-server", re.compile(r"vscode-server|code-server"), 10),
+   ("cursor-remote-server", re.compile(r"cursor-server"), 10),
+   # Priority 20 (> vscode-remote-server's 10): same overlapping-extension-
+   # path hazard as _CATEGORY_RULES above -- claude-code/codex-cli must beat
+   # vscode-remote-server for a Claude Code / Codex VS Code extension path.
+   ("claude-code", re.compile(
+      r"claude-code|anthropic\.claude-code|(^|/)claude( |$)"), 20),
+   ("codex-cli", re.compile(r"(^|/)codex( |$)|openai\.chatgpt"), 20),
+   ("jupyter-kernel", re.compile(r"ipykernel"), 10),
+   ("jupyter-server", re.compile(r"jupyter"), 10),
+   ("torch-distributed", re.compile(r"torch\.distributed|torchrun"), 10),
+   ("mpi-launch", re.compile(r"(^|/)(mpiexec|mpirun|aprun|srun)( |$)"), 10),
    ("compiler-invocation", re.compile(
-      r"(^|/)(gcc|g\+\+|clang|nvcc|ftn|cc|c\+\+)( |$)")),
-   ("build-driver", re.compile(r"(^|/)(make|gmake|cmake|ninja)( |$)")),
-   ("package-install", re.compile(r"(^|/)(pip|pip3|conda|spack)( |$)")),
-   ("git-operation", re.compile(r"(^|/)git( |$)|(^|/)git-[a-z-]+( |$)")),
+      r"(^|/)(gcc|g\+\+|clang|nvcc|ftn|cc|c\+\+)( |$)"), 10),
+   ("build-driver", re.compile(r"(^|/)(make|gmake|cmake|ninja)( |$)"), 10),
+   ("package-install", re.compile(r"(^|/)(pip|pip3|conda|spack)( |$)"), 10),
+   ("git-operation", re.compile(r"(^|/)git( |$)|(^|/)git-[a-z-]+( |$)"), 10),
    ("data-transfer", re.compile(
-      r"(^|/)(rsync|scp|sftp|globus|globus-url-copy|curl|wget)( |$)")),
-   ("filesystem-scan", re.compile(r"(^|/)(find|du|ncdu|updatedb)( |$)")),
-   ("pbs-query", re.compile(r"(^|/)(qstat|qsub|qdel|pbsnodes)( |$)")),
-   ("shell", re.compile(r"(^|/)(bash|zsh|tcsh|csh|ksh|sh)( |$)|^-")),
-   ("ssh-session", re.compile(r"(^|/)sshd( |:|$)")),
-   ("terminal-multiplexer", re.compile(r"(^|/)(screen|tmux)( |$)")),
+      r"(^|/)(rsync|scp|sftp|globus|globus-url-copy|curl|wget)( |$)"), 10),
+   ("filesystem-scan", re.compile(r"(^|/)(find|du|ncdu|updatedb)( |$)"), 10),
+   ("pbs-query", re.compile(r"(^|/)(qstat|qsub|qdel|pbsnodes)( |$)"), 10),
+   ("shell", re.compile(r"(^|/)(bash|zsh|tcsh|csh|ksh|sh)( |$)|^-"), 10),
+   ("ssh-session", re.compile(r"(^|/)sshd( |:|$)"), 10),
+   ("terminal-multiplexer", re.compile(r"(^|/)(screen|tmux)( |$)"), 10),
 ]
 
 # Paths that qualify a process to a project with high confidence.
@@ -656,24 +673,42 @@ def _parse_stat(raw):
    return comm, tail
 
 
+def _resolve_rule(rules, haystack):
+   """Return the label of the highest-priority rule matching `haystack`.
+
+   Highest-priority-wins, not first-match-in-list-wins: `rules` is a list of
+   (label, pattern, priority) tuples, and every one is checked against
+   `haystack` rather than stopping at the first hit, so a later list
+   position or a future reordering can never accidentally change which
+   rule wins for a given priority value -- only the priority numbers can.
+   Returns None if nothing matches.
+   """
+   best_label = None
+   best_priority = None
+   for label, pattern, priority in rules:
+      if pattern.search(haystack) and (
+            best_priority is None or priority > best_priority):
+         best_label = label
+         best_priority = priority
+   return best_label
+
+
 def _classify(name, cmdline):
    """Return (category, activity, confidence).
 
-   Matched against the command line when we have one and the process name
-   otherwise. For other users' processes cmdline is readable but exe/cwd are
-   not (PLANNING.md 5.6), so argv is usually all we get.
+   Matched against the command line (argv) when we have one, and the
+   process name otherwise. `name` here is /proc/<pid>/stat's `comm` field,
+   a renameable 15-character task name (`prctl(PR_SET_NAME)`; `MainThread`
+   and bare `node` are both common) -- it is only a fallback for when
+   cmdline is absent, and must never override a cmdline-based match: a
+   process can rename its own comm to anything, but it cannot rewrite the
+   argv the kernel already recorded at exec time. For other users'
+   processes cmdline is readable but exe/cwd are not (PLANNING.md 5.6), so
+   argv is usually all we get anyway.
    """
    haystack = cmdline if cmdline else name
-   category = _DEFAULT_CATEGORY
-   for label, pattern in _CATEGORY_RULES:
-      if pattern.search(haystack):
-         category = label
-         break
-   activity = None
-   for label, pattern in _ACTIVITY_RULES:
-      if pattern.search(haystack):
-         activity = label
-         break
+   category = _resolve_rule(_CATEGORY_RULES, haystack) or _DEFAULT_CATEGORY
+   activity = _resolve_rule(_ACTIVITY_RULES, haystack)
    if activity is None:
       confidence = _CONF_UNKNOWN
    elif cmdline and cmdline.startswith("/"):

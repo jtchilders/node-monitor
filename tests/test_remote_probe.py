@@ -9,6 +9,7 @@ denial, coverage accounting, and the JSON contract the daemon depends on.
 import errno
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -160,6 +161,110 @@ class TestClassification:
       assert probe._project_from_path(
          "/lus/eagle/projects/datascience/run.sh") == "datascience"
       assert probe._project_from_path("/home/u/run.sh") is None
+
+
+class TestClassificationPriority:
+   """Overlapping-rule precedence must be explicit priority data, not
+   implicit source-line order.
+
+   Regression: a Claude Code VS Code extension path such as
+   .vscode-server/extensions/anthropic.claude-code-*/bin/claude matched the
+   broad ide-remote / vscode-remote-server rules first because they simply
+   appeared earlier in the list. Live Polaris impact measured 2026-09-04:
+   about 24% undercount of AI-agent processes, 9 distinct users reported
+   instead of 12.
+   """
+
+   def test_vscode_claude_code_extension_path_is_ai_coding_agent(self):
+      """The exact path shape from the live undercount."""
+      cmdline = (
+         "/home/u/.vscode-server/extensions/anthropic.claude-code-1.2.3/"
+         "bin/claude")
+      category, activity, _ = probe._classify("claude", cmdline)
+      assert category == "ai-coding-agent"
+      assert activity == "claude-code"
+
+   def test_vscode_codex_extension_path_is_ai_coding_agent(self):
+      cmdline = (
+         "/home/u/.vscode-server/extensions/openai.chatgpt-0.9.0/bin/codex")
+      category, activity, _ = probe._classify("codex", cmdline)
+      assert category == "ai-coding-agent"
+      assert activity == "codex-cli"
+
+   def test_ordinary_vscode_server_path_stays_ide_remote(self):
+      """A broad VS Code server path with no AI-agent marker must be
+      unaffected by the priority fix."""
+      cmdline = (
+         "/home/u/.vscode-server/bin/abc/node "
+         "/home/u/.vscode-server/bin/abc/out/server-main.js")
+      category, activity, _ = probe._classify("node", cmdline)
+      assert category == "ide-remote"
+      assert activity == "vscode-remote-server"
+
+   def test_misleading_comm_cannot_defeat_argv_classification(self):
+      """comm is a renameable 15-char task name (MainThread, node, ...).
+
+      argv identifying Claude Code must win regardless of what comm says.
+      """
+      cmdline = (
+         "/home/u/.vscode-server/extensions/anthropic.claude-code-1.2.3/"
+         "bin/claude")
+      for misleading_comm in ("MainThread", "node"):
+         category, activity, _ = probe._classify(misleading_comm, cmdline)
+         assert category == "ai-coding-agent"
+         assert activity == "claude-code"
+
+   def test_priority_is_data_highest_wins_regardless_of_list_order(self):
+      """Priority must be resolved by an explicit numeric field, not by
+      which rule happens to appear first in the source list.
+
+      Builds a tiny reversed/shuffled rule sequence -- deliberately putting
+      the low-priority rule ahead of the high-priority one in list order --
+      and shows the resolver still returns the higher-priority match. A
+      resolver that just returns the first regex to match this sequence
+      would fail here even though it might pass against the real
+      _CATEGORY_RULES, because real list order happens to already agree
+      with priority for the untouched cases.
+      """
+      broad = ("broad-low-priority", re.compile(r"marker"), 10)
+      specific = ("specific-high-priority", re.compile(r"special-marker"), 90)
+      # Broad, lower-priority rule listed FIRST -- source order disagrees
+      # with priority order on purpose.
+      rules = [broad, specific]
+      label = probe._resolve_rule(rules, "special-marker-here")
+      assert label == "specific-high-priority"
+
+      # Shuffle again the other way to prove it is not an accident of
+      # which position happens to be checked first.
+      rules_reversed = [specific, broad]
+      label_reversed = probe._resolve_rule(rules_reversed, "special-marker-here")
+      assert label_reversed == "specific-high-priority"
+
+   def test_category_rules_carry_explicit_priority(self):
+      """Every category rule must declare priority as data (a 3-tuple),
+      not rely on its position in the list."""
+      for rule in probe._CATEGORY_RULES:
+         assert len(rule) == 3, (
+            "%r must be a (label, pattern, priority) tuple" % (rule,))
+         label, pattern, priority = rule
+         assert isinstance(priority, int)
+
+   def test_activity_rules_carry_explicit_priority(self):
+      for rule in probe._ACTIVITY_RULES:
+         assert len(rule) == 3, (
+            "%r must be a (label, pattern, priority) tuple" % (rule,))
+         label, pattern, priority = rule
+         assert isinstance(priority, int)
+
+   def test_claude_code_priority_exceeds_vscode_remote_server(self):
+      """Direct data assertion backing up the behavioral tests above:
+      the claude-code activity rule's priority must exceed
+      vscode-remote-server's, and the ai-coding-agent category rule's
+      priority must exceed ide-remote's."""
+      cat_priority = {label: pr for label, _, pr in probe._CATEGORY_RULES}
+      act_priority = {label: pr for label, _, pr in probe._ACTIVITY_RULES}
+      assert cat_priority["ai-coding-agent"] > cat_priority["ide-remote"]
+      assert act_priority["claude-code"] > act_priority["vscode-remote-server"]
 
 
 class TestBehavior:
