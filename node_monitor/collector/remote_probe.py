@@ -199,28 +199,52 @@ _CONF_UNKNOWN = "unknown"
 # vscode-server tool rules below, because both facts are true at once and
 # only one of them is a priority-ordered classification.
 #
-# Bare tool names are boundary-anchored ((^|/) ... ( |$)) to avoid matching
-# a substring inside an unrelated executable name, e.g. "mycodexhelper" must
-# not count as codex. The longer marker strings (".vscode-server",
-# "anthropic.claude-code", etc.) are specific enough to match as plain
-# substrings.
+# EVERY marker below -- bare names and path/marker substrings alike -- is
+# boundary-anchored against "not preceded/followed by an alnum character"
+# (`_TOOL_BOUNDARY_BEFORE` / `_TOOL_BOUNDARY_AFTER`), not just the bare-name
+# rules. A naive substring check on "claude-code" would also match
+# "myclaude-code-helper"; a naive substring check on "jupyter" would also
+# match "myjupyterhelper". Review round 1 caught exactly these two false
+# positives (plus vscode-server/cursor-server/codex analogues) from an
+# earlier version of this file that only anchored the bare-name rules.
+# `_` is intentionally treated as a boundary too (not just alnum), so
+# `ipykernel_launcher` -- the real executable name jupyter kernels run
+# under -- still matches `ipykernel` while `myipykernelhelper` does not.
 # --------------------------------------------------------------------------
+
+_TOOL_BOUNDARY_BEFORE = r"(?<![A-Za-z0-9])"
+_TOOL_BOUNDARY_AFTER = r"(?![A-Za-z0-9])"
+
+
+def _bounded(marker):
+   return _TOOL_BOUNDARY_BEFORE + marker + _TOOL_BOUNDARY_AFTER
+
 
 _TOOL_RULES = [
    ("claude-code", re.compile(
-      r"(^|/)claude( |$)|claude-code|anthropic\.claude-code")),
+      _bounded(r"claude") + "|" + _bounded(r"claude-code") + "|" +
+      _bounded(r"anthropic\.claude-code"))),
    ("codex", re.compile(
-      r"(^|/)codex( |$)|codex-code-mode-host|\.codex/|openai\.chatgpt")),
-   ("vscode-server", re.compile(r"\.vscode-server|vscode-server")),
-   ("cursor-server", re.compile(r"\.cursor-server|cursor-server")),
-   ("jupyter", re.compile(r"jupyter|ipykernel")),
+      _bounded(r"codex") + "|" + _bounded(r"codex-code-mode-host") + "|" +
+      r"\.codex/" + "|" + _bounded(r"openai\.chatgpt"))),
+   ("vscode-server", re.compile(
+      _bounded(r"vscode-server") + "|" + r"\.vscode-server(?![A-Za-z0-9])")),
+   ("cursor-server", re.compile(
+      _bounded(r"cursor-server") + "|" + r"\.cursor-server(?![A-Za-z0-9])")),
+   ("jupyter", re.compile(_bounded(r"jupyter") + "|" + _bounded(r"ipykernel"))),
 ]
 
-# VS Code / Cursor embed a 40-hex installation id in their server path, e.g.
-# ".vscode-server/bin/<Stable-HEX40>/node" or ".../code-<HEX40>/...". Other
-# tracked tools have no equivalent stable identifier, so install_count stays
-# null for them rather than reporting a meaningless 0.
-_INSTALL_ID_RE = re.compile(r"(?:stable|code)-([0-9a-f]{40})", re.IGNORECASE)
+# VS Code / Cursor embed a 40-hex installation id as a whole path component:
+# ".../Stable-<hex40>/..." or ".../code-<hex40>/...". Anchored on BOTH ends
+# -- `(?:^|/)` before the prefix, `(?=/|$)` after the hex run -- so
+# "fooStable-<hex40>" (prefix not at a path boundary), a 41-hex run (one
+# extra hex char after the 40th still matches [0-9a-f] and would slip past
+# a naive {40} count without the trailing boundary), and "code-<hex40>z"
+# (trailing non-boundary character) are all rejected. Case-insensitive
+# because VS Code capitalizes "Stable-", not because the hex itself varies
+# in practice.
+_INSTALL_ID_RE = re.compile(
+   r"(?:^|/)(?:stable|code)-([0-9a-f]{40})(?=/|$)", re.IGNORECASE)
 _INSTALL_ID_TOOLS = frozenset(("vscode-server", "cursor-server"))
 
 # Ancestor-chain walk for `nested_in`: real fleet process trees are a few

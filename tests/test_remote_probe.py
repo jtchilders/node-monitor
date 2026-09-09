@@ -556,6 +556,72 @@ class TestToolAggregates:
          {0: "root"}, drop_raw_args=True, deadline=None)
       assert tools == []
 
+   def test_match_tools_boundary_positives_and_false_positives(self):
+      """Every tool family: a legitimate match plus a substring near-miss.
+
+      Review round 1 finding: only the bare-name rules were boundary
+      anchored; the longer marker strings (claude-code, jupyter,
+      vscode-server, cursor-server) matched as plain substrings, so
+      'myclaude-code-helper' and 'myjupyterhelper' falsely matched.
+      """
+      assert probe._match_tools("claude") == ["claude-code"]
+      assert probe._match_tools("myclaude-code-helper") == []
+      assert probe._match_tools("/x/notclaude-code-wrapper") == []
+
+      assert probe._match_tools("codex exec --model gpt-5") == ["codex"]
+      assert probe._match_tools("mycodexhelper --run") == []
+      assert probe._match_tools("notcodex") == []
+
+      assert probe._match_tools(
+         "/home/u/.vscode-server/bin/abc/node server-main.js"
+      ) == ["vscode-server"]
+      assert probe._match_tools("notvscode-serverhelper") == []
+
+      assert probe._match_tools(
+         "/home/u/.cursor-server/bin/xyz/node server.js"
+      ) == ["cursor-server"]
+      assert probe._match_tools("notcursor-serverhelper") == []
+
+      assert probe._match_tools(
+         "/soft/python/bin/python -m ipykernel_launcher -f k.json"
+      ) == ["jupyter"]
+      assert probe._match_tools("myjupyterhelper") == []
+      assert probe._match_tools("/x/myipykernelhelper") == []
+
+
+class TestInstallIdBoundaries:
+   """Review round 1 finding: install-id extraction had no path-component
+   anchoring, so a prefix glued to another word, a 41-hex near-miss, and a
+   trailing extra character after the hex all falsely extracted an id.
+   """
+
+   def _hex40(self, ch="a"):
+      return ch * 40
+
+   def test_rejects_prefix_not_at_path_boundary(self):
+      cmdline = "/x/fooStable-%s/node" % self._hex40()
+      assert probe._extract_install_ids(cmdline) == []
+
+   def test_rejects_41_hex_near_miss(self):
+      cmdline = "Stable-%s" % ("a" * 41)
+      assert probe._extract_install_ids(cmdline) == []
+
+   def test_rejects_trailing_suffix_after_hex(self):
+      cmdline = "code-%sz" % self._hex40()
+      assert probe._extract_install_ids(cmdline) == []
+
+   def test_accepts_valid_stable_and_code_forms(self):
+      hex_id = self._hex40("b")
+      assert probe._extract_install_ids(
+         "/home/u/.vscode-server/bin/Stable-%s/node" % hex_id) == [hex_id]
+      assert probe._extract_install_ids(
+         "/home/u/.cursor-server/bin/code-%s/node" % hex_id) == [hex_id]
+
+   def test_accepts_case_insensitive_and_dedupes(self):
+      hex_id = self._hex40("c")
+      cmdline = "/x/Stable-%s/node worker.js" % hex_id.upper()
+      assert probe._extract_install_ids(cmdline) == [hex_id]
+
 
 class TestToolAggregatesSubprocess:
    def test_census_subprocess_emits_tools_without_raw_args(self, tmp_path):
