@@ -486,15 +486,25 @@ async def _run_subprocess(argv, env, stdin_data, timeout_sec,
    except asyncio.TimeoutError:
       await _terminate_process_group(proc, grace_sec)
       raise ProbeTimeoutError("probe exceeded %.1fs timeout" % timeout_sec)
-   except asyncio.CancelledError:
-      # The awaiting coroutine itself was cancelled (e.g. the scheduler
-      # tore down a slow poll's task at its next deadline, or another
-      # exception aborted the collection path). This function -- not
-      # the caller -- owns the subprocess/process group, so it must
-      # still terminate/kill/reap it before letting the cancellation
-      # propagate; otherwise the child (and any of its own
-      # descendants) is orphaned with no one left to reap it.
-      await asyncio.shield(_terminate_process_group(proc, grace_sec))
+   except BaseException as exc:
+      # ANY exception raised while _collect() owns the live subprocess
+      # -- not just our own internal timeout, and not just external
+      # cancellation -- must still terminate/kill/reap the owned
+      # process group before propagating. This function is the sole
+      # owner of `proc`; nothing else will ever reap it. Examples: the
+      # scheduler cancels this task at its next deadline (CancelledError,
+      # a BaseException), or a caller-supplied argument makes
+      # `proc.stdin.write()` raise synchronously inside `_feed_stdin`
+      # (e.g. AssertionError from asyncio's own StreamWriter on a
+      # non-bytes payload) before `proc.wait()` is ever reached.
+      # `asyncio.shield` only matters for the cancellation case (so a
+      # second cancellation of *this* task cannot interrupt the
+      # cleanup it caused), but does no harm for any other exception.
+      cleanup = _terminate_process_group(proc, grace_sec)
+      if isinstance(exc, asyncio.CancelledError):
+         await asyncio.shield(cleanup)
+      else:
+         await cleanup
       raise
 
    wall_seconds = clock() - started

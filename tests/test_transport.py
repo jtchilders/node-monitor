@@ -806,6 +806,56 @@ class TestTimeoutAndProcessGroupCleanup:
       with pytest.raises(ProcessLookupError):
          os.kill(child_pid, 0)
 
+   def test_non_cancellation_collection_failure_still_reaps_process(
+         self, fake_probe, tmp_path):
+      """Review round 2: cleanup must not be limited to
+      asyncio.TimeoutError/CancelledError. ANY exception raised while
+      _collect() owns the live subprocess must still terminate/kill/
+      reap the owned process group before propagating. A non-bytes
+      probe_script_source makes the real asyncio StreamWriter.write()
+      raise AssertionError synchronously inside _feed_stdin -- well
+      before proc.wait() is ever reached -- which is exactly the
+      "another collection-path exception aborts the await" case. The
+      fake is made to sleep, so an unreaped child is trivially
+      distinguishable from a reaped one via proc.returncode/os.kill.
+      """
+      control_dir = tmp_path / "ssh-control"
+      config_path = tmp_path / "ssh_config"
+      transport.write_ssh_config(str(config_path), str(control_dir), 8)
+      env = dict(os.environ)
+      env["FAKE_SLEEP_SECONDS"] = "30"
+      captured = {}
+      real_exec = asyncio.create_subprocess_exec
+
+      async def _capturing_exec(*args, **kwargs):
+         proc = await real_exec(*args, **kwargs)
+         captured["proc"] = proc
+         return proc
+
+      with pytest.raises(AssertionError):
+         _run(transport.run_remote_probe(
+            ssh_binary=fake_probe,
+            ssh_config_path=str(config_path),
+            connect_timeout_sec=8,
+            hostname="polaris-login-01.head",
+            probe_python="/usr/bin/python3.11",
+            probe_script_source="not-bytes",
+            loop="census",
+            probe_max_seconds=20,
+            hard_timeout_sec=30,
+            expected_probe_version=4,
+            base_env=env,
+            subprocess_exec=_capturing_exec,
+         ))
+
+      proc = captured["proc"]
+      deadline = time.monotonic() + 3
+      while time.monotonic() < deadline and proc.returncode is None:
+         time.sleep(0.05)
+      assert proc.returncode is not None, "child was never reaped"
+      with pytest.raises(ProcessLookupError):
+         os.kill(proc.pid, 0)
+
 
 # --------------------------------------------------------------------------
 # validate_probe_payload -- pure function, direct unit tests
