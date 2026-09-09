@@ -633,6 +633,39 @@ class TestRunRemoteProbe:
       assert len(result.stderr) <= 512
       assert result.stderr_truncated is True
 
+   def test_early_ssh_exit_with_oversized_stdin_raises_typed_ssh_error(
+         self, fake_probe, tmp_path):
+      """Review round 1 finding 1: when ssh exits early (e.g. exit 255,
+      auth failure) before the daemon finishes writing probe source to
+      its stdin pipe, writing must tolerate the child's early closure
+      (BrokenPipeError/ConnectionResetError) instead of leaking an
+      untyped exception, and the call must still classify the completed
+      ssh exit through the normal SSHAuthError/SSHTransportError path.
+      The fake ignores stdin entirely and exits immediately, so a probe
+      source larger than the OS pipe buffer (well over 64KiB) is certain
+      to still be in flight when the child closes its end.
+      """
+      config_path = self._config(tmp_path)
+      env = dict(os.environ)
+      env["FAKE_EXIT_CODE"] = "255"
+      env["FAKE_STDERR_TEXT"] = "Permission denied (publickey)\n"
+      oversized_source = b"x" * 2_000_000
+      with pytest.raises(transport.SSHAuthError) as excinfo:
+         _run(transport.run_remote_probe(
+            ssh_binary=fake_probe,
+            ssh_config_path=config_path,
+            connect_timeout_sec=8,
+            hostname="polaris-login-01.head",
+            probe_python="/usr/bin/python3.11",
+            probe_script_source=oversized_source,
+            loop="census",
+            probe_max_seconds=20,
+            hard_timeout_sec=30,
+            expected_probe_version=4,
+            base_env=env,
+         ))
+      assert excinfo.value.failure_type == "ssh_auth"
+
 
 # --------------------------------------------------------------------------
 # Hard timeout: terminate/kill/reap of process groups, no orphan descendants
@@ -726,6 +759,53 @@ class TestTimeoutAndProcessGroupCleanup:
       # Bounded by hard_timeout_sec + grace_sec, not the fake's 10s sleep.
       assert elapsed < 5
 
+   def test_cancellation_kills_process_group_no_orphan(
+         self, fake_probe, tmp_path):
+      """Review round 1 finding 2: transport.py owns the subprocess/
+      process group and must clean it up when the AWAITING COROUTINE is
+      cancelled (e.g. the scheduler cancels a slow poll's task at its
+      next deadline), not only on its own internal asyncio.TimeoutError.
+      The fake forks a long-lived grandchild; after cancelling the
+      run_local_probe task, that grandchild must be dead -- an orphan
+      would still answer os.kill(pid, 0).
+      """
+      marker = tmp_path / "cancel_child_pid.txt"
+      env = dict(os.environ)
+      env["FAKE_SPAWN_MARKER_FILE"] = str(marker)
+      env["FAKE_SPAWN_SLEEP_SECONDS"] = "30"
+      env["FAKE_SLEEP_SECONDS"] = "30"
+      probe_script_path = str(tmp_path / "remote_probe.py")
+      with open(probe_script_path, "w") as handle:
+         handle.write("# stand-in\n")
+
+      async def _drive():
+         task = asyncio.ensure_future(transport.run_local_probe(
+            probe_python=fake_probe,
+            probe_script_path=probe_script_path,
+            loop="census",
+            probe_max_seconds=30,
+            hard_timeout_sec=30,
+            expected_probe_version=4,
+            base_env=env,
+            grace_sec=0.3,
+         ))
+         deadline = time.monotonic() + 5
+         while time.monotonic() < deadline and not marker.exists():
+            await asyncio.sleep(0.05)
+         assert marker.exists(), "grandchild never started"
+         task.cancel()
+         with pytest.raises(asyncio.CancelledError):
+            await task
+
+      _run(_drive())
+
+      content = marker.read_text().strip()
+      assert content, "grandchild never wrote its pid"
+      child_pid = int(content)
+      time.sleep(0.5)
+      with pytest.raises(ProcessLookupError):
+         os.kill(child_pid, 0)
+
 
 # --------------------------------------------------------------------------
 # validate_probe_payload -- pure function, direct unit tests
@@ -765,3 +845,22 @@ class TestValidateProbePayload:
       with pytest.raises(transport.HostnameMismatchError):
          transport.validate_probe_payload(
             payload, "census", 4, expected_fqdn="right.example.org")
+
+   def test_missing_fqdn_rejected_even_without_expected_fqdn(self):
+      """Design: 'Each successful payload must have ... a remote-reported
+      FQDN.' This must hold independent of whether the caller happens to
+      know the exact hostname it expects.
+      """
+      payload = {"probe_version": 4, "loop": "census"}
+      with pytest.raises(transport.InvariantViolationError):
+         transport.validate_probe_payload(payload, "census", 4)
+
+   def test_empty_fqdn_rejected_even_without_expected_fqdn(self):
+      payload = {"probe_version": 4, "loop": "census", "hostname_fqdn": ""}
+      with pytest.raises(transport.InvariantViolationError):
+         transport.validate_probe_payload(payload, "census", 4)
+
+   def test_non_string_fqdn_rejected_even_without_expected_fqdn(self):
+      payload = {"probe_version": 4, "loop": "census", "hostname_fqdn": 123}
+      with pytest.raises(transport.InvariantViolationError):
+         transport.validate_probe_payload(payload, "census", 4)

@@ -278,10 +278,15 @@ def validate_probe_payload(payload, expected_loop, expected_probe_version,
       raise InvariantViolationError(
          "requested loop %r but probe reported loop %r"
          % (expected_loop, payload.get("loop")))
-   if expected_fqdn is not None and payload.get("hostname_fqdn") != expected_fqdn:
+   fqdn = payload.get("hostname_fqdn")
+   if not isinstance(fqdn, str) or not fqdn:
+      raise InvariantViolationError(
+         "probe payload must carry a non-empty string hostname_fqdn, "
+         "got %r" % (fqdn,))
+   if expected_fqdn is not None and fqdn != expected_fqdn:
       raise HostnameMismatchError(
          "expected FQDN %r, got %r"
-         % (expected_fqdn, payload.get("hostname_fqdn")))
+         % (expected_fqdn, fqdn))
    return payload
 
 
@@ -437,8 +442,33 @@ async def _run_subprocess(argv, env, stdin_data, timeout_sec,
       try:
          proc.stdin.write(stdin_data)
          await proc.stdin.drain()
+      except (BrokenPipeError, ConnectionResetError):
+         # The child (e.g. ssh failing fast on auth) closed its stdin
+         # before the daemon finished writing the probe source. That is
+         # not a transport bug -- the child's own exit code/stderr,
+         # captured below regardless, is the authoritative failure
+         # signal. Swallow the pipe error so it cannot surface as an
+         # unhandled/"Future exception was never retrieved" exception
+         # ahead of the typed classification in _finish.
+         pass
       finally:
-         proc.stdin.close()
+         try:
+            proc.stdin.close()
+         except (BrokenPipeError, ConnectionResetError):
+            pass
+         try:
+            await proc.stdin.wait_closed()
+         except (BrokenPipeError, ConnectionResetError):
+            # CPython's asyncio subprocess transport tracks stdin
+            # closure with its own internal future
+            # (SubprocessStreamProtocol._stdin_closed) that is set
+            # with an exception when the pipe closed abnormally (the
+            # same early-exit case this whole except-block exists
+            # for). If nothing ever awaits it, asyncio logs an
+            # "exception was never retrieved" warning on GC. Retrieve
+            # and discard it here for the same reason we discard the
+            # write/drain error above.
+            pass
 
    async def _collect():
       stderr_task = asyncio.ensure_future(
@@ -456,6 +486,16 @@ async def _run_subprocess(argv, env, stdin_data, timeout_sec,
    except asyncio.TimeoutError:
       await _terminate_process_group(proc, grace_sec)
       raise ProbeTimeoutError("probe exceeded %.1fs timeout" % timeout_sec)
+   except asyncio.CancelledError:
+      # The awaiting coroutine itself was cancelled (e.g. the scheduler
+      # tore down a slow poll's task at its next deadline, or another
+      # exception aborted the collection path). This function -- not
+      # the caller -- owns the subprocess/process group, so it must
+      # still terminate/kill/reap it before letting the cancellation
+      # propagate; otherwise the child (and any of its own
+      # descendants) is orphaned with no one left to reap it.
+      await asyncio.shield(_terminate_process_group(proc, grace_sec))
+      raise
 
    wall_seconds = clock() - started
    return _RawResult(
