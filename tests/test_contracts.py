@@ -412,6 +412,20 @@ class TestRecursiveArgvBan:
       }
       validate_node_poll_failures(record)  # must not raise
 
+   def test_node_collection_log_rejects_argv_nested_inside_a_tuple(self):
+      """Review round 2 finding: json.dumps serializes tuples as JSON
+      arrays just like lists, but the round-1 recursive scan only
+      descended into list/dict containers. A forbidden key nested
+      inside a tuple therefore reached the sink unexamined."""
+      record = {
+         "system": "polaris",
+         "timestamp_utc": "2026-09-09T00:00:00Z",
+         "event": "daemon_start",
+         "detail": {"nested": ({"argv": ["--secret"]},)},
+      }
+      with pytest.raises(ContractError, match="argv"):
+         validate_node_collection_log(record)
+
 
 # --------------------------------------------------------------------------
 # validate_record dispatch

@@ -333,7 +333,8 @@ _FORBIDDEN_ARGV_KEYS = frozenset((
 
 def _reject_forbidden_argv_keys(value, where):
    """Recursively scan ``value`` for any forbidden raw-argv/environment
-   key, at any nesting depth, through dicts and lists alike.
+   key, at any nesting depth, through dicts and every JSON-serializable
+   sequence container alike.
 
    Review round 1 finding: the original version only checked the
    diagnostic_census record root and its immediate ``processes[]`` rows.
@@ -346,6 +347,12 @@ def _reject_forbidden_argv_keys(value, where):
    that happens to contain "argv" as a substring (e.g. a human-written
    failure detail) is correctly left alone: only actual mapping keys are
    checked, never string contents.
+
+   Review round 2 finding: ``json.dumps`` serializes tuples exactly like
+   lists (both become JSON arrays), so a forbidden key nested inside a
+   tuple reached the sink unexamined when only ``list`` was checked
+   here. Every sequence type accepted by the stdlib JSON encoder -- at
+   minimum list and tuple -- must be traversed the same way.
    """
    if isinstance(value, dict):
       present = _FORBIDDEN_ARGV_KEYS & set(value)
@@ -355,7 +362,7 @@ def _reject_forbidden_argv_keys(value, where):
             % (where, ", ".join(sorted(present))))
       for key, nested in value.items():
          _reject_forbidden_argv_keys(nested, "%s.%s" % (where, key))
-   elif isinstance(value, list):
+   elif isinstance(value, (list, tuple)):
       for index, item in enumerate(value):
          _reject_forbidden_argv_keys(item, "%s[%d]" % (where, index))
 
