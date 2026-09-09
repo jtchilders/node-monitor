@@ -1,53 +1,50 @@
-# node_monitor example configuration.
-# Copy to config.yaml and edit. config.yaml is gitignored: it names hosts and
-# may carry DB connection details. Never commit it.
+# Phase 0 canary daemon configuration.
 #
-# This file is illustrative and intentionally contains NO IP addresses --
-# hostnames only. The daemon refuses to start on unknown keys.
+# Copy to config.yaml on the deployment host and edit -- config.yaml is
+# gitignored and never committed. This file is illustrative and
+# intentionally contains no site-specific detail: the daemon refuses to
+# start on any unknown key.
+#
+# Corrected against node_monitor.config's strict loader (Phase 0):
+# nodes now declare an explicit local/remote role (exactly one local
+# node is required), probe_python must name an explicit versioned
+# interpreter, and output_root must resolve under the deploying user's
+# home directory (never under /tmp).
 
 system: polaris
 
 nodes:
-  - polaris-login-01.hsn.cm.polaris.alcf.anl.gov
-  - polaris-login-02.hsn.cm.polaris.alcf.anl.gov
-  - polaris-login-04.hsn.cm.polaris.alcf.anl.gov
+  - hostname: polaris-login-04.hsn.cm.polaris.alcf.anl.gov
+    role: local
+  - hostname: polaris-login-01.hsn.cm.polaris.alcf.anl.gov
+    role: remote
+  - hostname: polaris-login-02.hsn.cm.polaris.alcf.anl.gov
+    role: remote
 
-collection:
-  census_interval_sec: 60
-  counter_interval_sec: 60
-  rollup_interval_sec: 60
-  # Days between forced hwinfo re-verification, absent a reboot or a missing
-  # row (both of which always trigger a refresh regardless of this value).
-  # Cheap insurance against a hardware swap that never bumped boot_id.
-  hardware_refresh_days: 30
+# Root directory for the run's phase0-<run-id>/ artifact directory (see
+# node_monitor.output.jsonl.Phase0Sink). Must resolve under $HOME.
+output_root: ~/phase0-runs
 
-backoff:
-  on_node_load:
-    enabled: false
-    load_threshold_ratio: 1.5
-    consecutive_polls: 3
-    recovery_polls: 5
-    max_interval_sec: 300
-  on_probe_cost:
-    enabled: true
-    max_probe_seconds: 2.0
-    consecutive_polls: 3
-    recovery_polls: 5
-    max_interval_sec: 300
+# Explicit, versioned remote/local probe interpreter -- never a bare
+# "python3" default. Login nodes ship an old system python3; this must
+# name the discovered >=3.9 interpreter for the target system.
+probe_python: /usr/bin/python3.11
 
-ssh:
-  census_timeout_sec: 20
-  counter_timeout_sec: 15
-  connect_timeout_sec: 8
-  require_mux: true
+# --- Everything below has a built-in default; only override what you
+# --- need to change from PHASE0_DAEMON_DESIGN.md's approved values.
 
-database:
-  # Loopback only. Credentials belong in the environment or a 0600 file,
-  # never here.
-  host: 127.0.0.1
-  port: 5432
-  dbname: CHANGEME
-  schema: node_monitor
+counter_interval_sec: 10
+census_interval_sec: 60
+rollup_interval_sec: 60
+usage_interval_sec: 900
+duration_sec: 86400
 
-safety:
-  min_free_disk_pct: 10
+counter_timeout_sec: 4
+census_timeout_sec: 20
+ssh_connect_timeout_sec: 8
+
+max_parallel_polls: 8
+
+# Output filesystem free-space floor. The daemon treats output write/flush
+# failure and low disk as fatal -- JSONL is the only Phase 0 result.
+min_free_disk_pct: 10
