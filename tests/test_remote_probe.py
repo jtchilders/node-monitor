@@ -588,6 +588,50 @@ class TestToolAggregates:
       assert probe._match_tools("myjupyterhelper") == []
       assert probe._match_tools("/x/myipykernelhelper") == []
 
+   def test_match_tools_underscore_and_dotted_component_near_misses(self):
+      """Review round 2 finding: `_` was already boundary-excluded, but the
+      bare-word alternatives still treated `.` as a valid boundary
+      character, so a `.` glued directly onto a marker (e.g. the unrelated
+      path component "foo.codex") satisfied the old boundary check even
+      though the tool-specific dotted markers (`.codex/`, `.vscode-server`,
+      `.cursor-server`) were correctly anchored to a real path component.
+      Also covers the underscore near-miss for every tool, not just
+      claude-code, and confirms `ipykernel_launcher` still matches as the
+      explicit suffix exception.
+      """
+      # Underscore near-misses across all five tool families.
+      assert probe._match_tools("my_claude_helper") == []
+      assert probe._match_tools("my_codex_helper") == []
+      assert probe._match_tools("my_vscode_server_helper") == []
+      assert probe._match_tools("my_cursor_server_helper") == []
+      assert probe._match_tools("my_jupyter_helper") == []
+      assert probe._match_tools("my_ipykernel_helper") == []
+
+      # Dotted-component near-misses: the marker sits inside an unrelated
+      # path component ("foo.codex", not a "/.codex/" component), so none
+      # of these should match even though the bare marker (codex,
+      # vscode-server, cursor-server) is present in the string.
+      assert probe._match_tools("/opt/foo.codex/bin/node") == []
+      assert probe._match_tools("/opt/foo.vscode-server/bin/node") == []
+      assert probe._match_tools("/opt/foo.cursor-server/bin/node") == []
+
+      # Real dotted path components must still match.
+      assert probe._match_tools("/home/u/.codex/bin/node") == ["codex"]
+      assert probe._match_tools(
+         "/home/u/.vscode-server/bin/node") == ["vscode-server"]
+      assert probe._match_tools(
+         "/home/u/.cursor-server/bin/node") == ["cursor-server"]
+
+      # Markers that legitimately contain an internal "." must still match
+      # -- the boundary exclusion only applies at the marker's edges.
+      assert probe._match_tools(
+         "anthropic.claude-code extension.js") == ["claude-code"]
+      assert probe._match_tools("openai.chatgpt cli") == ["codex"]
+
+      # ipykernel_launcher remains the one explicit underscore exception.
+      assert probe._match_tools(
+         "ipykernel_launcher -f k.json") == ["jupyter"]
+
 
 class TestInstallIdBoundaries:
    """Review round 1 finding: install-id extraction had no path-component

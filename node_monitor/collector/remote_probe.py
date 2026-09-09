@@ -200,24 +200,56 @@ _CONF_UNKNOWN = "unknown"
 # only one of them is a priority-ordered classification.
 #
 # EVERY marker below -- bare names and path/marker substrings alike -- is
-# boundary-anchored against "not preceded/followed by an alnum character"
-# (`_TOOL_BOUNDARY_BEFORE` / `_TOOL_BOUNDARY_AFTER`), not just the bare-name
-# rules. A naive substring check on "claude-code" would also match
-# "myclaude-code-helper"; a naive substring check on "jupyter" would also
-# match "myjupyterhelper". Review round 1 caught exactly these two false
-# positives (plus vscode-server/cursor-server/codex analogues) from an
-# earlier version of this file that only anchored the bare-name rules.
-# `_` is intentionally treated as a boundary too (not just alnum), so
+# boundary-anchored against "not preceded/followed by an executable-name
+# or path-component character" (`_TOOL_BOUNDARY_BEFORE` /
+# `_TOOL_BOUNDARY_AFTER`), which treats `_` AND `.` as name characters too
+# (NOT boundaries) -- otherwise "my_claude_helper" would false-match
+# "claude" the same way "myclaude-code-helper" did, and bare "codex" would
+# false-match the unrelated "foo.codex" component of
+# "/opt/foo.codex/bin/node" (a literal "." sitting right next to "codex"
+# looks like a boundary if `.` is treated as one, even though the dotted
+# per-tool markers below correctly require a REAL path component). Review
+# round 1 caught the plain-substring case (myclaude-code-helper,
+# myjupyterhelper, and the vscode-server/cursor-server/codex analogues);
+# review round 2 caught the underscore gap (my_claude_helper) and, on a
+# second pass after `.` surfaced as the same class of gap for the bare
+# markers, folded `.` into the shared boundary exclusion set rather than
+# only anchoring the dotted markers -- a marker-specific fix would have
+# left the bare "codex"/"vscode-server"/"cursor-server" alternatives in
+# the same rule still matching "foo.codex" via their own edges.
+#
 # `ipykernel_launcher` -- the real executable name jupyter kernels run
-# under -- still matches `ipykernel` while `myipykernelhelper` does not.
+# under -- is handled as an explicit optional suffix on the `ipykernel`
+# marker rather than by loosening the general boundary, so it matches
+# without reopening the underscore/dot gap for every other tool.
+#
+# The dotted markers (`.codex/`, `.vscode-server`, `.cursor-server`) are
+# meant to identify a specific path COMPONENT, so each is additionally
+# anchored at its leading edge with `_TOOL_PATH_BOUNDARY` (start of
+# string or a preceding `/`) -- otherwise "/opt/foo.codex/bin/node" would
+# false-match on the ".codex/" suffix of the unrelated "foo.codex"
+# component. This leading-edge anchor is necessary but not sufficient on
+# its own: without also excluding `.` from `_TOOL_BOUNDARY_AFTER`/
+# `_TOOL_BOUNDARY_BEFORE`, the SAME false positive still slips in through
+# the bare "codex" alternative in that tool's compiled pattern, since a
+# `.` immediately before/after "codex" satisfied the old alnum-or-`_`-only
+# boundary check.
 # --------------------------------------------------------------------------
 
-_TOOL_BOUNDARY_BEFORE = r"(?<![A-Za-z0-9])"
-_TOOL_BOUNDARY_AFTER = r"(?![A-Za-z0-9])"
+_TOOL_BOUNDARY_BEFORE = r"(?<![A-Za-z0-9_.])"
+_TOOL_BOUNDARY_AFTER = r"(?![A-Za-z0-9_.])"
+_TOOL_PATH_BOUNDARY = r"(?:^|/)"
 
 
 def _bounded(marker):
    return _TOOL_BOUNDARY_BEFORE + marker + _TOOL_BOUNDARY_AFTER
+
+
+def _bounded_path(marker):
+   """For a dotted path-component marker like ``.codex/`` -- must start at
+   the beginning of the string or immediately after a ``/``, so it only
+   matches a real path component, never a suffix of an unrelated one."""
+   return _TOOL_PATH_BOUNDARY + marker
 
 
 _TOOL_RULES = [
@@ -226,12 +258,17 @@ _TOOL_RULES = [
       _bounded(r"anthropic\.claude-code"))),
    ("codex", re.compile(
       _bounded(r"codex") + "|" + _bounded(r"codex-code-mode-host") + "|" +
-      r"\.codex/" + "|" + _bounded(r"openai\.chatgpt"))),
+      _bounded_path(r"\.codex/") + "|" + _bounded(r"openai\.chatgpt"))),
    ("vscode-server", re.compile(
-      _bounded(r"vscode-server") + "|" + r"\.vscode-server(?![A-Za-z0-9])")),
+      _bounded(r"vscode-server") + "|" +
+      _bounded_path(r"\.vscode-server") + _TOOL_BOUNDARY_AFTER)),
    ("cursor-server", re.compile(
-      _bounded(r"cursor-server") + "|" + r"\.cursor-server(?![A-Za-z0-9])")),
-   ("jupyter", re.compile(_bounded(r"jupyter") + "|" + _bounded(r"ipykernel"))),
+      _bounded(r"cursor-server") + "|" +
+      _bounded_path(r"\.cursor-server") + _TOOL_BOUNDARY_AFTER)),
+   ("jupyter", re.compile(
+      _bounded(r"jupyter") + "|" +
+      _TOOL_BOUNDARY_BEFORE + r"ipykernel(?:_launcher)?" +
+      _TOOL_BOUNDARY_AFTER)),
 ]
 
 # VS Code / Cursor embed a 40-hex installation id as a whole path component:
