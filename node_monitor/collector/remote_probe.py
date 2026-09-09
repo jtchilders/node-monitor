@@ -186,6 +186,129 @@ _CONF_PATH = "path_qualified"
 _CONF_ARGV = "argv_heuristic"
 _CONF_UNKNOWN = "unknown"
 
+# --------------------------------------------------------------------------
+# Tool-instance aggregates (`payload["tools"]`)
+#
+# Deliberately separate from _CATEGORY_RULES / _ACTIVITY_RULES above: those
+# answer "what kind of work is this" for every process, while this answers
+# "how many instances of THIS SPECIFIC TOOL are on the node" for a small,
+# named set of tools the project tracks explicitly. A process can therefore
+# match a tool rule here and a completely different activity label -- e.g. a
+# Claude Code VS Code extension process is `activity=claude-code` (priority
+# beats the broad IDE rule) but matches BOTH the claude-code and
+# vscode-server tool rules below, because both facts are true at once and
+# only one of them is a priority-ordered classification.
+#
+# Bare tool names are boundary-anchored ((^|/) ... ( |$)) to avoid matching
+# a substring inside an unrelated executable name, e.g. "mycodexhelper" must
+# not count as codex. The longer marker strings (".vscode-server",
+# "anthropic.claude-code", etc.) are specific enough to match as plain
+# substrings.
+# --------------------------------------------------------------------------
+
+_TOOL_RULES = [
+   ("claude-code", re.compile(
+      r"(^|/)claude( |$)|claude-code|anthropic\.claude-code")),
+   ("codex", re.compile(
+      r"(^|/)codex( |$)|codex-code-mode-host|\.codex/|openai\.chatgpt")),
+   ("vscode-server", re.compile(r"\.vscode-server|vscode-server")),
+   ("cursor-server", re.compile(r"\.cursor-server|cursor-server")),
+   ("jupyter", re.compile(r"jupyter|ipykernel")),
+]
+
+# VS Code / Cursor embed a 40-hex installation id in their server path, e.g.
+# ".vscode-server/bin/<Stable-HEX40>/node" or ".../code-<HEX40>/...". Other
+# tracked tools have no equivalent stable identifier, so install_count stays
+# null for them rather than reporting a meaningless 0.
+_INSTALL_ID_RE = re.compile(r"(?:stable|code)-([0-9a-f]{40})", re.IGNORECASE)
+_INSTALL_ID_TOOLS = frozenset(("vscode-server", "cursor-server"))
+
+# Ancestor-chain walk for `nested_in`: real fleet process trees are a few
+# hops deep, so 8 is generous headroom, not a tuned limit -- it exists to
+# bound the walk against a corrupt/cyclic PPID chain, which cycle detection
+# below also guards against independently.
+_NESTED_IN_MAX_HOPS = 8
+
+
+def _match_tools(cmdline):
+   """Return the sorted list of tool labels `cmdline` matches (may be >1)."""
+   return sorted(label for label, pattern in _TOOL_RULES
+                 if pattern.search(cmdline))
+
+
+def _extract_install_ids(cmdline):
+   # Normalize to lowercase: the requirement is dedup on distinct IDs
+   # "case-insensitive hex" -- Stable-AAAA... and stable-aaaa... must count
+   # as the same install, not two.
+   return [match.lower() for match in _INSTALL_ID_RE.findall(cmdline)]
+
+
+def _build_tool_aggregates(pid_index, tool_matches):
+   """Build `payload["tools"]` from the per-process data gathered in the one
+   /proc walk _collect_processes already does -- no second /proc pass.
+
+   `pid_index`: pid -> {"ppid": int, "tools": set(labels)} for EVERY process
+   seen this census (not just tool matches), so ancestor lookups work.
+   `tool_matches`: one entry per (pid, matched tool) pair -- a process
+   matching two tools contributes two entries, one per tool.
+
+   Nested-tool counts overlap by construction (one process can be `nested_in`
+   more than one aggregate, and one aggregate can have entries both nested
+   and standalone) and must NEVER be summed across tools -- doing so would
+   double-count the same process under two different tool totals.
+   """
+   groups = {}
+   for match in tool_matches:
+      key = (match["tool"], match["username"])
+      groups.setdefault(key, []).append(match)
+
+   aggregates = []
+   for (tool, username), items in groups.items():
+      tree_root_count = 0
+      rss_kb_total = 0
+      install_ids = set()
+      nested_in = set()
+      for item in items:
+         rss_kb_total += item["rss_kb"]
+         if tool in _INSTALL_ID_TOOLS:
+            install_ids.update(item["install_ids"])
+
+         parent_pid = pid_index[item["pid"]]["ppid"]
+         parent = pid_index.get(parent_pid)
+         if parent is None or tool not in parent["tools"]:
+            tree_root_count += 1
+
+         # Walk the PPID chain looking for CONTAINING tools -- distinct from
+         # this process's own tool matches, which is why the loop below
+         # only records ancestor tools, never `tool` itself.
+         visited = set()
+         cur_pid = parent_pid
+         hops = 0
+         while cur_pid is not None and hops < _NESTED_IN_MAX_HOPS:
+            if cur_pid in visited:
+               break
+            visited.add(cur_pid)
+            ancestor = pid_index.get(cur_pid)
+            if ancestor is None:
+               break
+            nested_in.update(t for t in ancestor["tools"] if t != tool)
+            cur_pid = ancestor["ppid"]
+            hops += 1
+
+      aggregates.append({
+         "tool": tool,
+         "username": username,
+         "proc_count": len(items),
+         "tree_root_count": tree_root_count,
+         "install_count": len(install_ids) if tool in _INSTALL_ID_TOOLS
+         else None,
+         "rss_kb_total": rss_kb_total,
+         "nested_in": sorted(nested_in),
+      })
+
+   aggregates.sort(key=lambda entry: (entry["tool"], entry["username"] or ""))
+   return aggregates
+
 
 class ProbeTimeout(Exception):
    """Raised by the SIGALRM handler when the probe exceeds its budget."""
@@ -740,12 +863,18 @@ def _project_from_path(cmdline):
 
 
 def _collect_processes(uid_names, drop_raw_args, deadline):
-   """Walk /proc once. Returns (rows, coverage).
+   """Walk /proc once. Returns (rows, coverage, tools).
 
    Coverage counts every way a process can fail to be read, so the daemon can
    tell a quiet node from a probe that is being denied. A census that
    silently drops 40% of processes and reports a clean sample is the single
    most dangerous failure mode this project has.
+
+   `tools` is the privacy-preserving tool-instance aggregate (see
+   `_build_tool_aggregates`): it is computed HERE, in this single /proc walk,
+   while `cmdline` is still available in this function's local scope --
+   never a second /proc pass, and never by keeping cmdline on the public row
+   past this function when `drop_raw_args` is set.
    """
    rows = []
    coverage = {
@@ -757,6 +886,14 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
       "owner_unresolved": 0,
       "vanished": 0,
    }
+   # Internal working representation for the tool aggregates below. Keyed by
+   # pid so ancestor lookups (parent tool, grandparent tool, ...) don't need
+   # a second /proc walk. Holds cmdline-derived tool matches only -- never
+   # the raw cmdline itself -- so this dict cannot leak argv even though it
+   # outlives the per-row `cmdline` local.
+   pid_index = {}
+   tool_matches = []
+
    try:
       entries = os.listdir(PROC_ROOT)
    except (IOError, OSError) as exc:
@@ -845,7 +982,21 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
       if not drop_raw_args:
          row["cmdline"] = cmdline
       rows.append(row)
-   return rows, coverage
+
+      pid_int = int(entry)
+      matched_tools = _match_tools(cmdline)
+      pid_index[pid_int] = {"ppid": ppid, "tools": set(matched_tools)}
+      for tool in matched_tools:
+         tool_matches.append({
+            "pid": pid_int,
+            "tool": tool,
+            "username": username,
+            "rss_kb": row["rss_kb"],
+            "install_ids": _extract_install_ids(cmdline)
+            if tool in _INSTALL_ID_TOOLS else (),
+         })
+   tools = _build_tool_aggregates(pid_index, tool_matches)
+   return rows, coverage, tools
 
 
 class _ProcUnreadable(Exception):
@@ -1012,10 +1163,11 @@ def main(argv):
 
          if opts["loop"] == "census":
             uid_names = _resolve_uid_names(_distinct_uids())
-            rows, coverage = _collect_processes(
+            rows, coverage, tools = _collect_processes(
                uid_names, opts["drop_raw_args"], deadline)
             payload["processes"] = rows
             payload["census_coverage"] = coverage
+            payload["tools"] = tools
             payload["counters"].update(_collect_session_counts(rows))
    except ProbeTimeout:
       signal.alarm(0)

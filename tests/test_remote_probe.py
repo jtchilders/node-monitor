@@ -289,7 +289,7 @@ class TestCensus:
          {"pid": 200, "comm": "node", "tty_nr": 0,
           "cmdline": "/home/u/.vscode-server/bin/a/node server-main.js"},
       ])
-      rows, coverage = probe._collect_processes(
+      rows, coverage, _tools = probe._collect_processes(
          {0: "root"}, drop_raw_args=True, deadline=None)
       assert coverage["pids_seen"] == 2
       by_pid = {row["pid"]: row for row in rows}
@@ -307,7 +307,7 @@ class TestCensus:
          {"pid": 2, "comm": "kthreadd", "cmdline": None},
          {"pid": 100, "comm": "bash", "cmdline": "-bash"},
       ])
-      rows, coverage = probe._collect_processes(
+      rows, coverage, _tools = probe._collect_processes(
          {0: "root"}, drop_raw_args=True, deadline=None)
       assert [row["pid"] for row in rows] == [100]
       assert coverage["kernel_thread"] == 1
@@ -327,7 +327,7 @@ class TestCensus:
          {"pid": 3, "comm": "kworker", "cmdline": ""},
          {"pid": 100, "comm": "bash", "cmdline": "-bash"},
       ])
-      rows, coverage = probe._collect_processes(
+      rows, coverage, _tools = probe._collect_processes(
          {0: "root"}, drop_raw_args=True, deadline=None)
       assert [row["pid"] for row in rows] == [100]
       assert coverage["cmdline_empty"] == 1
@@ -353,7 +353,7 @@ class TestCensus:
          return real_read(path)
 
       monkeypatch.setattr(probe, "_read_text", denying_read)
-      rows, coverage = probe._collect_processes(
+      rows, coverage, _tools = probe._collect_processes(
          {0: "root"}, drop_raw_args=True, deadline=None)
       assert [row["pid"] for row in rows] == [100]
       assert coverage["kernel_thread"] == 1
@@ -362,14 +362,14 @@ class TestCensus:
    def test_raw_args_dropped_by_default(self, proc_root):
       proc_root([{"pid": 100, "comm": "git",
                   "cmdline": "git clone https://user:secret@host/r.git"}])
-      rows, _ = probe._collect_processes(
+      rows, _, _tools = probe._collect_processes(
          {0: "root"}, drop_raw_args=True, deadline=None)
       assert "cmdline" not in rows[0]
       assert "secret" not in json.dumps(rows[0])
 
    def test_raw_args_kept_when_requested(self, proc_root):
       proc_root([{"pid": 100, "comm": "git", "cmdline": "git status"}])
-      rows, _ = probe._collect_processes(
+      rows, _, _tools = probe._collect_processes(
          {0: "root"}, drop_raw_args=False, deadline=None)
       assert rows[0]["cmdline"] == "git status"
 
@@ -387,7 +387,7 @@ class TestCensus:
          return real_read(path)
 
       monkeypatch.setattr(probe, "_read_text", denying_read)
-      rows, coverage = probe._collect_processes(
+      rows, coverage, _tools = probe._collect_processes(
          {0: "root"}, drop_raw_args=True, deadline=None)
       assert coverage["stat_unreadable"] == 1
       assert coverage["pids_seen"] == 2
@@ -396,7 +396,7 @@ class TestCensus:
    def test_username_null_when_unresolvable(self, proc_root):
       """An unresolvable uid must stay null, never be invented."""
       proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash"}])
-      rows, coverage = probe._collect_processes(
+      rows, coverage, _tools = probe._collect_processes(
          {}, drop_raw_args=True, deadline=None)
       assert rows[0]["username"] is None
       assert coverage["owner_unresolved"] == 1
@@ -404,10 +404,177 @@ class TestCensus:
    def test_rss_converted_from_pages(self, proc_root):
       proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
                   "rss_pages": 2048}])
-      rows, _ = probe._collect_processes(
+      rows, _, _tools = probe._collect_processes(
          {0: "root"}, drop_raw_args=True, deadline=None)
       page_kb = os.sysconf("SC_PAGESIZE") // 1024
       assert rows[0]["rss_kb"] == 2048 * page_kb
+
+
+# --------------------------------------------------------------------------
+# On-node tool-instance aggregates (privacy-preserving; computed while argv
+# is still available, before drop_raw_args strips cmdline from the rows).
+# --------------------------------------------------------------------------
+
+class TestToolAggregates:
+   def test_tools_present_default_rows_have_no_cmdline(self, proc_root):
+      proc_root([
+         {"pid": 100, "comm": "claude", "cmdline": "claude", "ppid": 1},
+      ])
+      rows, coverage, tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert "cmdline" not in rows[0]
+      assert tools == [
+         {"tool": "claude-code", "username": rows[0]["username"],
+          "proc_count": 1, "tree_root_count": 1, "install_count": None,
+          "rss_kb_total": rows[0]["rss_kb"], "nested_in": []},
+      ]
+
+   def test_proc_count_vs_tree_root_count_same_tool_parent_child(
+         self, proc_root):
+      """Same-tool parent+child must count as 2 processes but 1 tree root."""
+      proc_root([
+         {"pid": 100, "comm": "claude", "cmdline": "claude", "ppid": 1},
+         {"pid": 101, "comm": "claude", "cmdline": "claude --resume",
+          "ppid": 100},
+      ])
+      rows, coverage, tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      entry = next(t for t in tools if t["tool"] == "claude-code")
+      assert entry["proc_count"] == 2
+      assert entry["tree_root_count"] == 1
+
+   def test_install_id_dedup_and_null_for_non_install_tools(self, proc_root):
+      install_id = "a" * 40
+      proc_root([
+         {"pid": 200, "comm": "node", "ppid": 1,
+          "cmdline": "/home/u/.vscode-server/bin/Stable-%s/node "
+                     "server.js" % install_id},
+         {"pid": 201, "comm": "node", "ppid": 1,
+          "cmdline": "/home/u/.vscode-server/bin/Stable-%s/node "
+                     "worker.js" % install_id},
+         {"pid": 300, "comm": "claude", "ppid": 1, "cmdline": "claude"},
+      ])
+      rows, coverage, tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      vscode = next(t for t in tools if t["tool"] == "vscode-server")
+      assert vscode["proc_count"] == 2
+      assert vscode["install_count"] == 1
+      claude = next(t for t in tools if t["tool"] == "claude-code")
+      assert claude["install_count"] is None
+
+   def test_install_id_dedup_is_case_insensitive(self, proc_root):
+      """Stable-<HEX> vs Stable-<HEX-uppercase> must count as one install."""
+      hex_id = "abc123def456abc123def456abc123def456abcd"[:40]
+      proc_root([
+         {"pid": 200, "comm": "node", "ppid": 1,
+          "cmdline": "/home/u/.vscode-server/bin/Stable-%s/node "
+                     "server.js" % hex_id},
+         {"pid": 201, "comm": "node", "ppid": 1,
+          "cmdline": "/home/u/.vscode-server/bin/Stable-%s/node "
+                     "worker.js" % hex_id.upper()},
+      ])
+      rows, coverage, tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      vscode = next(t for t in tools if t["tool"] == "vscode-server")
+      assert vscode["proc_count"] == 2
+      assert vscode["install_count"] == 1
+
+   def test_rss_totals_sum_exactly(self, proc_root):
+      proc_root([
+         {"pid": 100, "comm": "claude", "cmdline": "claude", "ppid": 1,
+          "rss_pages": 100},
+         {"pid": 101, "comm": "claude", "cmdline": "claude", "ppid": 1,
+          "rss_pages": 200},
+      ])
+      rows, coverage, tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      entry = next(t for t in tools if t["tool"] == "claude-code")
+      page_kb = os.sysconf("SC_PAGESIZE") // 1024
+      assert entry["rss_kb_total"] == 300 * page_kb
+
+   def test_claude_under_vscode_nested_in_and_primary_category_preserved(
+         self, proc_root):
+      proc_root([
+         {"pid": 200, "comm": "node", "ppid": 1,
+          "cmdline": "/home/u/.vscode-server/bin/abc/node server-main.js"},
+         {"pid": 201, "comm": "claude", "ppid": 200,
+          "cmdline": "/home/u/.vscode-server/extensions/"
+                     "anthropic.claude-code-1.2.3/bin/claude"},
+      ])
+      rows, coverage, tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      claude_row = next(r for r in rows if r["pid"] == 201)
+      assert claude_row["category"] == "ai-coding-agent"
+      claude_tool = next(t for t in tools if t["tool"] == "claude-code")
+      assert claude_tool["nested_in"] == ["vscode-server"]
+
+   def test_parent_chain_bounded_and_cycle_safe(self, proc_root):
+      """A PPID cycle among ancestors must not hang or crash the walk.
+
+      pids 300..311 form a 12-node ring (each one's parent is the previous
+      one in the ring, wrapping around); pid 400 (claude) hangs off pid 300.
+      Walking claude's ancestry must terminate at the 8-hop bound.
+      """
+      pids = []
+      for i in range(12):
+         pid = 300 + i
+         ppid = 300 + (i - 1) if i > 0 else 300 + 11
+         pids.append({"pid": pid, "comm": "sh", "ppid": ppid,
+                      "cmdline": "sh -c foo"})
+      pids.append(
+         {"pid": 400, "comm": "claude", "ppid": 300, "cmdline": "claude"})
+      proc_root(pids)
+      rows, coverage, tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      entry = next(t for t in tools if t["tool"] == "claude-code")
+      assert entry["proc_count"] == 1
+      assert entry["nested_in"] == []
+
+   def test_one_process_contributes_to_two_tools_not_summed(self, proc_root):
+      """A Claude Code VS Code extension process legitimately matches both
+      claude-code and vscode-server aggregates. Each tool's proc_count must
+      independently reflect that one process; a caller summing proc_count
+      across tools would double count it, which is why callers must not.
+      """
+      proc_root([
+         {"pid": 500, "comm": "claude", "ppid": 1,
+          "cmdline": "/home/u/.vscode-server/extensions/"
+                     "anthropic.claude-code-1.2.3/bin/claude"},
+      ])
+      rows, coverage, tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      claude_tool = next(t for t in tools if t["tool"] == "claude-code")
+      vscode_tool = next(t for t in tools if t["tool"] == "vscode-server")
+      assert claude_tool["proc_count"] == 1
+      assert vscode_tool["proc_count"] == 1
+
+   def test_unknown_process_produces_no_tool_row(self, proc_root):
+      proc_root([
+         {"pid": 100, "comm": "bash", "cmdline": "-bash", "ppid": 1},
+      ])
+      rows, coverage, tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert tools == []
+
+
+class TestToolAggregatesSubprocess:
+   def test_census_subprocess_emits_tools_without_raw_args(self, tmp_path):
+      root = str(tmp_path / "proc")
+      fake_proc.write_proc(root, [
+         {"pid": 100, "comm": "claude", "cmdline": "claude", "ppid": 1},
+         {"pid": 200, "comm": "bash", "cmdline": "-bash"},
+      ])
+      env = dict(os.environ)
+      env["NODE_MONITOR_PROC_ROOT"] = root
+      result = subprocess.run(
+         [sys.executable, PROBE_PATH, "--loop", "census"],
+         capture_output=True, text=True, timeout=60, env=env)
+      assert result.returncode == 0, result.stderr
+      payload = json.loads(result.stdout)
+      assert "tools" in payload
+      assert {t["tool"] for t in payload["tools"]} == {"claude-code"}
+      for row in payload["processes"]:
+         assert "cmdline" not in row
 
 
 # --------------------------------------------------------------------------
