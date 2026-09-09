@@ -759,6 +759,56 @@ class TestTimeoutAndProcessGroupCleanup:
       # Bounded by hard_timeout_sec + grace_sec, not the fake's 10s sleep.
       assert elapsed < 5
 
+   def test_timeout_descendant_ignoring_sigterm_still_reaped(
+         self, fake_probe, tmp_path):
+      """Review round 3: a direct child that exits on group SIGTERM must
+      not make cleanup declare victory while a SIGTERM-ignoring
+      descendant of that same process group is still alive. The fake
+      leader here responds normally to SIGTERM (so proc.wait() returns
+      quickly), but its forked grandchild ignores SIGTERM and would
+      otherwise survive as an orphan; cleanup must escalate to a group
+      SIGKILL and confirm the WHOLE group is gone, not just the leader.
+      """
+      marker = tmp_path / "ignoring_descendant_pid.txt"
+      env = dict(os.environ)
+      env["FAKE_SPAWN_MARKER_FILE"] = str(marker)
+      env["FAKE_SPAWN_SLEEP_SECONDS"] = "30"
+      env["FAKE_SPAWN_IGNORE_SIGTERM"] = "1"
+      env["FAKE_SLEEP_SECONDS"] = "10"
+      probe_script_path = str(tmp_path / "remote_probe.py")
+      with open(probe_script_path, "w") as handle:
+         handle.write("# stand-in\n")
+
+      with pytest.raises(transport.ProbeTimeoutError):
+         _run(transport.run_local_probe(
+            probe_python=fake_probe,
+            probe_script_path=probe_script_path,
+            loop="census",
+            probe_max_seconds=30,
+            hard_timeout_sec=1.0,
+            expected_probe_version=4,
+            base_env=env,
+            grace_sec=0.3,
+         ))
+
+      deadline = time.monotonic() + 3
+      child_pid = None
+      while time.monotonic() < deadline:
+         if marker.exists():
+            content = marker.read_text().strip()
+            if content:
+               child_pid = int(content)
+               break
+         time.sleep(0.05)
+      assert child_pid is not None, "descendant never started"
+
+      # Give cleanup's own escalation/poll loop time to finish; it must
+      # not rely on the caller waiting further than transport.py itself
+      # already waited internally.
+      time.sleep(0.5)
+      with pytest.raises(ProcessLookupError):
+         os.kill(child_pid, 0)
+
    def test_cancellation_kills_process_group_no_orphan(
          self, fake_probe, tmp_path):
       """Review round 1 finding 2: transport.py owns the subprocess/

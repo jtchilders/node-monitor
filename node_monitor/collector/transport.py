@@ -375,6 +375,34 @@ async def _read_all(stream):
    return b"".join(chunks)
 
 
+def _process_group_alive(pgid):
+   """True if any process still belongs to `pgid` AND it is still ours
+   to signal.
+
+   A process group is not the same thing as its (former) leader: once
+   at least one member remains, `killpg(pgid, 0)` keeps succeeding even
+   after the leader that gave the group its pgid has exited and been
+   reaped. That is exactly the state a SIGTERM-ignoring descendant
+   leaves behind, so this is the only reliable way to tell "the group
+   is gone" from "the leader is gone".
+
+   `PermissionError` (EPERM, distinct from ESRCH/ProcessLookupError)
+   means the OS has recycled `pgid` onto an unrelated process group
+   this caller no longer has permission to signal -- observed in
+   practice under rapid repeated process creation, where a pgid a
+   moment ago was our own child can be reassigned to a different
+   process owned by another user by the time this check runs. That
+   process is not our orphan; further escalation against `pgid` would
+   be signalling someone else's process group, so treat it the same as
+   "gone" for our own cleanup's purposes and stop escalating.
+   """
+   try:
+      os.killpg(pgid, 0)
+   except (ProcessLookupError, PermissionError):
+      return False
+   return True
+
+
 async def _terminate_process_group(proc, grace_sec):
    """SIGTERM the whole process group started with start_new_session,
    give it `grace_sec` to exit, SIGKILL if it has not, then reap.
@@ -386,6 +414,15 @@ async def _terminate_process_group(proc, grace_sec):
    that has itself forked -- killing only the direct child would leave
    any grandchild (e.g. a hung nvidia-smi, or a remote shell's own
    children on the daemon-host end of the ssh pipe) running unreaped.
+
+   Reaping the direct child (`proc.wait()`) is NOT sufficient proof the
+   group is gone: a descendant that ignores SIGTERM keeps the process
+   group alive even after the leader we spawned has exited. So after
+   both the initial grace-period wait and any SIGKILL escalation, this
+   explicitly re-checks the whole group via `_process_group_alive` and
+   keeps escalating to SIGKILL until nothing answers to `pgid` (or the
+   grace budget runs out) -- never treating "our direct child exited"
+   as "the group is gone".
    """
    pgid = None
    try:
@@ -399,15 +436,34 @@ async def _terminate_process_group(proc, grace_sec):
          pass
    try:
       await asyncio.wait_for(proc.wait(), timeout=grace_sec)
-      return
    except asyncio.TimeoutError:
-      pass
-   if pgid is not None:
-      try:
-         os.killpg(pgid, signal.SIGKILL)
-      except ProcessLookupError:
-         pass
-   await proc.wait()
+      if pgid is not None:
+         try:
+            os.killpg(pgid, signal.SIGKILL)
+         except ProcessLookupError:
+            pass
+      await proc.wait()
+
+   if pgid is None:
+      return
+   if not _process_group_alive(pgid):
+      return
+   # The leader is gone (proc.wait() above returned) but something
+   # else in its process group is still alive -- e.g. a descendant
+   # that ignored the group SIGTERM above. SIGKILL cannot be ignored,
+   # so escalate and poll until the whole group is confirmed gone or
+   # the grace budget is exhausted. `pgid` was fetched while `proc`
+   # itself was still alive, but by this point the leader has already
+   # exited -- so, same as `_process_group_alive`, a PermissionError
+   # here means the OS has recycled `pgid` onto some other process
+   # this caller has no business signalling; treat that as "gone".
+   try:
+      os.killpg(pgid, signal.SIGKILL)
+   except (ProcessLookupError, PermissionError):
+      return
+   deadline = time.monotonic() + max(grace_sec, 0.0)
+   while _process_group_alive(pgid) and time.monotonic() < deadline:
+      await asyncio.sleep(0.02)
 
 
 async def _run_subprocess(argv, env, stdin_data, timeout_sec,

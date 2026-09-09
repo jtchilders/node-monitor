@@ -34,11 +34,15 @@ if _env("FAKE_IGNORE_SIGTERM") == "1":
    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 if _env("FAKE_SPAWN_MARKER_FILE"):
-   child = subprocess.Popen([
-      sys.executable, "-c",
-      "import os,sys,time;"
+   _spawn_code = "import os,sys,time,signal;"
+   if _env("FAKE_SPAWN_IGNORE_SIGTERM") == "1":
+      _spawn_code += "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+   _spawn_code += (
       "open(sys.argv[1],'w').write(str(os.getpid()));"
-      "time.sleep(float(sys.argv[2]))",
+      "time.sleep(float(sys.argv[2]))"
+   )
+   child = subprocess.Popen([
+      sys.executable, "-c", _spawn_code,
       _env("FAKE_SPAWN_MARKER_FILE"),
       _env("FAKE_SPAWN_SLEEP_SECONDS", "30"),
    ])
