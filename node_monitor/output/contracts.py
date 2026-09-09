@@ -47,6 +47,15 @@ def _validate_schema(record, required_keys, nullable_keys, what):
    ``required_keys``: must be present (value may still be None if the
    key is also in ``nullable_keys``).
    ``nullable_keys``: subset of required_keys allowed to hold None.
+
+   Also enforces the global "raw argv/environment never persists"
+   invariant (design: "Raw argv, environment, file descriptors, and
+   process I/O never persist") recursively across the WHOLE record, not
+   just the fields a given validator happens to type-check explicitly --
+   every record type accepts at least one free-form nested container
+   (``detail``, ``audit``, ``end_of_window``, ``rates``, ``cpu_deltas``)
+   that a caller could stuff a forbidden key into at any depth, and
+   Phase0Sink writes whatever validate_record() returns verbatim.
    """
    if not isinstance(record, dict):
       raise ContractError("%s record must be a mapping, got %s" % (
@@ -64,6 +73,7 @@ def _validate_schema(record, required_keys, nullable_keys, what):
       if record[key] is None and key not in nullable_keys:
          raise ContractError(
             "%s record field %r may not be null" % (what, key))
+   _reject_forbidden_argv_keys(record, "%s record" % what)
 
 
 # --------------------------------------------------------------------------
@@ -321,27 +331,39 @@ _FORBIDDEN_ARGV_KEYS = frozenset((
 ))
 
 
-def _reject_forbidden_argv_keys(mapping, where):
-   if not isinstance(mapping, dict):
-      return
-   present = _FORBIDDEN_ARGV_KEYS & set(mapping)
-   if present:
-      raise ContractError(
-         "diagnostic_census %s carries forbidden raw-argv key(s): %s"
-         % (where, ", ".join(sorted(present))))
+def _reject_forbidden_argv_keys(value, where):
+   """Recursively scan ``value`` for any forbidden raw-argv/environment
+   key, at any nesting depth, through dicts and lists alike.
+
+   Review round 1 finding: the original version only checked the
+   diagnostic_census record root and its immediate ``processes[]`` rows.
+   Every record type carries at least one free-form nested container
+   (``detail`` on node_collection_log/node_poll_failures, ``audit`` on
+   node_counter_samples, ``cpu_deltas`` on diagnostic_census, etc.) that
+   a caller could stuff a forbidden key into at arbitrary depth, and the
+   sink writes whatever validate_record() returns verbatim -- so this is
+   the last checkpoint before such a key reaches disk. A plain string
+   that happens to contain "argv" as a substring (e.g. a human-written
+   failure detail) is correctly left alone: only actual mapping keys are
+   checked, never string contents.
+   """
+   if isinstance(value, dict):
+      present = _FORBIDDEN_ARGV_KEYS & set(value)
+      if present:
+         raise ContractError(
+            "%s carries forbidden raw-argv key(s): %s"
+            % (where, ", ".join(sorted(present))))
+      for key, nested in value.items():
+         _reject_forbidden_argv_keys(nested, "%s.%s" % (where, key))
+   elif isinstance(value, list):
+      for index, item in enumerate(value):
+         _reject_forbidden_argv_keys(item, "%s[%d]" % (where, index))
 
 
 def validate_diagnostic_census(record):
    _validate_schema(record, _CENSUS_REQUIRED, _CENSUS_NULLABLE, "diagnostic_census")
    for key, types in _CENSUS_TYPES.items():
       _check_type(record, key, types, "diagnostic_census")
-   _reject_forbidden_argv_keys(record, "record")
-   for index, proc_row in enumerate(record["processes"]):
-      if not isinstance(proc_row, dict):
-         raise ContractError(
-            "diagnostic_census processes[%d] must be a mapping, got %s"
-            % (index, type(proc_row).__name__))
-      _reject_forbidden_argv_keys(proc_row, "processes[%d]" % index)
    return record
 
 

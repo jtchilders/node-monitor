@@ -332,6 +332,88 @@ class TestDiagnosticCensus:
 
 
 # --------------------------------------------------------------------------
+# Review round 1 regression: the raw-argv ban must be recursive across
+# EVERY record type and EVERY nesting level, not just diagnostic_census's
+# top level and immediate processes[] rows. detail/audit/end_of_window/
+# rates/cpu_deltas are all free-form dict payloads a caller could stuff a
+# forbidden key into at any depth.
+# --------------------------------------------------------------------------
+
+class TestRecursiveArgvBan:
+   def test_node_collection_log_rejects_argv_in_nested_detail(self):
+      record = {
+         "system": "polaris",
+         "timestamp_utc": "2026-09-09T00:00:00Z",
+         "event": "daemon_start",
+         "detail": {"argv": ["--secret"]},
+      }
+      with pytest.raises(ContractError, match="argv"):
+         validate_node_collection_log(record)
+
+   def test_diagnostic_census_rejects_argv_nested_inside_cpu_deltas(self):
+      record = {
+         "system": "polaris",
+         "source_hostname": "polaris-login-04.example.org",
+         "timestamp_utc": "2026-09-09T00:00:00Z",
+         "probe_version": 4,
+         "processes": [],
+         "cpu_deltas": {"nested": {"raw_argv": ["--secret"]}},
+      }
+      with pytest.raises(ContractError, match="argv"):
+         validate_diagnostic_census(record)
+
+   def test_diagnostic_census_rejects_argv_inside_a_list_of_dicts(self):
+      record = {
+         "system": "polaris",
+         "source_hostname": "polaris-login-04.example.org",
+         "timestamp_utc": "2026-09-09T00:00:00Z",
+         "probe_version": 4,
+         "processes": [{"pid": 1, "username": "u", "category": "other"}],
+         "cpu_deltas": {
+            "deltas": [{"pid": 1, "detail": {"cmdline": "python3 --secret"}}],
+            "unmeasured": [], "anomalies": [],
+         },
+      }
+      with pytest.raises(ContractError, match="argv"):
+         validate_diagnostic_census(record)
+
+   def test_node_counter_samples_rejects_argv_inside_audit(self):
+      record = {
+         "system": "polaris",
+         "source_hostname": "polaris-login-04.example.org",
+         "collector_hostname": "polaris-login-04.example.org",
+         "probe_version": 4,
+         "daemon_version": "0.1.0",
+         "window_start_utc": "2026-09-09T00:00:00Z",
+         "window_end_utc": "2026-09-09T00:01:00Z",
+         "sample_count": 6,
+         "expected_count": 6,
+         "coverage": 1.0,
+         "end_of_window": {"mem_available_kb": 1000},
+         "rates": {},
+         "audit": {"raw_cumulative": {"environ": {"SECRET": "x"}}},
+      }
+      with pytest.raises(ContractError, match="argv|environ"):
+         validate_node_counter_samples(record)
+
+   def test_node_poll_failures_rejects_argv_leaking_into_detail_string_is_not_flagged(self):
+      """detail on node_poll_failures is a plain string, not a container --
+      confirms the recursive scan does not false-positive on ordinary text
+      that merely contains the substring "argv"."""
+      record = {
+         "system": "polaris",
+         "source_hostname": "polaris-login-01.example.org",
+         "loop": "counter",
+         "timestamp_utc": "2026-09-09T00:00:00Z",
+         "failure_type": "timeout",
+         "detail": "argv parsing not involved here",
+         "consecutive_failures": 1,
+         "breaker_state": "closed",
+      }
+      validate_node_poll_failures(record)  # must not raise
+
+
+# --------------------------------------------------------------------------
 # validate_record dispatch
 # --------------------------------------------------------------------------
 

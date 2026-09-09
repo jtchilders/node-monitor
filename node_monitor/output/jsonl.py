@@ -229,6 +229,9 @@ class Phase0Sink:
       opened, so a rejected record leaves no trace on disk.
       Raises ``Phase0SinkDiskFullError`` if free disk is below the
       configured floor; the write never proceeds in that case either.
+      Raises ``Phase0SinkError`` if called after ``finalize_summary()``
+      has already run -- a write must never land after the summary that
+      is supposed to describe the run's final content.
       """
       if record_type not in _FILENAMES:
          raise Phase0SinkError("unknown record_type %r" % (record_type,))
@@ -236,6 +239,11 @@ class Phase0Sink:
       validated = validate_record(record_type, record)
 
       async with self._get_lock():
+         if self._summary_finalized:
+            raise Phase0SinkError(
+               "write_record() called after finalize_summary(); a run's "
+               "JSONL content must never diverge from its finalized "
+               "summary")
          self._check_disk_guard()
 
          if self._test_before_write_hook is not None:
@@ -263,8 +271,20 @@ class Phase0Sink:
       file simply never got a handle and reports zero counts/size, so a
       partial (signal-driven) shutdown still produces a valid summary
       for whichever files did receive data.
+
+      Must be called exactly once per sink: a second call raises
+      ``Phase0SinkError`` rather than silently re-finalizing, and once
+      finalized, ``write_record`` also refuses further writes -- so a
+      finalized run's summary can never diverge from its JSONL content
+      (review round 1 finding: a write slipping in after finalize_summary
+      previously left DONE-marked artifacts whose summary undercounted
+      their own files).
       """
       async with self._get_lock():
+         if self._summary_finalized:
+            raise Phase0SinkError(
+               "finalize_summary() called twice; a run's summary must "
+               "be produced exactly once")
          for handle in self._file_handles.values():
             handle.flush()
             os.fsync(handle.fileno())

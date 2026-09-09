@@ -456,3 +456,58 @@ class TestDoneOrdering:
       sink.write_done()
 
       assert order == ["summary_renamed", "done_opened"]
+
+
+# --------------------------------------------------------------------------
+# Review round 1 regression: a write after finalize_summary() must be
+# rejected, and DONE must never be reachable for a run whose JSONL
+# content has diverged from its already-finalized summary.
+# --------------------------------------------------------------------------
+
+class TestWriteAfterFinalizeRejected:
+   def test_write_after_finalize_is_rejected(self, tmp_path):
+      sink = Phase0Sink(str(tmp_path), "run24", disk_usage_fn=_full_disk_usage)
+      _run(sink.finalize_summary())
+      with pytest.raises(Phase0SinkError):
+         _run(sink.write_record("node_hardware", _hardware_record()))
+
+   def test_write_after_finalize_does_not_change_jsonl_or_summary(self, tmp_path):
+      sink = Phase0Sink(str(tmp_path), "run25", disk_usage_fn=_full_disk_usage)
+      _run(sink.write_record("node_hardware", _hardware_record("a.example.org")))
+      summary_before = _run(sink.finalize_summary())
+
+      with pytest.raises(Phase0SinkError):
+         _run(sink.write_record("node_hardware", _hardware_record("b.example.org")))
+
+      path = os.path.join(sink.run_dir, "node_hardware.jsonl")
+      with open(path) as handle:
+         lines = handle.readlines()
+      assert len(lines) == 1  # the post-finalize write never landed
+      assert summary_before["files"]["node_hardware"]["record_count"] == 1
+
+   def test_finalize_then_write_then_done_would_have_diverged_but_write_is_blocked(self, tmp_path):
+      """Reproduces the exact review-round-1 scenario: finalize an empty
+      sink, attempt one write, then call write_done(). The write must be
+      rejected so DONE can never mark a run whose summary undercounts its
+      own JSONL content."""
+      sink = Phase0Sink(str(tmp_path), "run26", disk_usage_fn=_full_disk_usage)
+      summary = _run(sink.finalize_summary())
+      assert summary["files"]["node_collection_log"]["record_count"] == 0
+
+      with pytest.raises(Phase0SinkError):
+         _run(sink.write_record("node_collection_log", {
+            "system": "polaris",
+            "timestamp_utc": "2026-09-09T00:00:00Z",
+            "event": "daemon_start",
+            "detail": {},
+         }))
+
+      sink.write_done()  # must still succeed: no divergent write got through
+      path = os.path.join(sink.run_dir, "node_collection_log.jsonl")
+      assert not os.path.exists(path)
+
+   def test_repeated_finalize_is_rejected(self, tmp_path):
+      sink = Phase0Sink(str(tmp_path), "run27", disk_usage_fn=_full_disk_usage)
+      _run(sink.finalize_summary())
+      with pytest.raises(Phase0SinkError):
+         _run(sink.finalize_summary())
