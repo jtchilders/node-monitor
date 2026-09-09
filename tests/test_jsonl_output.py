@@ -511,3 +511,120 @@ class TestWriteAfterFinalizeRejected:
       _run(sink.finalize_summary())
       with pytest.raises(Phase0SinkError):
          _run(sink.finalize_summary())
+
+
+# --------------------------------------------------------------------------
+# Review round 3 regression: a record must not be able to gain a
+# forbidden raw-argv key through mutation after it has already passed
+# validation but before it lands on disk -- i.e. validation and
+# serialization must be one indivisible step, with no `await` in
+# between where a queued writer's record could be mutated.
+# --------------------------------------------------------------------------
+
+class TestValidationSerializationAtomicity:
+   def test_mutation_while_write_is_queued_on_the_lock_cannot_persist(self, tmp_path):
+      """Deterministic reproduction of the review round 3 finding.
+
+      Writer 1 holds the sink's lock (paused inside the critical
+      section via the test-only hook). Writer 2 is started with a safe
+      record and allowed to run its *synchronous* prefix -- record-type
+      check, contract validation, and (with the fix) JSON serialization
+      -- up to the point where it blocks trying to acquire the same
+      lock. Only then is writer 2's original record object mutated to
+      inject a forbidden ``argv`` key. Writer 1 is released, writer 2's
+      write completes, and the persisted line must reflect the record
+      as it was AT VALIDATION TIME, not the later mutation -- proving
+      validation and serialization happened atomically with no
+      exploitable gap.
+      """
+      sink = Phase0Sink(str(tmp_path), "run28", disk_usage_fn=_full_disk_usage)
+
+      async def _main():
+         entered = asyncio.Event()
+         release = asyncio.Event()
+
+         async def hook():
+            entered.set()
+            await release.wait()
+
+         sink._test_before_write_hook = hook
+
+         record1 = {
+            "system": "polaris",
+            "timestamp_utc": "2026-09-09T00:00:00Z",
+            "event": "writer_one",
+            "detail": {},
+         }
+         task1 = asyncio.create_task(
+            sink.write_record("node_collection_log", record1))
+         await entered.wait()  # writer 1 now holds the lock, paused in the hook
+
+         record2 = {
+            "system": "polaris",
+            "timestamp_utc": "2026-09-09T00:00:00Z",
+            "event": "writer_two",
+            "detail": {"safe": True},
+         }
+         task2 = asyncio.create_task(
+            sink.write_record("node_collection_log", record2))
+         # Let writer 2 run its synchronous prefix (validate + serialize
+         # under the fix) until it blocks acquiring the lock held by
+         # writer 1. It must not be able to complete yet.
+         await asyncio.sleep(0)
+         assert not task2.done()
+
+         # Mutate writer 2's record object *after* it has (per the fix)
+         # already been validated and serialized, but while its write
+         # is still queued on the lock.
+         record2["detail"]["argv"] = ["--secret-marker"]
+
+         release.set()
+         await asyncio.gather(task1, task2)
+
+      _run(_main())
+
+      path = os.path.join(sink.run_dir, "node_collection_log.jsonl")
+      with open(path) as handle:
+         records = [json.loads(line) for line in handle]
+
+      assert len(records) == 2
+      by_event = {r["event"]: r for r in records}
+      assert by_event["writer_one"]["detail"] == {}
+      # The persisted record must match the pre-mutation, validated
+      # state -- no argv key, and "safe" still present and true.
+      assert by_event["writer_two"]["detail"] == {"safe": True}
+      assert "argv" not in by_event["writer_two"]["detail"]
+
+   def test_no_await_between_validate_and_serialize(self):
+      """Structural guard: assert write_record's compiled bytecode has
+      no YIELD/AWAIT opcode between the ``validate_record`` call and
+      the ``json.dumps`` call, so the atomicity this test suite relies
+      on cannot silently regress if the method is refactored.
+      """
+      import dis
+
+      from node_monitor.output.jsonl import Phase0Sink
+
+      instructions = list(dis.get_instructions(Phase0Sink.write_record))
+
+      validate_idx = None
+      dumps_idx = None
+      for index, instr in enumerate(instructions):
+         if instr.argval == "validate_record" and validate_idx is None:
+            validate_idx = index
+         if instr.argval == "dumps" and dumps_idx is None:
+            dumps_idx = index
+      assert validate_idx is not None and dumps_idx is not None
+      assert validate_idx < dumps_idx
+
+      between = instructions[validate_idx:dumps_idx]
+      suspend_opnames = {
+         name for name in (
+            "GET_AWAITABLE", "YIELD_FROM", "YIELD_VALUE",
+            "SEND", "BEFORE_ASYNC_WITH",
+         )
+      }
+      suspending = [instr for instr in between if instr.opname in suspend_opnames]
+      assert suspending == [], (
+         "found a suspension-capable opcode between validate_record() and "
+         "json.dumps(): %r" % (suspending,))

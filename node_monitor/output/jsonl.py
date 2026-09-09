@@ -232,11 +232,31 @@ class Phase0Sink:
       Raises ``Phase0SinkError`` if called after ``finalize_summary()``
       has already run -- a write must never land after the summary that
       is supposed to describe the run's final content.
+
+      Review round 3 finding: ``record`` is a caller-owned mutable
+      object. The old code validated it here but only serialized it
+      later, after awaiting the sink's lock -- a genuine ``await``
+      suspension point across which another coroutine could mutate the
+      same object (e.g. inject a forbidden argv key into a nested dict)
+      before the now-stale ``validated`` reference was finally
+      ``json.dumps``-ed. To close that TOCTOU window, validation and
+      serialization now happen back to back with no ``await`` between
+      them -- nothing can run on this single-threaded event loop in
+      that gap -- so ``line`` is fixed, immutable bytes computed from
+      exactly the structure that passed the privacy validator, before
+      this coroutine ever yields control by awaiting the lock.
       """
       if record_type not in _FILENAMES:
          raise Phase0SinkError("unknown record_type %r" % (record_type,))
 
       validated = validate_record(record_type, record)
+      # No `await` between validation and serialization: this line and
+      # the one above run atomically with respect to every other
+      # coroutine on this event loop, so `record` cannot be mutated in
+      # between. `line` is the immutable, already-serialized snapshot
+      # that every later step (lock wait, disk guard, hook, actual
+      # write) is scoped to.
+      line = json.dumps(validated, separators=(",", ":"))
 
       async with self._get_lock():
          if self._summary_finalized:
@@ -250,7 +270,6 @@ class Phase0Sink:
             await self._test_before_write_hook()
 
          handle = self._handle_for(record_type)
-         line = json.dumps(validated, separators=(",", ":"))
          handle.write(line + "\n")
          handle.flush()
 
