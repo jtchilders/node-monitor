@@ -1,0 +1,569 @@
+"""Tests for node_monitor.collector.usage -- census transformation and
+15-minute usage aggregation.
+
+Design: PHASE0_DAEMON_DESIGN.md "Output contract" (node_usage_intervals,
+diagnostic_census) + "Metric semantics" (process identity, CPU
+attribution) + Task 5 write-up in PHASE0_DAEMON_IMPLEMENTATION_PLAN.md.
+
+Two things under test, matching the module's own split:
+
+* ``build_diagnostic_census`` -- pure function, one raw census probe
+  payload (+ the daemon-known system/source_hostname identity, + the
+  optional cpu_delta result against the previous sample) in, one
+  ``diagnostic_censuses`` record out. Privacy-filtered: this is the last
+  checkpoint before a census-derived record reaches the sink, so it must
+  not depend on remote_probe.py's own --drop-raw-args default to keep
+  raw argv out.
+* ``UsageIntervalAccumulator`` -- bounded per-node state for one
+  15-minute window; ``finalize()`` must produce dicts that
+  ``node_monitor.output.contracts.validate_node_usage_intervals`` accepts
+  outright, so this suite pins the accumulator directly against the real
+  contract validator rather than a hand-invented shape.
+"""
+
+import pytest
+
+from node_monitor.collector.usage import (
+   UsageIntervalAccumulator,
+   build_diagnostic_census,
+   build_usage_observations,
+)
+from node_monitor.output.contracts import (
+   ContractError,
+   validate_diagnostic_census,
+   validate_node_usage_intervals,
+)
+
+
+CLK_TCK = 100
+
+
+def _row(pid, start_time_ticks, utime_ticks=0, stime_ticks=0,
+         category="other", activity=None, username="jchilders",
+         rss_kb=1000, state="S", interactive=False, cmdline=None):
+   row = {
+      "pid": pid,
+      "ppid": 1,
+      "uid": 1000,
+      "username": username,
+      "comm": "python",
+      "category": category,
+      "behavior": "batch",
+      "activity": activity,
+      "activity_confidence": "unknown",
+      "project_path_hint": None,
+      "utime_ticks": utime_ticks,
+      "stime_ticks": stime_ticks,
+      "rss_kb": rss_kb,
+      "state": state,
+      "start_time_ticks": start_time_ticks,
+      "interactive": interactive,
+   }
+   if cmdline is not None:
+      row["cmdline"] = cmdline
+   return row
+
+
+def _census(uptime_sec, processes, tools=None, wall_clock_utc="2026-09-09T00:00:00Z",
+            probe_version=4, clk_tck=CLK_TCK):
+   payload = {
+      "probe_version": probe_version,
+      "loop": "census",
+      "hostname_fqdn": "polaris-login-04.example.org",
+      "wall_clock_utc": wall_clock_utc,
+      "uptime_sec": uptime_sec,
+      "counters": {"clk_tck": clk_tck},
+      "processes": processes,
+   }
+   if tools is not None:
+      payload["tools"] = tools
+   return payload
+
+
+# --------------------------------------------------------------------------
+# build_diagnostic_census
+# --------------------------------------------------------------------------
+
+class TestBuildDiagnosticCensus:
+   def test_basic_shape_validates_against_contract(self):
+      payload = _census(10.0, [_row(1, 5, utime_ticks=100, stime_ticks=50)])
+
+      record = build_diagnostic_census(
+         "polaris", "polaris-login-04.example.org", payload)
+
+      validate_diagnostic_census(record)
+      assert record["system"] == "polaris"
+      assert record["source_hostname"] == "polaris-login-04.example.org"
+      assert record["timestamp_utc"] == "2026-09-09T00:00:00Z"
+      assert record["probe_version"] == 4
+
+   def test_first_sample_with_no_prior_cpu_delta_has_empty_deltas(self):
+      payload = _census(10.0, [_row(1, 5)])
+
+      record = build_diagnostic_census(
+         "polaris", "polaris-login-04.example.org", payload)
+
+      assert record["cpu_deltas"]["deltas"] == []
+      assert record["cpu_deltas"]["unmeasured"] == []
+      assert record["cpu_deltas"]["anomalies"] == []
+
+   def test_supplied_cpu_delta_is_carried_through(self):
+      payload = _census(19.0, [_row(1, 5, utime_ticks=150, stime_ticks=70)])
+      cpu_deltas = {
+         "deltas": [{"pid": 1, "start_time_ticks": 5,
+                     "utime_delta_ticks": 50, "stime_delta_ticks": 20,
+                     "cpu_seconds": 0.7}],
+         "unmeasured": [],
+         "anomalies": [],
+      }
+
+      record = build_diagnostic_census(
+         "polaris", "polaris-login-04.example.org", payload,
+         cpu_deltas=cpu_deltas)
+
+      assert record["cpu_deltas"]["deltas"] == cpu_deltas["deltas"]
+      validate_diagnostic_census(record)
+
+   def test_raw_cmdline_stripped_even_if_present_in_payload(self):
+      # Defense-in-depth: even if the probe emitted raw cmdline (e.g. a
+      # local test run with --keep-raw-args), this module must never let
+      # it reach a diagnostic_census record.
+      payload = _census(10.0, [
+         _row(1, 5, cmdline="/usr/bin/python3 --secret-token abc123"),
+      ])
+
+      record = build_diagnostic_census(
+         "polaris", "polaris-login-04.example.org", payload)
+
+      assert "cmdline" not in record["processes"][0]
+      validate_diagnostic_census(record)
+
+   def test_tool_aggregates_retained_in_cpu_deltas(self):
+      tools = [{"tool": "claude-code", "username": "jchilders",
+                "proc_count": 2, "tree_root_count": 1, "install_count": None,
+                "rss_kb_total": 4000, "nested_in": []}]
+      payload = _census(10.0, [_row(1, 5)], tools=tools)
+
+      record = build_diagnostic_census(
+         "polaris", "polaris-login-04.example.org", payload)
+
+      assert record["cpu_deltas"]["tools"] == tools
+      validate_diagnostic_census(record)
+
+   def test_missing_tools_field_yields_empty_list(self):
+      payload = _census(10.0, [_row(1, 5)])
+      assert "tools" not in payload
+
+      record = build_diagnostic_census(
+         "polaris", "polaris-login-04.example.org", payload)
+
+      assert record["cpu_deltas"]["tools"] == []
+
+   def test_other_process_fields_preserved(self):
+      payload = _census(10.0, [_row(
+         1, 5, category="ai-coding-agent", activity="claude-code",
+         username="jchilders", rss_kb=50000, state="S", interactive=True)])
+
+      record = build_diagnostic_census(
+         "polaris", "polaris-login-04.example.org", payload)
+
+      row = record["processes"][0]
+      assert row["category"] == "ai-coding-agent"
+      assert row["activity"] == "claude-code"
+      assert row["username"] == "jchilders"
+      assert row["rss_kb"] == 50000
+      assert row["state"] == "S"
+      assert row["interactive"] is True
+
+
+# --------------------------------------------------------------------------
+# build_usage_observations -- joins cpu_delta results back to census rows
+# --------------------------------------------------------------------------
+
+class TestBuildUsageObservationsMeasured:
+   def test_continuously_running_process_is_measured(self):
+      previous = _census(10.0, [
+         _row(42, 500, utime_ticks=100, stime_ticks=50,
+              category="ai-coding-agent", activity="claude-code",
+              username="alice", rss_kb=5000, state="S", interactive=True),
+      ])
+      current = _census(19.0, [
+         _row(42, 500, utime_ticks=250, stime_ticks=90,
+              category="ai-coding-agent", activity="claude-code",
+              username="alice", rss_kb=5000, state="S", interactive=True),
+      ])
+
+      observations = build_usage_observations(current, previous)
+
+      assert len(observations) == 1
+      obs = observations[0]
+      assert obs["pid"] == 42
+      assert obs["unmeasured"] is False
+      assert obs["cpu_seconds"] == pytest.approx(1.9)
+      assert obs["category"] == "ai-coding-agent"
+      assert obs["activity"] == "claude-code"
+      assert obs["username"] == "alice"
+      assert obs["rss_kb"] == 5000
+      assert obs["state"] == "S"
+      assert obs["interactive"] is True
+
+   def test_new_process_started_in_window_is_measured(self):
+      previous = _census(10.0, [])
+      current = _census(19.0, [
+         _row(77, 1500, utime_ticks=30, stime_ticks=10,
+              category="compute/build", activity="build-driver"),
+      ])
+
+      observations = build_usage_observations(current, previous)
+
+      assert len(observations) == 1
+      assert observations[0]["unmeasured"] is False
+      assert observations[0]["cpu_seconds"] == pytest.approx(0.4)
+
+
+class TestBuildUsageObservationsExited:
+   def test_exited_process_is_unmeasured_with_category_from_previous_sample(self):
+      previous = _census(10.0, [
+         _row(55, 200, utime_ticks=400, stime_ticks=100,
+              category="jupyter", activity="jupyter-kernel",
+              username="bob", rss_kb=8000, state="S", interactive=False),
+      ])
+      current = _census(19.0, [])
+
+      observations = build_usage_observations(current, previous)
+
+      assert len(observations) == 1
+      obs = observations[0]
+      assert obs["pid"] == 55
+      assert obs["unmeasured"] is True
+      assert obs["cpu_seconds"] == 0.0
+      assert obs["category"] == "jupyter"
+      assert obs["activity"] == "jupyter-kernel"
+      assert obs["username"] == "bob"
+
+
+class TestBuildUsageObservationsStartedBeforeWindow:
+   def test_started_before_window_process_is_unmeasured_with_current_category(self):
+      previous = _census(10.0, [])
+      current = _census(19.0, [
+         _row(88, 5, utime_ticks=9000, stime_ticks=4000,
+              category="fs-scan", activity="filesystem-scan"),
+      ])
+
+      observations = build_usage_observations(current, previous)
+
+      assert len(observations) == 1
+      obs = observations[0]
+      assert obs["unmeasured"] is True
+      assert obs["cpu_seconds"] == 0.0
+      assert obs["category"] == "fs-scan"
+
+
+class TestBuildUsageObservationsAmbiguous:
+   def test_negative_delta_anomaly_is_unmeasured_not_fabricated(self):
+      previous = _census(10.0, [
+         _row(9, 50, utime_ticks=800, stime_ticks=250,
+              category="other", activity=None),
+      ])
+      current = _census(19.0, [
+         _row(9, 50, utime_ticks=700, stime_ticks=250,
+              category="other", activity=None),
+      ])
+
+      observations = build_usage_observations(current, previous)
+
+      assert len(observations) == 1
+      obs = observations[0]
+      assert obs["unmeasured"] is True
+      assert obs["cpu_seconds"] == 0.0
+
+
+class TestBuildUsageObservationsFirstSample:
+   def test_no_previous_payload_marks_every_process_unmeasured(self):
+      # First census of a run: no previous sample exists at all, so
+      # cpu_delta.compute_cpu_delta is never called (there is nothing to
+      # diff against). Every process is present but unmeasurable.
+      current = _census(10.0, [
+         _row(1, 5, category="shell/session", activity="shell"),
+         _row(2, 8, category="other", activity=None),
+      ])
+
+      observations = build_usage_observations(current, previous_payload=None)
+
+      assert len(observations) == 2
+      assert all(obs["unmeasured"] is True for obs in observations)
+      assert all(obs["cpu_seconds"] == 0.0 for obs in observations)
+
+
+class TestBuildUsageObservationsMixed:
+   def test_mixed_sample_produces_correct_observation_per_pid(self):
+      previous = _census(10.0, [
+         _row(1, 10, utime_ticks=100, stime_ticks=50,
+              category="shell/session", activity="shell", username="alice"),
+         _row(2, 20, utime_ticks=300, stime_ticks=100,
+              category="jupyter", activity="jupyter-kernel", username="bob"),
+      ])
+      current = _census(19.0, [
+         _row(1, 10, utime_ticks=150, stime_ticks=70,
+              category="shell/session", activity="shell", username="alice"),
+         _row(4, 1700, utime_ticks=20, stime_ticks=10,
+              category="compute/build", activity="build-driver",
+              username="alice"),
+      ])
+
+      observations = build_usage_observations(current, previous)
+
+      by_pid = {obs["pid"]: obs for obs in observations}
+      assert set(by_pid) == {1, 2, 4}
+      assert by_pid[1]["unmeasured"] is False
+      assert by_pid[1]["cpu_seconds"] == pytest.approx(0.7)
+      assert by_pid[4]["unmeasured"] is False
+      assert by_pid[4]["cpu_seconds"] == pytest.approx(0.3)
+      assert by_pid[2]["unmeasured"] is True
+      assert by_pid[2]["category"] == "jupyter"
+      assert by_pid[2]["username"] == "bob"
+
+
+# --------------------------------------------------------------------------
+# UsageIntervalAccumulator -- bounded per-node 15-minute rollup
+# --------------------------------------------------------------------------
+
+def _make_accumulator(expected_count=15, system="polaris",
+                       source_hostname="polaris-login-04.example.org"):
+   return UsageIntervalAccumulator(
+      system=system,
+      source_hostname=source_hostname,
+      interval_start_utc="2026-09-09T00:00:00Z",
+      interval_end_utc="2026-09-09T00:15:00Z",
+      expected_count=expected_count,
+   )
+
+
+def _process_row(pid, category="other", activity=None, username="jchilders",
+                  cpu_seconds=0.0, rss_kb=1000, state="S", interactive=False,
+                  unmeasured=False):
+   """One 'observed process' entry as add_sample expects -- the shape the
+   daemon builds by joining one census payload's process rows against
+   cpu_delta.compute_cpu_delta's per-pid deltas/unmeasured lists for the
+   SAME sample. ``unmeasured=True`` means this pid had no measurable CPU
+   delta for this sample (new-but-before-window, exited, or the first
+   sample of the run with nothing to diff against) -- cpu_seconds is
+   irrelevant/ignored in that case.
+   """
+   return {
+      "pid": pid,
+      "category": category,
+      "activity": activity,
+      "username": username,
+      "cpu_seconds": cpu_seconds,
+      "rss_kb": rss_kb,
+      "state": state,
+      "interactive": interactive,
+      "unmeasured": unmeasured,
+   }
+
+
+class TestGrainGrouping:
+   def test_separate_rows_per_category_activity_username(self):
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample([
+         _process_row(1, category="ai-coding-agent", activity="claude-code",
+                      username="alice", cpu_seconds=1.0),
+         _process_row(2, category="ai-coding-agent", activity="codex-cli",
+                      username="alice", cpu_seconds=2.0),
+         _process_row(3, category="ai-coding-agent", activity="claude-code",
+                      username="bob", cpu_seconds=3.0),
+      ])
+
+      records = acc.finalize()
+
+      keys = {(r["category"], r["activity"], r["username"]) for r in records}
+      assert keys == {
+         ("ai-coding-agent", "claude-code", "alice"),
+         ("ai-coding-agent", "codex-cli", "alice"),
+         ("ai-coding-agent", "claude-code", "bob"),
+      }
+      for record in records:
+         validate_node_usage_intervals(record)
+
+   def test_same_grain_processes_summed_together(self):
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample([
+         _process_row(1, category="shell/session", activity="shell",
+                      username="alice", cpu_seconds=1.0),
+         _process_row(2, category="shell/session", activity="shell",
+                      username="alice", cpu_seconds=2.0),
+      ])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      assert records[0]["cpu_seconds"] == pytest.approx(3.0)
+
+
+class TestActivityNoneNormalizedToUnknown:
+   def test_null_activity_becomes_unknown_string(self):
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample([_process_row(1, category="other", activity=None)])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      assert records[0]["activity"] == "unknown"
+      validate_node_usage_intervals(records[0])
+
+
+class TestUsernameMayBeNull:
+   def test_null_username_grain_preserved_and_passes_contract(self):
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample([_process_row(1, username=None)])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      assert records[0]["username"] is None
+      validate_node_usage_intervals(records[0])
+
+
+class TestProcessCountPercentiles:
+   def test_p50_p95_max_over_samples(self):
+      acc = _make_accumulator(expected_count=3)
+      # Sample 1: 1 process in this grain; sample 2: 3; sample 3: 5.
+      acc.add_sample([_process_row(1, cpu_seconds=0.1)])
+      acc.add_sample([_process_row(1, cpu_seconds=0.1),
+                       _process_row(2, cpu_seconds=0.1),
+                       _process_row(3, cpu_seconds=0.1)])
+      acc.add_sample([_process_row(i, cpu_seconds=0.1) for i in range(5)])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      counts = records[0]["process_count"]
+      assert counts["max"] == 5
+      assert counts["p50"] <= counts["p95"] <= counts["max"]
+
+
+class TestCpuSecondsSummedAcrossSamples:
+   def test_cpu_seconds_accumulates_across_samples(self):
+      acc = _make_accumulator(expected_count=2)
+      acc.add_sample([_process_row(1, cpu_seconds=2.0)])
+      acc.add_sample([_process_row(1, cpu_seconds=3.5)])
+
+      records = acc.finalize()
+
+      assert records[0]["cpu_seconds"] == pytest.approx(5.5)
+
+
+class TestRssSummary:
+   def test_rss_kb_percentiles_over_all_observations(self):
+      acc = _make_accumulator(expected_count=2)
+      acc.add_sample([_process_row(1, rss_kb=1000)])
+      acc.add_sample([_process_row(1, rss_kb=3000)])
+
+      records = acc.finalize()
+
+      rss = records[0]["rss_kb"]
+      assert rss["max"] == 3000
+      assert rss["p50"] <= rss["p95"] <= rss["max"]
+
+
+class TestDStateFraction:
+   def test_fraction_of_observations_in_d_state(self):
+      acc = _make_accumulator(expected_count=4)
+      acc.add_sample([_process_row(1, state="D")])
+      acc.add_sample([_process_row(1, state="S")])
+      acc.add_sample([_process_row(1, state="D")])
+      acc.add_sample([_process_row(1, state="S")])
+
+      records = acc.finalize()
+
+      assert records[0]["d_state_fraction"] == pytest.approx(0.5)
+
+
+class TestInteractivityFraction:
+   def test_fraction_of_observations_interactive(self):
+      acc = _make_accumulator(expected_count=4)
+      acc.add_sample([_process_row(1, interactive=True)])
+      acc.add_sample([_process_row(1, interactive=True)])
+      acc.add_sample([_process_row(1, interactive=False)])
+      acc.add_sample([_process_row(1, interactive=False)])
+
+      records = acc.finalize()
+
+      assert records[0]["interactivity_fraction"] == pytest.approx(0.5)
+
+
+class TestExpectedAndSampleCounts:
+   def test_full_window_reports_full_expected_and_sample_counts(self):
+      acc = _make_accumulator(expected_count=3)
+      for _ in range(3):
+         acc.add_sample([_process_row(1)])
+
+      records = acc.finalize()
+
+      assert records[0]["sample_count"] == 3
+      assert records[0]["expected_count"] == 3
+
+   def test_partial_window_reports_partial_sample_count(self):
+      acc = _make_accumulator(expected_count=3)
+      acc.add_sample([_process_row(1)])
+
+      records = acc.finalize()
+
+      assert records[0]["sample_count"] == 1
+      assert records[0]["expected_count"] == 3
+
+
+class TestUnmeasuredCount:
+   def test_unmeasured_process_observation_counted_separately(self):
+      acc = _make_accumulator(expected_count=2)
+      acc.add_sample([_process_row(1, cpu_seconds=0.0, unmeasured=True)])
+      acc.add_sample([_process_row(1, cpu_seconds=1.0, unmeasured=False)])
+
+      records = acc.finalize()
+
+      assert records[0]["unmeasured_count"] == 1
+      # Only the measured observation contributes cpu_seconds.
+      assert records[0]["cpu_seconds"] == pytest.approx(1.0)
+
+   def test_unmeasured_only_grain_still_produces_a_valid_row(self):
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample([_process_row(1, unmeasured=True)])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      assert records[0]["unmeasured_count"] == 1
+      assert records[0]["cpu_seconds"] == 0.0
+      validate_node_usage_intervals(records[0])
+
+
+class TestEmptyWindow:
+   def test_zero_samples_produces_zero_records(self):
+      acc = _make_accumulator(expected_count=3)
+
+      records = acc.finalize()
+
+      assert records == []
+
+
+class TestContractCompliance:
+   def test_finalize_output_validates_against_node_usage_intervals_contract(self):
+      acc = _make_accumulator(expected_count=2)
+      acc.add_sample([_process_row(
+         1, category="ai-coding-agent", activity="claude-code",
+         username="jchilders", cpu_seconds=1.0, rss_kb=2000, state="S",
+         interactive=True)])
+      acc.add_sample([_process_row(
+         1, category="ai-coding-agent", activity="claude-code",
+         username="jchilders", cpu_seconds=1.5, rss_kb=2200, state="D",
+         interactive=True)])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      validated = validate_node_usage_intervals(records[0])
+      assert validated["system"] == "polaris"
+      assert validated["source_hostname"] == "polaris-login-04.example.org"
+      assert validated["interval_start_utc"] == "2026-09-09T00:00:00Z"
+      assert validated["interval_end_utc"] == "2026-09-09T00:15:00Z"
