@@ -666,18 +666,46 @@ class TestBoundedRawCumulativeAudit:
    def test_excess_samples_do_not_move_window_last_raw_snapshot_forward_of_cap(self):
       # An excess sample still updates end_of_window gauges (design:
       # gauges are the true last sample), but the raw_cumulative audit
-      # snapshot must stay bounded to exactly two entries regardless --
-      # this test only asserts it never grows into a list/history.
-      acc = _make_accumulator(expected_count=1)
+      # must stay pinned to the accepted boundary that actually
+      # produced the reported rates -- not the excess sample's raw
+      # cumulative values, which never contributed to any rate.
+      acc = _make_accumulator(expected_count=2)
       acc.add_sample(_sample(10.0, cpu_jiffies=_jiffies(user=100, idle=900)))
-      acc.add_sample(_sample(20.0, cpu_jiffies=_jiffies(user=999, idle=999)))
+      acc.add_sample(_sample(20.0, cpu_jiffies=_jiffies(user=200, idle=1800)))
+      # Excess: uptime/jiffies far beyond the accepted window, so if it
+      # leaked into raw_cumulative it would silently imply a huge,
+      # unreported rate.
+      acc.add_sample(_sample(
+         40.0, cpu_jiffies=_jiffies(user=100000, idle=100000)))
 
       record = acc.finalize()
       raw = record["audit"]["raw_cumulative"]
 
-      assert isinstance(raw["window_first"], dict)
-      assert isinstance(raw["window_last"], dict)
-      assert record["sample_count"] == 1
+      assert record["sample_count"] == 2
+      assert record["audit"]["excess_sample_count"] == 1
+      assert raw["window_first"]["uptime_sec"] == 10.0
+      assert raw["window_first"]["cpu_jiffies"] == \
+         _jiffies(user=100, idle=900)
+      # Must reflect the second (accepted) sample -- the true boundary
+      # rate computation used -- not the excess third sample.
+      assert raw["window_last"]["uptime_sec"] == 20.0
+      assert raw["window_last"]["cpu_jiffies"] == \
+         _jiffies(user=200, idle=1800)
+
+      # The audit boundaries must independently reproduce the reported
+      # cpu_busy_pct rate: (200-100)/((1800-900)+(200-100)) * 100.
+      elapsed_jiffies = (
+         (raw["window_last"]["cpu_jiffies"]["user"]
+          - raw["window_first"]["cpu_jiffies"]["user"])
+         + (raw["window_last"]["cpu_jiffies"]["idle"]
+            - raw["window_first"]["cpu_jiffies"]["idle"]))
+      busy_jiffies = (
+         raw["window_last"]["cpu_jiffies"]["user"]
+         - raw["window_first"]["cpu_jiffies"]["user"])
+      recomputed_busy_pct = 100.0 * busy_jiffies / elapsed_jiffies
+      assert record["rates"]["cpu_busy_pct"]["max"] == \
+         pytest.approx(recomputed_busy_pct)
+
       validate_node_counter_samples(record)
 
    def test_raw_cumulative_state_bounded_under_many_samples(self):

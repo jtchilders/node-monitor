@@ -362,13 +362,17 @@ class CounterWindowAccumulator:
    Design: "Raw cumulative values and validity diagnostics remain in a
    bounded audit object" -- the ``audit`` field on the finalized record
    carries summary counts/reasons plus ``raw_cumulative``: exactly TWO
-   raw-counter snapshots (the window's first accepted sample and its
-   true last sample, whichever the two are), each reduced to only the
-   cumulative fields the rate math itself uses (``uptime_sec``,
-   ``boot_id``, ``cpu_jiffies``, ``net``, ``md_ops``) so the record is
-   independently auditable -- a reviewer can recompute any reported rate
-   from these two snapshots alone -- without ever growing with sample
-   count. ``end_of_window``'s point-in-time gauges are likewise always
+   raw-counter snapshots (the window's first accepted sample and the
+   last accepted sample that actually contributed to rate computation),
+   each reduced to only the cumulative fields the rate math itself uses
+   (``uptime_sec``, ``boot_id``, ``cpu_jiffies``, ``net``, ``md_ops``)
+   so the record is independently auditable -- a reviewer can recompute
+   any reported rate from these two snapshots alone -- without ever
+   growing with sample count. An excess sample (beyond
+   ``expected_count``) never moves ``window_last`` forward, since it
+   contributes no rate; it only updates ``end_of_window``, whose
+   point-in-time gauges are deliberately drawn from the true last
+   sample of the window (tracked separately) and are likewise always
    exactly one sample's worth of data.
    """
 
@@ -489,8 +493,8 @@ class CounterWindowAccumulator:
                _raw_cumulative_snapshot(self._first_sample)
                if self._first_sample else None),
             "window_last": (
-               _raw_cumulative_snapshot(self._last_sample)
-               if self._last_sample else None),
+               _raw_cumulative_snapshot(self._previous_sample)
+               if self._previous_sample else None),
          },
       }
 
