@@ -1010,6 +1010,96 @@ class TestTimeoutAndProcessGroupCleanup:
          "cleanup left subprocess pipe transports for __del__/GC to "
          "close after event-loop shutdown: %r" % (captured,))
 
+   def test_wait_group_confirmed_gone_rejects_single_racy_final_read(
+         self, monkeypatch):
+      """Round 5 finding 2: a "gone" reading observed only once, right
+      as the deadline is reached, must NOT be accepted as confirmation
+      -- only `_GROUP_GONE_STABILITY_CHECKS` actual consecutive "gone"
+      reads may return True. The deadline is set to elapse after
+      exactly one poll interval, so the sequence is: check #1 (alive)
+      resets the counter, one real `_GROUP_GONE_POLL_SEC` sleep passes,
+      check #2 (gone) brings the consecutive count to only 1 -- far
+      short of `_GROUP_GONE_STABILITY_CHECKS` -- at which point the
+      deadline has already elapsed. The pre-fix code's dedicated "one
+      more read at the deadline" branch would have accepted that
+      single reading as proof; the fixed code must not.
+      """
+      calls = {"n": 0}
+
+      def _fake_alive(pgid):
+         calls["n"] += 1
+         return calls["n"] == 1
+
+      monkeypatch.setattr(transport, "_process_group_alive", _fake_alive)
+      deadline = time.monotonic() + (transport._GROUP_GONE_POLL_SEC * 1.5)
+
+      result = _run(transport._wait_group_confirmed_gone(
+         pgid=424242, deadline=deadline))
+      assert result is False
+      assert calls["n"] >= 2
+
+   def test_wait_group_confirmed_gone_true_only_after_stability_run(
+         self, monkeypatch):
+      """Companion positive case: `_GROUP_GONE_STABILITY_CHECKS`
+      consecutive "gone" reads, well before the deadline, DO confirm
+      the group is gone.
+      """
+      calls = {"n": 0}
+
+      def _fake_alive(pgid):
+         calls["n"] += 1
+         # First read alive, then permanently gone.
+         return calls["n"] == 1
+
+      monkeypatch.setattr(transport, "_process_group_alive", _fake_alive)
+      deadline = time.monotonic() + 5.0
+
+      result = _run(transport._wait_group_confirmed_gone(
+         pgid=424242, deadline=deadline))
+      assert result is True
+      assert calls["n"] == 1 + transport._GROUP_GONE_STABILITY_CHECKS
+
+   def test_terminate_process_group_raises_when_group_confirmed_alive(
+         self, monkeypatch):
+      """Round 5 finding 1: `_terminate_process_group` must not
+      silently return while its owned process group is confirmed to
+      remain alive even after SIGKILL escalation -- it must raise
+      `ProcessGroupCleanupError` instead. Deterministic reproduction of
+      the reviewer's finding: a stub process plus patched
+      `os.getpgid`/`os.killpg`/`_process_group_alive` (always "alive")
+      means no amount of escalation will ever see the group go away.
+      """
+      class _StubProc:
+         def __init__(self, pid):
+            self.pid = pid
+            self.returncode = 0
+            self._transport = None
+            self.stdout = None
+            self.stderr = None
+
+         async def wait(self):
+            return 0
+
+      monkeypatch.setattr(transport.os, "getpgid", lambda pid: 424242)
+      monkeypatch.setattr(transport.os, "killpg", lambda pgid, sig: None)
+      monkeypatch.setattr(
+         transport, "_process_group_alive", lambda pgid: True)
+      close_calls = []
+
+      async def _spy_close(proc):
+         close_calls.append(proc)
+
+      monkeypatch.setattr(
+         transport, "_close_subprocess_transport", _spy_close)
+
+      proc = _StubProc(pid=123456)
+      with pytest.raises(transport.ProcessGroupCleanupError):
+         _run(transport._terminate_process_group(proc, grace_sec=0.05))
+
+      # Cleanup failure must not be masked by proceeding to drain/close
+      # the transport and returning as if nothing were wrong.
+      assert close_calls == []
+
 
 # --------------------------------------------------------------------------
 # validate_probe_payload -- pure function, direct unit tests

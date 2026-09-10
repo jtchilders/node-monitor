@@ -116,6 +116,23 @@ class InvariantViolationError(TransportError):
    failure_type = "invariant_violation"
 
 
+class ProcessGroupCleanupError(TransportError):
+   """`_terminate_process_group` could not confirm its owned process
+   group was gone even after bounded SIGKILL escalation.
+
+   SIGKILL cannot be ignored by a process in a normal runnable state,
+   so exhausting several confirmed escalation attempts means something
+   is fundamentally wrong (e.g. a descendant stuck in uninterruptible
+   I/O). There is no more specific failure type for this in the
+   design's taxonomy, so it shares ``invariant_violation`` -- this is
+   deliberately NOT swallowed into a quiet return, since doing so would
+   let a caller believe cleanup succeeded (no orphan) when it did not
+   (review round 5).
+   """
+
+   failure_type = "invariant_violation"
+
+
 # --------------------------------------------------------------------------
 # Result
 # --------------------------------------------------------------------------
@@ -424,18 +441,27 @@ async def _wait_group_confirmed_gone(pgid, deadline):
    recheck, while a group observed "gone" only by a single racy read
    flips back to "alive" on the very next check because the kernel has
    not actually finished tearing it down yet. Returns True once the
-   group is confirmed gone, False if `deadline` was reached first.
+   group is confirmed gone by `_GROUP_GONE_STABILITY_CHECKS` actual
+   consecutive "gone" reads; returns False the instant `deadline`
+   passes, with NO extra read of any kind -- review round 5 found this
+   returning the result of one final, uncounted `_process_group_alive`
+   read at the deadline, which lets a single racy "gone" observation
+   (not yet corroborated by the required run of consecutive reads)
+   pass as confirmation. The deadline check happens before the poll
+   sleep specifically so a deadline that has already elapsed by the
+   time this coroutine is first scheduled still reports False rather
+   than silently performing one bonus read.
    """
    consecutive_gone = 0
    while True:
+      if time.monotonic() >= deadline:
+         return False
       if _process_group_alive(pgid):
          consecutive_gone = 0
       else:
          consecutive_gone += 1
          if consecutive_gone >= _GROUP_GONE_STABILITY_CHECKS:
             return True
-      if time.monotonic() >= deadline:
-         return not _process_group_alive(pgid)
       await asyncio.sleep(_GROUP_GONE_POLL_SEC)
 
 
@@ -492,10 +518,14 @@ async def _terminate_process_group(proc, grace_sec):
    and keeps escalating to SIGKILL until the group is CONFIRMED gone
    (several consecutive "gone" reads, not a single racy one) or the
    grace budget runs out -- never treating "our direct child exited",
-   or a single `killpg` failure, as "the group is gone". Finally,
-   drains and closes the owned subprocess transport so no pipe/fd
-   cleanup is left to `__del__` after this coroutine's event loop
-   shuts down.
+   or a single `killpg` failure, as "the group is gone". If SIGKILL
+   escalation still cannot confirm the group is gone before its own
+   deadline, this raises `ProcessGroupCleanupError` rather than
+   returning normally (review round 5: silently returning here let a
+   caller believe the no-orphan postcondition held when it did not).
+   Finally, drains and closes the owned subprocess transport so no
+   pipe/fd cleanup is left to `__del__` after this coroutine's event
+   loop shuts down.
    """
    pgid = None
    try:
@@ -535,7 +565,19 @@ async def _terminate_process_group(proc, grace_sec):
             pass
          else:
             escalated_deadline = time.monotonic() + max(grace_sec, 0.0)
-            await _wait_group_confirmed_gone(pgid, escalated_deadline)
+            if not await _wait_group_confirmed_gone(
+                  pgid, escalated_deadline):
+               # Do NOT proceed to drain/close the transport and return
+               # normally: that would tell the caller cleanup succeeded
+               # (no orphan) while the process group may still be
+               # alive. A process cannot ignore SIGKILL in a normal
+               # runnable state, so exhausting a full confirmed
+               # escalation cycle without seeing the group go away is
+               # an invariant violation worth surfacing explicitly
+               # rather than swallowing.
+               raise ProcessGroupCleanupError(
+                  "process group %r not confirmed gone after SIGKILL "
+                  "escalation (grace_sec=%r)" % (pgid, grace_sec))
 
    await _close_subprocess_transport(proc)
 
