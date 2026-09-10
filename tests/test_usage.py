@@ -651,11 +651,15 @@ class TestZeroFilledGaugeCounts:
       assert record["sample_count"] == 3
       assert record["expected_count"] == 3
 
-   def test_grain_first_appearing_after_earlier_successful_samples_not_backfilled(self):
-      # A grain that does not exist until sample 3 must NOT retroactively
-      # gain zero-counts for samples 1-2 -- it did not exist as a grain
-      # yet, so there is nothing to zero-fill; sample_count for THIS
-      # grain reflects only samples from its first appearance onward.
+   def test_grain_first_appearing_after_earlier_successful_samples_is_backfilled(self):
+      # Review round 2 finding 2: a grain that does not exist until
+      # sample 3 of an already-2-samples-old interval must be
+      # BACKFILLED with zero-counts for samples 1-2 -- those were still
+      # successful polls of the interval, and this grain's sample_count/
+      # percentiles must reflect every successful poll, not just the
+      # ones after its own first appearance (the interval's
+      # sample_count is "how many polls succeeded", not "how many polls
+      # happened since this grain was born").
       acc = _make_accumulator(expected_count=3)
       acc.add_sample([])
       acc.add_sample([])
@@ -665,8 +669,11 @@ class TestZeroFilledGaugeCounts:
       records = acc.finalize()
 
       assert len(records) == 1
-      assert records[0]["sample_count"] == 1
-      assert records[0]["process_count"] == {"p50": 1, "p95": 1, "max": 1}
+      record = records[0]
+      assert acc._grains[("other", "shell", "alice")].process_counts == [0, 0, 1]
+      assert record["sample_count"] == 3
+      assert record["expected_count"] == 3
+      assert record["process_count"] == {"p50": 0.0, "p95": 0.9, "max": 1}
 
 
 class TestExitedProcessDoesNotPolluteCurrentGauges:
@@ -719,3 +726,98 @@ class TestExitedProcessDoesNotPolluteCurrentGauges:
       assert record["d_state_fraction"] == 0.0
       assert record["interactivity_fraction"] == 0.0
       assert record["unmeasured_count"] == 1
+
+
+# --------------------------------------------------------------------------
+# Review round 2 findings -- unmeasured-but-resident CPU exclusion,
+# mid-window backfill, and a genuinely bounded excess-sample interval.
+# --------------------------------------------------------------------------
+
+class TestUnmeasuredResidentObservationExcludesCpu:
+   def test_unmeasured_currently_present_observation_does_not_contribute_cpu(self):
+      # Review round 2 finding 1: a CURRENTLY-RESIDENT but CPU-unmeasured
+      # observation (e.g. "started before window") must still count
+      # toward process-count/RSS/D-state/interactivity gauges, but its
+      # (semantically meaningless, per contract, but nonzero here to
+      # prove the boundary is enforced) cpu_seconds must NOT be added to
+      # the grain's cpu_seconds total -- only unmeasured_count reflects
+      # it. Uses a nonzero cpu_seconds input so this cannot pass by
+      # accident just because build_usage_observations() always emits
+      # 0.0 for unmeasured entries.
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample([_process_row(
+         1, category="fs-scan", activity="filesystem-scan",
+         username="jchilders", cpu_seconds=9.0, unmeasured=True,
+         currently_present=True)])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      record = records[0]
+      assert record["cpu_seconds"] == 0.0
+      assert record["unmeasured_count"] == 1
+      # Still counts as a resident process for the gauges.
+      assert record["process_count"] == {"p50": 1, "p95": 1, "max": 1}
+
+   def test_measured_and_unmeasured_resident_observations_in_same_grain(self):
+      # A grain with one measured and one unmeasured-but-resident
+      # observation in the same sample: only the measured one's CPU
+      # counts, but both count toward process_count/gauges.
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample([
+         _process_row(1, category="other", activity="shell",
+                      username="alice", cpu_seconds=2.0, unmeasured=False,
+                      currently_present=True),
+         _process_row(2, category="other", activity="shell",
+                      username="alice", cpu_seconds=99.0, unmeasured=True,
+                      currently_present=True),
+      ])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      record = records[0]
+      assert record["cpu_seconds"] == pytest.approx(2.0)
+      assert record["unmeasured_count"] == 1
+      assert record["process_count"] == {"p50": 2, "p95": 2, "max": 2}
+
+
+class TestIntervalBoundedByExpectedCount:
+   def test_excess_samples_beyond_expected_count_are_rejected(self):
+      # Review round 2 finding 3: an accumulator's bound is the
+      # INTERVAL's expected_count, not just per-grain per-sample
+      # aggregation -- feeding more add_sample calls than expected_count
+      # must not grow retained state past what expected_count sized it
+      # for, and must not inflate sample_count/process_count percentiles
+      # past the interval's actual capacity.
+      acc = _make_accumulator(expected_count=1)
+      for _ in range(5):
+         acc.add_sample([_process_row(1, category="other", activity="shell",
+                                       username="alice")])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      record = records[0]
+      grain = acc._grains[("other", "shell", "alice")]
+      assert len(grain.process_counts) == 1
+      assert len(grain.rss_per_sample) == 1
+      assert record["sample_count"] == 1
+      assert record["expected_count"] == 1
+      assert record["process_count"] == {"p50": 1, "p95": 1, "max": 1}
+
+   def test_excess_sample_does_not_create_a_brand_new_grain(self):
+      # An excess sample must be rejected in its entirety -- it must not
+      # even be allowed to create grain state for a process that never
+      # appeared in any of the expected_count accepted samples.
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample([_process_row(1, category="other", activity="shell",
+                                    username="alice")])
+      acc.add_sample([_process_row(2, category="ai-coding-agent",
+                                    activity="claude-code",
+                                    username="bob")])
+
+      records = acc.finalize()
+
+      keys = {(r["category"], r["activity"], r["username"]) for r in records}
+      assert keys == {("other", "shell", "alice")}
