@@ -50,11 +50,14 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "fixtures"))
 
+from node_monitor.collector import transport  # noqa: E402
 from node_monitor.config import load_config  # noqa: E402
 from node_monitor.daemon import Daemon, EXIT_OK, EXIT_SINK_FATAL  # noqa: E402
 from node_monitor.output.contracts import (  # noqa: E402
    validate_diagnostic_census,
+   validate_node_collection_log,
    validate_node_hardware,
+   validate_node_poll_failures,
    validate_node_usage_intervals,
 )
 from node_monitor.output.jsonl import Phase0Sink  # noqa: E402
@@ -779,6 +782,345 @@ class TestCensusAndUsageWiring:
       exit_code = _run(scenario())
 
       assert exit_code == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
+
+# --------------------------------------------------------------------------
+# Ordinary counter/census poll failures: node_poll_failures once the
+# node's FQDN is established from a prior successful poll, falling back
+# to node_collection_log (never the configured alias as provenance) when
+# it is not yet established. Excludes scheduler_miss (the scheduler's
+# own bookkeeping, tested separately in test_scheduler.py) -- this
+# increment covers only ordinary transport-layer poll failures.
+# --------------------------------------------------------------------------
+
+class TestOrdinaryPollFailuresPersisted:
+   def test_ordinary_poll_failure_after_fqdn_established_writes_node_poll_failures_record(
+         self, tmp_path):
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-pollfail-1", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload(hostname="canonical.example.org")
+         if loop == "counter":
+            call_counts["counter"] += 1
+            return _counter_payload(
+               uptime_sec=float(call_counts["counter"]),
+               hostname="canonical.example.org")
+         # census always fails -- an ordinary, non-transport exception
+         # (no failure_type attribute of its own) so the fixed fallback
+         # vocabulary bucket is exercised.
+         raise RuntimeError("simulated census probe failure")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      # Ordinary poll failures are never fatal -- only a sink write/
+      # flush failure is (design: "Output write/flush failure or low
+      # disk is fatal").
+      assert exit_code == EXIT_OK
+
+      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
+      assert os.path.exists(poll_failures_path)
+      with open(poll_failures_path, "rb") as handle:
+         raw_bytes = handle.read()
+      assert b"simulated census probe failure" not in raw_bytes
+
+      with open(poll_failures_path) as handle:
+         records = [json.loads(line) for line in handle]
+      assert len(records) >= 3
+      for record in records:
+         validate_node_poll_failures(record)
+         assert record["system"] == "polaris"
+         assert record["loop"] == "census"
+         assert record["source_hostname"] == "canonical.example.org"
+         assert record["failure_type"] == "invariant_violation"
+      consecutive = [record["consecutive_failures"] for record in records[:3]]
+      assert consecutive == [1, 2, 3]
+      breaker_states = [record["breaker_state"] for record in records[:3]]
+      assert breaker_states == ["closed", "closed", "open"]
+
+   def test_ordinary_poll_failure_before_fqdn_established_uses_collection_log_never_alias(
+         self, tmp_path):
+      """When hwinfo AND every scheduled poll fail before any payload has
+      ever been received for this node, no FQDN has ever been
+      established -- the configured SSH-alias hostname must never be
+      persisted as ``node_poll_failures.source_hostname`` (design:
+      "SSH aliases are transport identifiers only, never provenance").
+      The failure instead surfaces via ``node_collection_log``, whose
+      free-form ``detail`` can safely carry the configured hostname
+      under an honestly-named key without claiming it is a validated
+      FQDN.
+      """
+      config = _config(tmp_path, nodes=[
+         {"hostname": "ssh-alias", "role": "local"},
+      ], duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-pollfail-2", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            raise RuntimeError("simulated hwinfo failure")
+         raise RuntimeError("simulated probe failure")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
+      assert not os.path.exists(poll_failures_path)
+
+      log_path = os.path.join(sink.run_dir, "node_collection_log.jsonl")
+      assert os.path.exists(log_path)
+      with open(log_path, "rb") as handle:
+         raw_bytes = handle.read()
+      assert b"simulated" not in raw_bytes
+
+      with open(log_path) as handle:
+         entries = [json.loads(line) for line in handle]
+      pre_established = [
+         e for e in entries if e["event"] == "poll_failed_before_fqdn_established"]
+      assert len(pre_established) >= 1
+      for entry in pre_established:
+         validate_node_collection_log(entry)
+         assert entry["detail"]["configured_hostname"] == "ssh-alias"
+         assert "source_hostname" not in entry["detail"]
+
+   def test_known_transport_failure_type_is_persisted_via_fixed_vocabulary(
+         self, tmp_path):
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-pollfail-3", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         if loop == "counter":
+            call_counts["counter"] += 1
+            return _counter_payload(uptime_sec=float(call_counts["counter"]))
+         raise transport.SSHAuthError("permission denied (publickey)")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
+      with open(poll_failures_path) as handle:
+         records = [json.loads(line) for line in handle]
+      assert records
+      for record in records:
+         assert record["failure_type"] == "ssh_auth"
+
+   def test_consecutive_failures_reset_after_a_success(self, tmp_path):
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-pollfail-4", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0, "census": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         if loop == "counter":
+            call_counts["counter"] += 1
+            return _counter_payload(uptime_sec=float(call_counts["counter"]))
+         call_counts["census"] += 1
+         if call_counts["census"] <= 2:
+            raise RuntimeError("boom")
+         return _census_payload(uptime_sec=float(call_counts["census"]))
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
+      with open(poll_failures_path) as handle:
+         records = [json.loads(line) for line in handle]
+      # Only the first two census polls fail; every later poll succeeds,
+      # so exactly two failure records exist and the counter never grows
+      # past what those two consecutive failures produced.
+      assert len(records) == 2
+      assert [r["consecutive_failures"] for r in records] == [1, 2]
+
+   def test_scheduler_miss_never_produces_a_node_poll_failures_record(self, tmp_path):
+      """Regression/exclusion: a same-node/same-loop overlap
+      (``scheduler_miss``) is the scheduler's own bookkeeping concern,
+      not an ordinary poll failure this increment covers -- a cancelled
+      in-flight poll must never itself be recorded as a poll failure.
+      """
+      config = _config(tmp_path, duration_sec=100000)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-pollfail-5", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         if loop == "counter":
+            call_counts["counter"] += 1
+            return _counter_payload(uptime_sec=float(call_counts["counter"]))
+         # Never completes on its own -- every census dispatch is
+         # cancelled and reaped as a scheduler_miss by the following
+         # deadline, exactly like tests/test_scheduler.py's own
+         # equivalent scenario. A finite duration_sec would instead
+         # have the scheduler's natural-end path await this
+         # never-completing task forever (see collector/scheduler.py's
+         # own _run_target finally block), so this scenario relies on
+         # request_stop() -- exactly mirroring tests/test_scheduler.py's
+         # own miss scenario -- to end the run instead of letting
+         # duration_sec elapse.
+         await clock.sleep(1000)
+         return _census_payload(uptime_sec=1.0)
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         # Dispatch census at 0; misses (cancel+reap the prior attempt)
+         # at 1, 2, 3 -- comfortably past the first scheduler_miss.
+         await clock.advance(3)
+         daemon._scheduler.request_stop()
+         await clock.advance(10)  # let the bounded grace period elapse
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
+      assert not os.path.exists(poll_failures_path)
+
+   def test_ordinary_poll_failure_hostile_exception_class_name_never_persisted(
+         self, tmp_path):
+      """Same hostile-class-name concern as
+      TestHardwareCollectionFailureDetailIsScrubbed, applied to the
+      ordinary counter/census poll-failure path: the persisted
+      ``failure_type`` must come from a fixed, closed vocabulary; no
+      class name, exception message, or unrecognized attribute value
+      may be persisted.
+      """
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-pollfail-6", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0}
+
+      class HostileError(Exception):
+         pass
+
+      HostileError.__name__ = (
+         "argv=/bin/tool --token SECRET_MARKER " + ("X" * 1000000))
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         if loop == "counter":
+            call_counts["counter"] += 1
+            return _counter_payload(uptime_sec=float(call_counts["counter"]))
+         raise HostileError("irrelevant message with SECRET_MARKER too")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
+      with open(poll_failures_path, "rb") as handle:
+         raw_bytes = handle.read()
+      assert b"SECRET_MARKER" not in raw_bytes
+      assert b"argv=" not in raw_bytes
+      assert len(raw_bytes) < 5000
+
+      with open(poll_failures_path) as handle:
+         records = [json.loads(line) for line in handle]
+      assert records
+      for record in records:
+         assert record["failure_type"] == "invariant_violation"
+         assert len(record["failure_type"]) <= 64
+
+   def test_failure_record_sink_write_error_is_fatal_and_never_writes_done(
+         self, tmp_path):
+      config = _config(tmp_path, duration_sec=10)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      real_sink = Phase0Sink(
+         output_root, "daemon-run-pollfail-sink-fatal",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      sink = _SelectiveWriteFailsSink(real_sink, "node_poll_failures")
+      clock = FakeClock()
+      call_counts = {"counter": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         if loop == "counter":
+            call_counts["counter"] += 1
+            return _counter_payload(uptime_sec=float(call_counts["counter"]))
+         raise RuntimeError("ordinary census failure")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      assert _run(scenario()) == EXIT_SINK_FATAL
       assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
       assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
 

@@ -6,38 +6,59 @@ per-node counter-rollup/census/usage transforms, and the atomic JSONL
 sink into one injectable orchestration coroutine that a test can drive
 end to end against a fake clock instead of a real 24-hour duration.
 
-INCREMENT SCOPE NOTE (2026-09-10, second increment on kanban task
-t_14ece72e, building on the first increment's counter-loop-only
-orchestration core): this increment adds
+INCREMENT SCOPE NOTE (2026-09-10, third increment on kanban task
+t_c5cf59c4, building on the second increment's hardware/census/usage
+orchestration): this increment adds structured ``node_poll_failures``
+records for ORDINARY scheduled counter/census probe failures only
+(design: "node_poll_failures: one record per failed or skipped poll
+with bounded/scrubbed detail and breaker state"). Explicitly excluded
+from "ordinary": ``scheduler_miss`` (a same-node/same-loop overlap
+recorded entirely inside ``collector.scheduler.Scheduler``'s own
+bookkeeping/events -- this daemon-level path only ever sees an actual
+``transport_fn`` invocation attempt, never a skipped/overlapped one,
+so it structurally cannot double-record a miss).
 
-* one-time hardware collection per configured node (design:
-  "node_hardware: one record per node when first seen in the run"),
-  run sequentially BEFORE the scheduler starts -- it is not a
-  scheduled ``Target``/loop like counter and census, since it never
-  repeats within a run;
-* a ``census`` loop ``Target`` per node (alongside the existing
-  ``counter`` loop), wired through the existing
-  ``collector.usage.build_diagnostic_census``/``build_usage_
-  observations``/``UsageIntervalAccumulator`` and
-  ``collector.cpu_delta.compute_cpu_delta`` to produce
-  privacy-filtered ``diagnostic_census`` records every census poll
-  and bounded ``node_usage_intervals`` records every
-  ``usage_interval_sec // census_interval_sec`` census samples (the
-  same sample-count-windowing pattern the first increment already
-  used for the counter/rollup pair);
-* the minimum ``node_collection_log`` records needed by hardware-once
-  (a failed hwinfo poll has no other structured place to surface a
-  failure -- the Scheduler's own breaker bookkeeping only covers
-  polls it schedules itself, not this one-shot pre-scheduler step).
+Every ordinary poll failure's ``source_hostname`` is the node's
+remote-reported FQDN from the most recent PRIOR successful poll of any
+loop (hwinfo, counter, or census) for that node -- never the
+configured SSH-alias transport hostname (design: "SSH aliases are
+transport identifiers only, never provenance"). Before any poll has
+ever succeeded for a node, no FQDN has ever been established and a
+``node_poll_failures`` record (whose ``source_hostname`` is REQUIRED,
+non-nullable) cannot honestly be written; that case instead writes a
+``node_collection_log`` record whose free-form ``detail`` may safely
+carry the configured hostname under an explicitly-named
+``configured_hostname`` key, never claiming it is a validated FQDN.
 
-Still DEFERRED to a follow-up increment: ``node_poll_failures``
-records for ordinary counter/census poll failures (those already
-degrade gracefully through the Scheduler's own breaker/backoff
-bookkeeping without a daemon-level record, exactly as the first
-increment left them), signal handling, the partial-vs-clean
-acceptance evaluation, and CLI/deploy/docs wiring -- none of those are
-needed to prove hardware-once/census/usage are correctly wired to the
-existing transport, contracts, scheduler, and sink.
+``failure_type`` is classified via ``getattr(exc, "failure_type",
+None)`` checked against a fixed, closed set of the design's own
+enumerated poll-failure vocabulary (mirroring
+``collector.transport``'s own documented convention: "One exception
+subclass per node_poll_failures.failure_type ... so a caller builds a
+poll-failure record straight from exc.failure_type") -- any value
+outside that closed set (including no attribute at all, e.g. a plain
+``RuntimeError`` or a hostile custom exception class) falls back to
+the fixed ``"invariant_violation"`` literal. This module still never
+imports ``collector.transport`` itself (see class docstring below):
+classification reads a bounded, membership-checked attribute value off
+whatever exception ``transport_fn`` happens to raise, it does not
+``isinstance``-check against that module's exception hierarchy. The
+persisted ``detail`` string is always one fixed, non-parameterized
+literal -- never the exception's own message or class name -- so a
+hostile failure (arbitrary secret/argv text in the exception message,
+or an attacker-controlled ``__name__``) can never reach the sink
+through this path, mirroring ``_classify_hardware_failure``'s own
+fixed-vocabulary-only discipline for the hardware-collection-failure
+path above. ``consecutive_failures``/``breaker_state`` are this
+module's OWN per-(node, loop) bookkeeping (reset to zero on any
+success, incremented on every ordinary failure, breaker opens at the
+same three-consecutive-failure threshold the design specifies) --
+intentionally independent from ``collector.scheduler.Scheduler``'s own
+internal breaker state, which also counts scheduler_miss overlaps this
+module deliberately excludes from its own count.
+
+Still DEFERRED to a follow-up increment: signal handling, the
+partial-vs-clean acceptance evaluation, and CLI/deploy/docs wiring.
 
 KNOWN GAP carried over from the first increment: a trailing partial
 counter window (fewer than ``rollup_interval_sec // counter_interval_
@@ -145,6 +166,59 @@ def _classify_hardware_failure(exc):
    return _HARDWARE_FAILURE_TYPE_FALLBACK
 
 
+# Fixed, closed vocabulary this daemon will ever persist as an ordinary
+# poll failure's ``node_poll_failures.failure_type`` -- exactly
+# node_monitor.output.contracts._POLL_FAILURE_TYPES minus the two
+# entries that are never reachable through this path: "scheduler_miss"
+# (the scheduler's own bookkeeping, out of scope -- see module
+# docstring) and "reboot"/"reset" (metrics-layer concepts compared
+# across *successful* consecutive samples, never raised as an
+# exception by transport_fn). Kept local to this module -- rather than
+# importing node_monitor.collector.transport's exception hierarchy --
+# because this module intentionally stays agnostic to how transport_fn
+# is implemented (it is an injected callable, design: local/remote
+# parity lives entirely in what the caller's own transport_fn does);
+# classification below reads only a plain, membership-checked
+# ``failure_type`` attribute value, mirroring collector.transport's own
+# documented convention without requiring that module's types.
+_ORDINARY_POLL_FAILURE_TYPES = frozenset((
+   "timeout", "ssh_auth", "ssh_transport", "probe_exit", "malformed_json",
+   "probe_version_mismatch", "hostname_mismatch", "invariant_violation",
+))
+_ORDINARY_POLL_FAILURE_FALLBACK = "invariant_violation"
+
+
+def _classify_ordinary_poll_failure(exc):
+   """Map ``exc`` to a fixed, bounded ``failure_type`` label.
+
+   Reads ``getattr(exc, \"failure_type\", None)`` -- an ordinary,
+   caller-controlled instance/class attribute -- but the returned value
+   is used ONLY as a membership test against the fixed
+   ``_ORDINARY_POLL_FAILURE_TYPES`` set, never persisted verbatim: a
+   hostile exception setting ``failure_type = \"argv=...SECRET...\"``
+   fails that membership test exactly like a plain exception with no
+   attribute at all, and both fall through to the same fixed
+   ``_ORDINARY_POLL_FAILURE_FALLBACK`` literal. This is the same
+   discipline ``_classify_hardware_failure`` applies to
+   ``type(exc).__name__`` above, applied here to a different
+   caller-controlled attribute.
+   """
+   candidate = getattr(exc, "failure_type", None)
+   if candidate in _ORDINARY_POLL_FAILURE_TYPES:
+      return candidate
+   return _ORDINARY_POLL_FAILURE_FALLBACK
+
+
+# Design: "Each (node, loop) uses ... independent bounded exponential
+# backoff after three consecutive failures" -- this module's OWN
+# per-(node, loop) failure count feeding node_poll_failures.breaker_state
+# is intentionally independent of collector.scheduler.Scheduler's own
+# internal breaker (which also counts scheduler_miss overlaps this
+# module's own count deliberately excludes). Matches
+# node_monitor.collector.scheduler._DEFAULT_FAILURE_THRESHOLD.
+_POLL_FAILURE_BREAKER_THRESHOLD = 3
+
+
 class Daemon:
    """Orchestrates one Phase 0 run: config + transport + scheduler +
    the counter-rollup transform + sink.
@@ -216,6 +290,24 @@ class Daemon:
       # functions already handle that "no previous sample yet" case
       # explicitly rather than requiring a caller-side special case.
       self._previous_census_payload = {}
+
+      # The most recent remote-reported FQDN observed from ANY
+      # successful poll (hwinfo, counter, or census) for a node, keyed
+      # by node.hostname (the only identity known before a payload
+      # arrives). Design: "SSH aliases are transport identifiers only,
+      # never provenance" -- an ordinary poll failure's
+      # node_poll_failures.source_hostname must use this previously
+      # established FQDN, never the configured node.hostname alias.
+      # Absent until a node's first successful poll of any kind.
+      self._established_fqdn = {}
+
+      # Per-(node.hostname, loop) consecutive ordinary-failure count
+      # feeding node_poll_failures.consecutive_failures/breaker_state.
+      # Intentionally this module's OWN bookkeeping, independent of
+      # collector.scheduler.Scheduler's internal breaker state (see
+      # module docstring) -- reset to zero on any success for that
+      # (node, loop) pair, incremented on every ordinary failure.
+      self._poll_failure_counts = {}
 
       # Set the instant a fatal sink condition is observed; run()
       # checks this AFTER the scheduler stops to decide the exit code
@@ -342,7 +434,23 @@ class Daemon:
          await self._flush_usage_window(node)
 
    async def _poll_fn(self, node, loop):
-      payload = await self._transport_fn(node, loop)
+      try:
+         payload = await self._transport_fn(node, loop)
+      except Exception as exc:
+         try:
+            await self._record_ordinary_poll_failure(node, loop, exc)
+         except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as sink_exc:
+            # Same fatal contract as every other sink write in this
+            # module: a write/flush failure recording the poll failure
+            # ITSELF is still a sink failure, and design's "Output
+            # write/flush failure or low disk is fatal" draws no
+            # exception for the failure-record path.
+            self._fatal_error = sink_exc
+            self._scheduler.request_stop()
+            raise
+         raise
+      self._established_fqdn[node.hostname] = payload.get("hostname_fqdn")
+      self._poll_failure_counts[(node.hostname, loop)] = 0
       try:
          if loop == "counter":
             await self._handle_counter_poll(node, payload)
@@ -374,6 +482,61 @@ class Daemon:
          self._scheduler.request_stop()
          raise
       return payload
+
+   async def _record_ordinary_poll_failure(self, node, loop, exc):
+      """Write one structured record for an ORDINARY (non-scheduler-miss)
+      counter/census poll failure -- ``node_poll_failures`` once this
+      node's FQDN has been established by a prior successful poll of
+      any kind, or ``node_collection_log`` (never the configured
+      SSH-alias hostname as ``source_hostname``) before that.
+
+      ``failure_type``/category is always ``_classify_ordinary_poll_
+      failure(exc)``'s fixed, closed-vocabulary label -- never
+      ``str(exc)`` or ``type(exc).__name__`` verbatim -- mirroring
+      ``_log_hardware_collection_failure``'s own scrubbing discipline
+      for the analogous hardware-collection-failure path.
+      """
+      key = (node.hostname, loop)
+      count = self._poll_failure_counts.get(key, 0) + 1
+      self._poll_failure_counts[key] = count
+      failure_type = _classify_ordinary_poll_failure(exc)
+      established_fqdn = self._established_fqdn.get(node.hostname)
+
+      if established_fqdn is None:
+         # No FQDN has ever been established for this node -- writing
+         # a node_poll_failures record (whose source_hostname is
+         # REQUIRED, non-nullable) would force either an outright
+         # ContractError or a fallback to the configured alias, and
+         # design forbids the latter as provenance. Surface the gap
+         # via node_collection_log instead, whose free-form detail can
+         # honestly carry the configured hostname under an
+         # explicitly-named key.
+         record = {
+            "system": self._config.system,
+            "timestamp_utc": self._wall_clock_fn(),
+            "event": "poll_failed_before_fqdn_established",
+            "detail": {
+               "configured_hostname": node.hostname,
+               "loop": loop,
+               "failure_type": failure_type,
+            },
+         }
+         await self._sink.write_record("node_collection_log", record)
+         return
+
+      breaker_state = (
+         "open" if count >= _POLL_FAILURE_BREAKER_THRESHOLD else "closed")
+      record = {
+         "system": self._config.system,
+         "source_hostname": established_fqdn,
+         "loop": loop,
+         "timestamp_utc": self._wall_clock_fn(),
+         "failure_type": failure_type,
+         "detail": "ordinary poll failure; see failure_type",
+         "consecutive_failures": count,
+         "breaker_state": breaker_state,
+      }
+      await self._sink.write_record("node_poll_failures", record)
 
    async def _log_hardware_collection_failure(self, node, exc):
       """Write one ``node_collection_log`` record for a failed one-time
@@ -437,6 +600,7 @@ class Daemon:
          await self._log_hardware_collection_failure(node, exc)
          return
 
+      self._established_fqdn[node.hostname] = payload.get("hostname_fqdn")
       hardware = payload.get("hardware") or {}
       record = {
          "system": self._config.system,
