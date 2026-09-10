@@ -18,6 +18,18 @@ handling, and the partial-vs-clean acceptance evaluation are
 DEFERRED to a follow-up increment -- not implemented here. See the
 kanban card's review-recovery comment for the explicit scope cut.
 
+KNOWN GAP in this increment: a trailing partial counter window (fewer
+than ``rollup_interval_sec // counter_interval_sec`` samples when the
+run's duration/stop ends mid-window) is never flushed -- only a
+window that reaches its full expected sample count calls
+``CounterWindowAccumulator.finalize()``. The design's own accumulator
+already supports finalizing a degraded/partial window (see
+``metrics.CounterWindowAccumulator.finalize``'s docstring: "Always
+returns a record ... even for a window with zero samples"); wiring
+that flush into ``Daemon.run()``'s post-scheduler shutdown path is
+left to the deferred partial/clean-summary follow-up rather than
+implemented speculatively here without its own test.
+
 Nothing in this module imports a database driver, an ORM, or
 ``node_monitor.database``/``node_monitor.db`` -- design: "prove no
 database imports/connections" (Task 7 write-up). Only
@@ -39,10 +51,6 @@ from node_monitor.output.jsonl import Phase0SinkDiskFullError, Phase0SinkError
 # these straight to a process exit status.
 EXIT_OK = 0
 EXIT_SINK_FATAL = 2
-
-
-class DaemonError(Exception):
-   """Raised for daemon-orchestration-level construction/usage errors."""
 
 
 def _default_wall_clock():
