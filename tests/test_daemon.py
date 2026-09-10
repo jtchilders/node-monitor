@@ -202,6 +202,155 @@ class TestFatalSinkError:
       assert not os.path.exists(os.path.join(sink.run_dir, "summary.json"))
       assert not os.path.exists(os.path.join(sink.run_dir, "DONE"))
 
+   def test_raw_oserror_from_write_record_stops_daemon_nonzero_without_finalizing(
+         self, tmp_path):
+      """Review round 1 finding: a real output write/flush failure
+      from ``Phase0Sink.write_record()`` (``handle.write``,
+      ``handle.flush``, ``os.fsync`` in node_monitor/output/jsonl.py)
+      surfaces as a raw ``OSError``, NOT a ``Phase0SinkError``
+      subclass -- only the pre-flight disk-guard check raises the
+      dedicated ``Phase0SinkDiskFullError``. Before this fix, the
+      daemon's counter-poll boundary only caught the sink's own
+      exception types, so this raw OSError was swallowed by the
+      Scheduler as an ordinary failed poll and the daemon went on to
+      finalize_summary()/write_done() as if the run were clean --
+      exactly the reproduction the reviewer reported (exit_code=0,
+      finalized=True, done=True). This test drives a sink whose
+      ``write_record`` raises ``OSError`` and asserts the run instead
+      stops fatal, nonzero, with no summary/DONE.
+      """
+      config = _config(tmp_path, duration_sec=20)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      real_sink = Phase0Sink(
+         output_root, "daemon-run-3", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+
+      class _WriteFailsSink:
+         run_dir = real_sink.run_dir
+
+         async def write_record(self, record_type, record):
+            raise OSError("simulated fsync failure")
+
+         async def finalize_summary(self):
+            raise AssertionError(
+               "finalize_summary() must never be called after a fatal "
+               "write_record() OSError")
+
+         def write_done(self):
+            raise AssertionError(
+               "write_done() must never be called after a fatal "
+               "write_record() OSError")
+
+      clock = FakeClock()
+      call_count = {"n": 0}
+
+      async def transport_fn(node, loop):
+         call_count["n"] += 1
+         return _counter_payload(uptime_sec=float(call_count["n"]))
+
+      daemon = Daemon(config, _WriteFailsSink(), transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
+   def test_raw_oserror_from_finalize_summary_stops_daemon_nonzero(self, tmp_path):
+      """Review round 1 finding #2: ``finalize_summary()``/
+      ``write_done()`` can also raise a raw ``OSError`` during their
+      own flush/fsync/open/write calls -- that failure must map to
+      ``EXIT_SINK_FATAL`` too, not escape ``Daemon.run()`` uncaught,
+      and DONE must never be written when finalize_summary() itself
+      failed.
+      """
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      real_sink = Phase0Sink(
+         output_root, "daemon-run-4", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+
+      class _FinalizeFailsSink:
+         run_dir = real_sink.run_dir
+
+         async def write_record(self, record_type, record):
+            return None
+
+         async def finalize_summary(self):
+            raise OSError("simulated fsync failure during finalize")
+
+         def write_done(self):
+            raise AssertionError(
+               "write_done() must never be called when finalize_summary() "
+               "itself raised")
+
+      clock = FakeClock()
+
+      async def transport_fn(node, loop):
+         return _counter_payload(uptime_sec=1.0)
+
+      daemon = Daemon(config, _FinalizeFailsSink(), transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
+   def test_raw_oserror_from_write_done_stops_daemon_nonzero(self, tmp_path):
+      """Symmetric case: finalize_summary() itself succeeds but
+      write_done() raises a raw OSError -- also fatal/nonzero. A
+      summary.json without a DONE flag is the correct "partial, not
+      complete" artifact state; the exit code must reflect that, not
+      report EXIT_OK for a run whose DONE flag never landed.
+      """
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-5", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+
+      original_write_done = sink.write_done
+
+      def _failing_write_done():
+         raise OSError("simulated fsync failure writing DONE")
+
+      sink.write_done = _failing_write_done
+
+      clock = FakeClock()
+
+      async def transport_fn(node, loop):
+         return _counter_payload(uptime_sec=1.0)
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_SINK_FATAL
+      # finalize_summary() DID succeed here (only write_done() failed),
+      # so summary.json legitimately exists -- but DONE must not.
+      assert os.path.exists(os.path.join(sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(sink.run_dir, "DONE"))
+      sink.write_done = original_write_done
+
 
 # --------------------------------------------------------------------------
 # No database import/connection reachable from daemon.py

@@ -170,16 +170,28 @@ class Daemon:
       if loop == "counter":
          try:
             await self._handle_counter_poll(node, payload)
-         except (Phase0SinkDiskFullError, Phase0SinkError) as exc:
+         except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as exc:
             # Design: "Output write/flush failure or low disk is
-            # fatal because JSONL is the only Phase 0 result." Record
-            # the fatal condition and stop the scheduler from issuing
-            # any further polls -- there is no point burning the
-            # run's remaining duration against a sink that can no
-            # longer accept writes -- then re-raise so this poll's
-            # own outcome is visible to the scheduler's own
-            # failure/breaker bookkeeping like any other poll_fn
-            # exception.
+            # fatal because JSONL is the only Phase 0 result." A real
+            # write/flush/fsync failure from the sink's own file
+            # handles (node_monitor/output/jsonl.py's `handle.write`,
+            # `handle.flush`, `os.fsync`) surfaces as a raw
+            # OSError/IOError, not a Phase0SinkError subclass -- only
+            # the *disk-full guard check* raises the dedicated
+            # Phase0SinkDiskFullError. Catch OSError alongside the
+            # sink's own exception types so an actual write failure
+            # is just as fatal as a pre-flight low-disk rejection
+            # (review round 1 finding: a raw OSError from
+            # write_record was previously left uncaught here, so the
+            # scheduler absorbed it as an ordinary poll failure and
+            # the run went on to finalize/DONE as if nothing had
+            # happened). Record the fatal condition and stop the
+            # scheduler from issuing any further polls -- there is no
+            # point burning the run's remaining duration against a
+            # sink that can no longer accept writes -- then re-raise
+            # so this poll's own outcome is visible to the
+            # scheduler's own failure/breaker bookkeeping like any
+            # other poll_fn exception.
             self._fatal_error = exc
             self._scheduler.request_stop()
             raise
@@ -225,6 +237,24 @@ class Daemon:
       if self._fatal_error is not None:
          return EXIT_SINK_FATAL
 
-      await self._sink.finalize_summary()
-      self._sink.write_done()
+      try:
+         await self._sink.finalize_summary()
+         self._sink.write_done()
+      except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as exc:
+         # Same fatal contract as the counter-poll boundary above:
+         # finalize_summary() flushes/fsyncs every open JSONL handle
+         # and write_done() fsyncs its own DONE file, both of which
+         # can raise a raw OSError (disk-full, EIO, a yanked mount)
+         # exactly like write_record() can. Review round 1 finding:
+         # this path previously let such an OSError escape run()
+         # entirely, uncaught, instead of producing the defined
+         # nonzero orchestration result. Design's "fatal" means the
+         # run must never look complete: never write DONE after a
+         # failed finalize_summary(), and treat a write_done()
+         # failure (finalize succeeded, DONE failed) as fatal too --
+         # a summary.json without a DONE flag is exactly the
+         # "partial, not complete" state a caller/monitor needs to
+         # see, not a silently swallowed exception.
+         self._fatal_error = exc
+         return EXIT_SINK_FATAL
       return EXIT_OK
