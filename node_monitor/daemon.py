@@ -49,13 +49,23 @@ hostile failure (arbitrary secret/argv text in the exception message,
 or an attacker-controlled ``__name__``) can never reach the sink
 through this path, mirroring ``_classify_hardware_failure``'s own
 fixed-vocabulary-only discipline for the hardware-collection-failure
-path above. ``consecutive_failures``/``breaker_state`` are this
-module's OWN per-(node, loop) bookkeeping (reset to zero on any
-success, incremented on every ordinary failure, breaker opens at the
-same three-consecutive-failure threshold the design specifies) --
-intentionally independent from ``collector.scheduler.Scheduler``'s own
-internal breaker state, which also counts scheduler_miss overlaps this
-module deliberately excludes from its own count.
+path above. ``consecutive_failures``/``breaker_state`` are ALWAYS the
+authoritative ``collector.scheduler.Scheduler`` per-target state for
+this exact ``(node, loop)`` pair -- including any ``scheduler_miss``
+overlaps counted against that same target before this ordinary
+failure -- never a second, independently-counted value. This module
+tracks that authoritative state itself (see ``_observe_scheduler_
+event``/``self._scheduler_state``) purely because the scheduler's
+own per-target ``_TargetState`` is private and not incremented for
+THIS failure until after ``poll_fn`` (this module's own ``_poll_fn``)
+returns/raises -- i.e. after ``_record_ordinary_poll_failure`` has
+already had to decide what to persist. Fidelity to the scheduler's own
+count is what lets a same-node/same-loop miss immediately followed by
+an ordinary transport failure open the breaker at the correct
+cumulative count instead of under-reporting it (review round 2
+finding: a prior version kept a second, ordinary-failure-only counter
+here that silently diverged from the scheduler's own whenever a
+scheduler_miss preceded an ordinary failure for the same target).
 
 Still DEFERRED to a follow-up increment: signal handling, the
 partial-vs-clean acceptance evaluation, and CLI/deploy/docs wiring.
@@ -90,7 +100,12 @@ import time
 
 from node_monitor.collector.cpu_delta import compute_cpu_delta
 from node_monitor.collector.metrics import CounterWindowAccumulator
-from node_monitor.collector.scheduler import Scheduler, Target
+from node_monitor.collector.scheduler import (
+   BREAKER_CLOSED,
+   BREAKER_OPEN,
+   Scheduler,
+   Target,
+)
 from node_monitor.collector.usage import (
    UsageIntervalAccumulator,
    build_diagnostic_census,
@@ -210,12 +225,17 @@ def _classify_ordinary_poll_failure(exc):
 
 
 # Design: "Each (node, loop) uses ... independent bounded exponential
-# backoff after three consecutive failures" -- this module's OWN
-# per-(node, loop) failure count feeding node_poll_failures.breaker_state
-# is intentionally independent of collector.scheduler.Scheduler's own
-# internal breaker (which also counts scheduler_miss overlaps this
-# module's own count deliberately excludes). Matches
-# node_monitor.collector.scheduler._DEFAULT_FAILURE_THRESHOLD.
+# backoff after three consecutive failures". Must match
+# node_monitor.collector.scheduler._DEFAULT_FAILURE_THRESHOLD exactly:
+# Daemon.run() never overrides the Scheduler's failure_threshold, so
+# this is the same three-consecutive-failure boundary the actually
+# constructed Scheduler uses for ITS OWN breaker. Kept as a local
+# constant (rather than reading Scheduler._DEFAULT_FAILURE_THRESHOLD)
+# because a node_poll_failures record for a given ordinary failure must
+# be computed and written BEFORE the Scheduler's own per-target state
+# observes that same failure (see _record_ordinary_poll_failure) --
+# there is no live Scheduler/target-state object to consult yet at
+# that point, only this mirror of what the Scheduler will compute.
 _POLL_FAILURE_BREAKER_THRESHOLD = 3
 
 
@@ -301,13 +321,24 @@ class Daemon:
       # Absent until a node's first successful poll of any kind.
       self._established_fqdn = {}
 
-      # Per-(node.hostname, loop) consecutive ordinary-failure count
-      # feeding node_poll_failures.consecutive_failures/breaker_state.
-      # Intentionally this module's OWN bookkeeping, independent of
-      # collector.scheduler.Scheduler's internal breaker state (see
-      # module docstring) -- reset to zero on any success for that
-      # (node, loop) pair, incremented on every ordinary failure.
-      self._poll_failure_counts = {}
+      # Per-(node.hostname, loop) MIRROR of collector.scheduler.
+      # Scheduler's own authoritative per-target consecutive_failures/
+      # breaker_state, updated from the scheduler's own "scheduler_
+      # miss"/"failure"/"success" events (see _observe_scheduler_
+      # event). This is a mirror, not an independent count: review
+      # round 2 finding -- a prior version kept its own separate
+      # ordinary-failure-only counter here, which silently diverged
+      # from the scheduler's real breaker state whenever a
+      # same-node/same-loop scheduler_miss preceded an ordinary
+      # transport failure for that same target (the scheduler's own
+      # count include misses; the daemon-local one previously did
+      # not). Reflects the scheduler's state as of the MOST RECENT
+      # event observed for that (node, loop) pair -- i.e. as of just
+      # BEFORE whatever ordinary failure is currently being recorded,
+      # since the scheduler itself only increments/emits for that
+      # failure AFTER this module's own poll_fn (``_poll_fn`` below)
+      # returns or raises.
+      self._scheduler_state = {}
 
       # Set the instant a fatal sink condition is observed; run()
       # checks this AFTER the scheduler stops to decide the exit code
@@ -319,6 +350,42 @@ class Daemon:
    def _emit(self, **fields):
       if self._on_event is not None:
          self._on_event(fields)
+
+   def _observe_scheduler_event(self, event):
+      """Update ``self._scheduler_state`` -- this module's mirror of
+      ``collector.scheduler.Scheduler``'s own per-(node, loop)
+      ``consecutive_failures``/``breaker_state`` -- from every event
+      the Scheduler emits, then forward the event unchanged to
+      whatever ``on_event`` callable this Daemon itself was
+      constructed with (if any).
+
+      Installed as the Scheduler's OWN ``on_event`` (see ``run()``
+      below) rather than merely observing failures from inside
+      ``_poll_fn``: a ``scheduler_miss`` event is emitted entirely
+      inside ``Scheduler._run_target`` for a same-node/same-loop
+      overlap that this module's ``_poll_fn`` never itself sees (no
+      ``transport_fn`` invocation happens for a miss) -- the ONLY way
+      this module can learn a miss occurred, and fold it into the
+      state an immediately-following ordinary failure's
+      node_poll_failures record must report, is by watching the
+      Scheduler's own event stream directly (review round 2 finding:
+      a same-node/same-loop miss immediately followed by an ordinary
+      transport failure must open the breaker at the combined count,
+      not just the ordinary-failure-only count this module could see
+      on its own).
+      """
+      event_type = event.get("type")
+      if event_type in ("scheduler_miss", "failure"):
+         node = event["node"]
+         key = (node.hostname, event["loop"])
+         self._scheduler_state[key] = (
+            event["consecutive_failures"], event["breaker_state"])
+      elif event_type == "success":
+         node = event["node"]
+         key = (node.hostname, event["loop"])
+         self._scheduler_state[key] = (0, BREAKER_CLOSED)
+      if self._on_event is not None:
+         self._on_event(event)
 
    def _new_counter_accumulator(self, node, payload):
       now = self._wall_clock_fn()
@@ -450,7 +517,6 @@ class Daemon:
             raise
          raise
       self._established_fqdn[node.hostname] = payload.get("hostname_fqdn")
-      self._poll_failure_counts[(node.hostname, loop)] = 0
       try:
          if loop == "counter":
             await self._handle_counter_poll(node, payload)
@@ -495,12 +561,39 @@ class Daemon:
       ``str(exc)`` or ``type(exc).__name__`` verbatim -- mirroring
       ``_log_hardware_collection_failure``'s own scrubbing discipline
       for the analogous hardware-collection-failure path.
+
+      ``consecutive_failures``/``breaker_state`` must be exactly what
+      ``collector.scheduler.Scheduler``'s own ``_execute`` is about to
+      compute for THIS SAME failure once this coroutine returns/raises
+      back up to it -- including any scheduler_miss(es) already
+      recorded against this same (node, loop) target (review round 2
+      finding: excluding scheduler_miss from what this module counts
+      as an "ordinary" failure type does not mean a prior miss's
+      effect on the breaker/consecutive-failure state can be excluded
+      from an ordinary failure's own record). ``self._scheduler_state``
+      is this module's mirror of the Scheduler's own per-target state,
+      updated by ``_observe_scheduler_event`` from every event the
+      Scheduler emits (scheduler_miss, failure, success) -- but that
+      mirror necessarily still reflects the state as of the LAST event
+      observed (i.e. from BEFORE this exact failure, which the
+      Scheduler itself only observes and emits an event for AFTER this
+      coroutine's caller, ``_poll_fn``, propagates ``exc`` back up to
+      ``Scheduler._execute``). So the count/state actually persisted
+      here is deliberately computed one step ahead of the mirror:
+      exactly the prior mirrored count plus one, and the breaker state
+      that implies -- matching, field for field, what ``_execute``
+      will independently compute for the very same failure via its own
+      identical ``consecutive_failures += 1`` / threshold comparison.
       """
       key = (node.hostname, loop)
-      count = self._poll_failure_counts.get(key, 0) + 1
-      self._poll_failure_counts[key] = count
+      prior_count, _prior_state = self._scheduler_state.get(
+         key, (0, BREAKER_CLOSED))
+      count = prior_count + 1
       failure_type = _classify_ordinary_poll_failure(exc)
       established_fqdn = self._established_fqdn.get(node.hostname)
+      breaker_state = (
+         BREAKER_OPEN if count >= _POLL_FAILURE_BREAKER_THRESHOLD
+         else BREAKER_CLOSED)
 
       if established_fqdn is None:
          # No FQDN has ever been established for this node -- writing
@@ -510,7 +603,13 @@ class Daemon:
          # design forbids the latter as provenance. Surface the gap
          # via node_collection_log instead, whose free-form detail can
          # honestly carry the configured hostname under an
-         # explicitly-named key.
+         # explicitly-named key. Still carries consecutive_failures/
+         # breaker_state (review round 2 finding #2): this card scopes
+         # ordinary counter/census failure records to include loop,
+         # category/detail, consecutive failures, AND breaker state --
+         # the pre-FQDN fallback is still an ordinary counter/census
+         # failure record, just routed to a different sink table for
+         # the one honest reason (no validated source_hostname yet).
          record = {
             "system": self._config.system,
             "timestamp_utc": self._wall_clock_fn(),
@@ -519,13 +618,13 @@ class Daemon:
                "configured_hostname": node.hostname,
                "loop": loop,
                "failure_type": failure_type,
+               "consecutive_failures": count,
+               "breaker_state": breaker_state,
             },
          }
          await self._sink.write_record("node_collection_log", record)
          return
 
-      breaker_state = (
-         "open" if count >= _POLL_FAILURE_BREAKER_THRESHOLD else "closed")
       record = {
          "system": self._config.system,
          "source_hostname": established_fqdn,
@@ -660,7 +759,15 @@ class Daemon:
       scheduler_kwargs = dict(
          targets=targets, poll_fn=self._poll_fn, clock=self._clock,
          max_parallel_polls=self._config.max_parallel_polls,
-         duration_sec=self._config.duration_sec, on_event=self._on_event)
+         duration_sec=self._config.duration_sec,
+         # _observe_scheduler_event, not self._on_event directly: this
+         # module must observe every scheduler_miss/failure/success
+         # event itself (to keep self._scheduler_state -- the mirror
+         # of the Scheduler's own per-target consecutive_failures/
+         # breaker_state -- accurate for node_poll_failures records),
+         # while still forwarding every event on to this Daemon's own
+         # caller-supplied on_event exactly as before.
+         on_event=self._observe_scheduler_event)
       if self._sleep is not None:
          scheduler_kwargs["sleep"] = self._sleep
       self._scheduler = self._scheduler_cls(**scheduler_kwargs)

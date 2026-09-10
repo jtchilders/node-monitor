@@ -904,11 +904,30 @@ class TestOrdinaryPollFailuresPersisted:
          entries = [json.loads(line) for line in handle]
       pre_established = [
          e for e in entries if e["event"] == "poll_failed_before_fqdn_established"]
-      assert len(pre_established) >= 1
+      assert len(pre_established) >= 3
       for entry in pre_established:
          validate_node_collection_log(entry)
          assert entry["detail"]["configured_hostname"] == "ssh-alias"
          assert "source_hostname" not in entry["detail"]
+      # Review round 2 finding #2: the pre-FQDN fallback record must
+      # still carry consecutive_failures/breaker_state, progressing
+      # and opening the breaker exactly like the post-FQDN
+      # node_poll_failures path does -- this card scopes ordinary
+      # counter/census failure records to include loop, category/
+      # detail, consecutive failures, AND breaker state regardless of
+      # which sink table an individual failure happens to land in.
+      # Filtered to a single loop: counter and census dispatch
+      # independently, so their pre-FQDN entries interleave in the
+      # shared node_collection_log and each loop has its own
+      # consecutive-failure progression.
+      counter_entries = [
+         e for e in pre_established if e["detail"]["loop"] == "counter"]
+      progression = [
+         e["detail"]["consecutive_failures"] for e in counter_entries[:3]]
+      assert progression == [1, 2, 3]
+      breaker_states = [
+         e["detail"]["breaker_state"] for e in counter_entries[:3]]
+      assert breaker_states == ["closed", "closed", "open"]
 
    def test_known_transport_failure_type_is_persisted_via_fixed_vocabulary(
          self, tmp_path):
@@ -1036,6 +1055,87 @@ class TestOrdinaryPollFailuresPersisted:
 
       poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
       assert not os.path.exists(poll_failures_path)
+
+   def test_prior_scheduler_misses_are_folded_into_the_next_ordinary_failure_record(
+         self, tmp_path):
+      """Regression for review round 2 finding: a same-node/same-loop
+      ``scheduler_miss`` (a cancelled/reaped overlap, recorded entirely
+      inside ``collector.scheduler.Scheduler``'s own bookkeeping)
+      increments the SAME breaker/consecutive-failure state an
+      immediately-following ORDINARY transport failure for that same
+      target must report. Two prior misses followed by one ordinary
+      failure must open the breaker at count 3 -- never report the
+      ordinary failure alone as count 1/closed, which would silently
+      under-report how many consecutive non-successes this target has
+      actually accumulated.
+      """
+      config = _config(tmp_path, duration_sec=100000)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-pollfail-miss-then-failure",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0, "census": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         if loop == "counter":
+            call_counts["counter"] += 1
+            return _counter_payload(uptime_sec=float(call_counts["counter"]))
+         call_counts["census"] += 1
+         if call_counts["census"] <= 2:
+            # Never completes on its own -- cancelled and reaped as a
+            # scheduler_miss by the following deadline, exactly like
+            # test_scheduler_miss_never_produces_a_node_poll_failures_
+            # record above. Two such misses in a row before the third
+            # dispatch actually raises.
+            await clock.sleep(1000)
+            return _census_payload(uptime_sec=1.0)
+         # The third census dispatch (deadline 2) is an ORDINARY
+         # transport failure -- no attribute of its own, so the fixed
+         # fallback vocabulary bucket applies, same as every other
+         # plain-RuntimeError scenario in this class.
+         raise RuntimeError("simulated ordinary census failure after misses")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         # Dispatch census at 0 (hangs); miss #1 (cancel+reap) at
+         # deadline 1, dispatching a second hang; miss #2 at deadline
+         # 2, dispatching the third attempt, which raises immediately
+         # (no further virtual time needed for it to resolve). Stop
+         # right after that single failure resolves -- the backoff gap
+         # this failure's own count(3) >= threshold opens would
+         # otherwise schedule a FOURTH census dispatch (also failing)
+         # before request_stop's own next_deadline check is consulted,
+         # which would leave two failure records instead of the one
+         # this test means to isolate.
+         await clock.advance(2)
+         daemon._scheduler.request_stop()
+         await clock.advance(10)  # let the bounded grace period elapse
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
+      assert os.path.exists(poll_failures_path)
+      with open(poll_failures_path) as handle:
+         records = [json.loads(line) for line in handle]
+      census_records = [r for r in records if r["loop"] == "census"]
+      assert len(census_records) == 1
+      record = census_records[0]
+      validate_node_poll_failures(record)
+      # Two scheduler_miss overlaps (consecutive_failures 1, then 2)
+      # plus this one ordinary failure must report count 3 -- exactly
+      # matching collector.scheduler.Scheduler's own authoritative
+      # per-target state for this identical (node, loop) failure, not
+      # a daemon-local ordinary-failure-only count that would report 1.
+      assert record["consecutive_failures"] == 3
+      assert record["breaker_state"] == "open"
 
    def test_ordinary_poll_failure_hostile_exception_class_name_never_persisted(
          self, tmp_path):
