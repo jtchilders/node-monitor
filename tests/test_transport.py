@@ -17,6 +17,7 @@ this pattern first).
 """
 
 import asyncio
+import gc
 import json
 import os
 import stat
@@ -802,12 +803,67 @@ class TestTimeoutAndProcessGroupCleanup:
          time.sleep(0.05)
       assert child_pid is not None, "descendant never started"
 
-      # Give cleanup's own escalation/poll loop time to finish; it must
-      # not rely on the caller waiting further than transport.py itself
-      # already waited internally.
-      time.sleep(0.5)
+      # Round 4 finding 1: this must hold the INSTANT run_local_probe
+      # raises, with no extra sleep -- transport.py itself owns waiting
+      # out its own escalation/poll loop before returning. A caller-side
+      # sleep here would hide a race where the group-level probe
+      # (killpg(pgid, 0)) can report "gone" one syscall before the
+      # kernel has actually reaped the last group member, i.e. a real
+      # os.kill(descendant_pid, 0) can still succeed for a brief window
+      # after _terminate_process_group has already returned.
       with pytest.raises(ProcessLookupError):
          os.kill(child_pid, 0)
+
+   def test_timeout_descendant_ignoring_sigterm_gone_immediately_repeated(
+         self, fake_probe, tmp_path):
+      """Round 4 finding 1, repeated: a single pass of the scenario above
+      can pass by luck even with the bug present (the race window is a
+      few hundred microseconds), so repeat it enough times to make the
+      race observable. Reproduced failing ~40% of iterations against the
+      pre-fix code (killpg(pgid, 0) reporting the group gone while
+      os.kill(descendant_pid, 0) still succeeded immediately after
+      run_local_probe returned).
+      """
+      marker = tmp_path / "repeated_ignoring_descendant_pid.txt"
+      env = dict(os.environ)
+      env["FAKE_SPAWN_MARKER_FILE"] = str(marker)
+      env["FAKE_SPAWN_SLEEP_SECONDS"] = "30"
+      env["FAKE_SPAWN_IGNORE_SIGTERM"] = "1"
+      env["FAKE_SLEEP_SECONDS"] = "10"
+      probe_script_path = str(tmp_path / "remote_probe_repeated.py")
+      with open(probe_script_path, "w") as handle:
+         handle.write("# stand-in\n")
+
+      for _ in range(15):
+         if marker.exists():
+            marker.unlink()
+         with pytest.raises(transport.ProbeTimeoutError):
+            _run(transport.run_local_probe(
+               probe_python=fake_probe,
+               probe_script_path=probe_script_path,
+               loop="census",
+               probe_max_seconds=30,
+               hard_timeout_sec=1.0,
+               expected_probe_version=4,
+               base_env=env,
+               grace_sec=0.3,
+            ))
+
+         deadline = time.monotonic() + 3
+         child_pid = None
+         while time.monotonic() < deadline:
+            if marker.exists():
+               content = marker.read_text().strip()
+               if content:
+                  child_pid = int(content)
+                  break
+            time.sleep(0.02)
+         assert child_pid is not None, "descendant never started"
+
+         # No sleep: assert the postcondition the instant transport
+         # returned control to us.
+         with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
 
    def test_cancellation_kills_process_group_no_orphan(
          self, fake_probe, tmp_path):
@@ -905,6 +961,54 @@ class TestTimeoutAndProcessGroupCleanup:
       assert proc.returncode is not None, "child was never reaped"
       with pytest.raises(ProcessLookupError):
          os.kill(proc.pid, 0)
+
+   def test_timeout_cleanup_leaves_no_unraisable_pipe_transport_warning(
+         self, fake_probe, tmp_path):
+      """Round 4 finding 2: repeating the SIGTERM-ignoring-descendant
+      timeout scenario produced PytestUnraisableExceptionWarning from
+      asyncio.base_subprocess.BaseSubprocessTransport.__del__ raising
+      'RuntimeError: Event loop is closed' -- the timeout cleanup path
+      was not deterministically draining/closing the subprocess's pipe
+      transports before the event loop (created fresh per asyncio.run()
+      call) shut down, leaving that work to __del__/GC on some later
+      loop. Install sys.unraisablehook for the duration of several
+      repeated timeout+cleanup cycles and assert it never fires.
+      """
+      captured = []
+      previous_hook = sys.unraisablehook
+      sys.unraisablehook = captured.append
+      try:
+         marker = tmp_path / "unraisable_marker.txt"
+         env = dict(os.environ)
+         env["FAKE_SPAWN_MARKER_FILE"] = str(marker)
+         env["FAKE_SPAWN_SLEEP_SECONDS"] = "30"
+         env["FAKE_SPAWN_IGNORE_SIGTERM"] = "1"
+         env["FAKE_SLEEP_SECONDS"] = "10"
+         probe_script_path = str(tmp_path / "remote_probe_unraisable.py")
+         with open(probe_script_path, "w") as handle:
+            handle.write("# stand-in\n")
+
+         for _ in range(8):
+            if marker.exists():
+               marker.unlink()
+            with pytest.raises(transport.ProbeTimeoutError):
+               _run(transport.run_local_probe(
+                  probe_python=fake_probe,
+                  probe_script_path=probe_script_path,
+                  loop="census",
+                  probe_max_seconds=30,
+                  hard_timeout_sec=1.0,
+                  expected_probe_version=4,
+                  base_env=env,
+                  grace_sec=0.3,
+               ))
+            gc.collect()
+      finally:
+         sys.unraisablehook = previous_hook
+
+      assert not captured, (
+         "cleanup left subprocess pipe transports for __del__/GC to "
+         "close after event-loop shutdown: %r" % (captured,))
 
 
 # --------------------------------------------------------------------------

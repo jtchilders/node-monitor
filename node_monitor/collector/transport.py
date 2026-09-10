@@ -403,6 +403,75 @@ def _process_group_alive(pgid):
    return True
 
 
+_GROUP_GONE_STABILITY_CHECKS = 3
+_GROUP_GONE_POLL_SEC = 0.01
+
+
+async def _wait_group_confirmed_gone(pgid, deadline):
+   """Poll `_process_group_alive(pgid)` until it reports False on
+   `_GROUP_GONE_STABILITY_CHECKS` consecutive checks, or `deadline`
+   (a `time.monotonic()` value) passes.
+
+   A single `killpg(pgid, 0)` success/failure is not by itself
+   sufficient proof of the group's true state: `killpg` reports "no
+   such process group" (`ESRCH`) as soon as the LAST member the kernel
+   still associates with `pgid` has been signal-delivered and is
+   exiting, which can be a brief window before `os.kill(that pid, 0)`
+   -- checking the actual descendant PID directly -- also starts
+   raising `ProcessLookupError`. Requiring several consecutive "gone"
+   readings, each separated by a short real sleep, closes that window:
+   a group that is genuinely gone stays reporting gone across every
+   recheck, while a group observed "gone" only by a single racy read
+   flips back to "alive" on the very next check because the kernel has
+   not actually finished tearing it down yet. Returns True once the
+   group is confirmed gone, False if `deadline` was reached first.
+   """
+   consecutive_gone = 0
+   while True:
+      if _process_group_alive(pgid):
+         consecutive_gone = 0
+      else:
+         consecutive_gone += 1
+         if consecutive_gone >= _GROUP_GONE_STABILITY_CHECKS:
+            return True
+      if time.monotonic() >= deadline:
+         return not _process_group_alive(pgid)
+      await asyncio.sleep(_GROUP_GONE_POLL_SEC)
+
+
+async def _close_subprocess_transport(proc):
+   """Drain `proc`'s stdout/stderr pipes to EOF and close its
+   subprocess transport deterministically, instead of leaving that to
+   `BaseSubprocessTransport.__del__` whenever the garbage collector
+   happens to run it.
+
+   `asyncio.create_subprocess_exec`'s pipe transports hold OS file
+   descriptors and, once the child has exited, an internal reference
+   to the event loop they were created on. If nothing reads a
+   partially-buffered pipe to EOF and closes the transport before that
+   loop is closed (every call in this module runs under its own
+   `asyncio.run()`), `__del__` running later -- on a different loop,
+   or after the process has already exited -- raises `RuntimeError:
+   Event loop is closed` from inside `call_soon`, which asyncio can
+   only report as an unraisable exception. Under repeated timeout/
+   cleanup cycles in the same process (e.g. a long-running collector
+   polling many nodes) this surfaces as intermittent "Event loop is
+   closed" noise with no failed collection to explain it. The subgroup
+   has already been SIGKILLed and reaped by the time this runs, so
+   these reads return promptly.
+   """
+   for stream in (proc.stdout, proc.stderr):
+      if stream is None:
+         continue
+      try:
+         await stream.read()
+      except (BrokenPipeError, ConnectionResetError, OSError):
+         pass
+   transport = getattr(proc, "_transport", None)
+   if transport is not None:
+      transport.close()
+
+
 async def _terminate_process_group(proc, grace_sec):
    """SIGTERM the whole process group started with start_new_session,
    give it `grace_sec` to exit, SIGKILL if it has not, then reap.
@@ -419,10 +488,14 @@ async def _terminate_process_group(proc, grace_sec):
    group is gone: a descendant that ignores SIGTERM keeps the process
    group alive even after the leader we spawned has exited. So after
    both the initial grace-period wait and any SIGKILL escalation, this
-   explicitly re-checks the whole group via `_process_group_alive` and
-   keeps escalating to SIGKILL until nothing answers to `pgid` (or the
-   grace budget runs out) -- never treating "our direct child exited"
-   as "the group is gone".
+   explicitly re-checks the whole group via `_wait_group_confirmed_gone`
+   and keeps escalating to SIGKILL until the group is CONFIRMED gone
+   (several consecutive "gone" reads, not a single racy one) or the
+   grace budget runs out -- never treating "our direct child exited",
+   or a single `killpg` failure, as "the group is gone". Finally,
+   drains and closes the owned subprocess transport so no pipe/fd
+   cleanup is left to `__del__` after this coroutine's event loop
+   shuts down.
    """
    pgid = None
    try:
@@ -444,26 +517,27 @@ async def _terminate_process_group(proc, grace_sec):
             pass
       await proc.wait()
 
-   if pgid is None:
-      return
-   if not _process_group_alive(pgid):
-      return
-   # The leader is gone (proc.wait() above returned) but something
-   # else in its process group is still alive -- e.g. a descendant
-   # that ignored the group SIGTERM above. SIGKILL cannot be ignored,
-   # so escalate and poll until the whole group is confirmed gone or
-   # the grace budget is exhausted. `pgid` was fetched while `proc`
-   # itself was still alive, but by this point the leader has already
-   # exited -- so, same as `_process_group_alive`, a PermissionError
-   # here means the OS has recycled `pgid` onto some other process
-   # this caller has no business signalling; treat that as "gone".
-   try:
-      os.killpg(pgid, signal.SIGKILL)
-   except (ProcessLookupError, PermissionError):
-      return
-   deadline = time.monotonic() + max(grace_sec, 0.0)
-   while _process_group_alive(pgid) and time.monotonic() < deadline:
-      await asyncio.sleep(0.02)
+   if pgid is not None:
+      deadline = time.monotonic() + max(grace_sec, 0.0)
+      if not await _wait_group_confirmed_gone(pgid, deadline):
+         # The leader is gone (proc.wait() above returned) but
+         # something else in its process group is still alive -- e.g.
+         # a descendant that ignored the group SIGTERM above. SIGKILL
+         # cannot be ignored, so escalate and confirm again. `pgid`
+         # was fetched while `proc` itself was still alive, but by
+         # this point the leader has already exited -- so, same as
+         # `_process_group_alive`, a PermissionError here means the OS
+         # has recycled `pgid` onto some other process this caller has
+         # no business signalling; treat that as "gone".
+         try:
+            os.killpg(pgid, signal.SIGKILL)
+         except (ProcessLookupError, PermissionError):
+            pass
+         else:
+            escalated_deadline = time.monotonic() + max(grace_sec, 0.0)
+            await _wait_group_confirmed_gone(pgid, escalated_deadline)
+
+   await _close_subprocess_transport(proc)
 
 
 async def _run_subprocess(argv, env, stdin_data, timeout_sec,
