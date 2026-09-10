@@ -94,16 +94,24 @@ class Target:
 class _TargetState:
    """Mutable per-target bookkeeping. Not exposed publicly."""
 
-   __slots__ = ("next_deadline", "active_task", "consecutive_failures")
+   __slots__ = ("next_deadline", "active_task", "consecutive_failures",
+                "failure_threshold")
 
-   def __init__(self, next_deadline):
+   def __init__(self, next_deadline, failure_threshold):
       self.next_deadline = next_deadline
       self.active_task = None
       self.consecutive_failures = 0
+      # Stored per-state (not read from the module-level default) so
+      # that ``breaker_state`` reflects whatever ``failure_threshold``
+      # this Scheduler was actually constructed with -- review round 1
+      # found this hard-coded to ``_DEFAULT_FAILURE_THRESHOLD``, which
+      # contradicted the real scheduling policy whenever a caller
+      # configured a non-default threshold.
+      self.failure_threshold = failure_threshold
 
    @property
    def breaker_state(self):
-      if self.consecutive_failures >= _DEFAULT_FAILURE_THRESHOLD:
+      if self.consecutive_failures >= self.failure_threshold:
          return BREAKER_OPEN
       return BREAKER_CLOSED
 
@@ -202,8 +210,11 @@ class Scheduler:
       end_time = start_time + self._duration_sec
       tasks = [
          asyncio.ensure_future(
-            self._run_target(target, _TargetState(next_deadline=start_time),
-                              end_time))
+            self._run_target(
+               target,
+               _TargetState(next_deadline=start_time,
+                             failure_threshold=self._failure_threshold),
+               end_time))
          for target in self._targets
       ]
       await asyncio.gather(*tasks)
@@ -223,6 +234,58 @@ class Scheduler:
          return stop_task in done
       finally:
          for pending_task in (sleep_task, stop_task):
+            if not pending_task.done():
+               pending_task.cancel()
+               try:
+                  await pending_task
+               except asyncio.CancelledError:
+                  pass
+
+   def _next_gap(self, state, target):
+      """The gap (in seconds) from a dispatch's own deadline to the
+      target's next deadline, given ``state.consecutive_failures`` as
+      of right now -- normal interval while the breaker is closed,
+      bounded exponential backoff seeded from the target's own
+      interval once it is open.
+      """
+      if state.consecutive_failures >= self._failure_threshold:
+         exponent = state.consecutive_failures - self._failure_threshold + 1
+         return min(target.interval_sec * (2 ** exponent),
+                    self._backoff_cap_sec)
+      return target.interval_sec
+
+   async def _wait_for_task(self, task, timeout):
+      """Wait up to ``timeout`` (virtual seconds, via the injected
+      ``sleep``) for ``task`` to finish on its own, OR until
+      ``request_stop()`` fires. Returns without cancelling anything
+      either way -- a task that is still running when this returns is
+      simply left in place as ``state.active_task``, to be
+      cancelled/reaped as a ``scheduler_miss`` at its own next deadline
+      (or drained by the normal end-of-run/stop-requested finally
+      block), exactly as before this method existed. This only exists
+      so a poll that fails or succeeds ASYNCHRONOUSLY (genuinely
+      suspends before resolving) has its outcome folded into
+      ``consecutive_failures`` before the caller computes the next
+      deadline -- see the call site's comment.
+
+      Must watch the stop event, not just the timeout: a
+      request_stop() that lands while this wait is pending (e.g. a
+      target already in backoff, waiting out a long provisional gap)
+      would otherwise never observe it until the FULL provisional gap
+      elapses -- for an open breaker that can be minutes, and for a
+      poll_fn that never completes it hangs the whole run() forever,
+      since a stop mid-wait never reaches the outer loop's own
+      stop-requested check.
+      """
+      if task.done():
+         return
+      timeout_task = asyncio.ensure_future(self._sleep(timeout))
+      stop_task = asyncio.ensure_future(self._stop_event.wait())
+      try:
+         await asyncio.wait({task, timeout_task, stop_task},
+                             return_when=asyncio.FIRST_COMPLETED)
+      finally:
+         for pending_task in (timeout_task, stop_task):
             if not pending_task.done():
                pending_task.cancel()
                try:
@@ -283,33 +346,52 @@ class Scheduler:
 
             # Same-node/same-loop non-overlap (design: "a poll still
             # active at its next deadline is terminated, reaped, and
-            # recorded as a scheduler failure").
+            # recorded as a scheduler failure"). The design's own
+            # wording -- "recorded as a scheduler failure" -- means a
+            # miss must feed the same breaker/backoff counter a
+            # poll_fn exception does (review round 1 finding 2: this
+            # previously emitted the event without ever touching
+            # consecutive_failures, so repeated overruns could never
+            # open or back off the breaker).
             if state.active_task is not None and not state.active_task.done():
                await self._cancel_and_reap(state.active_task)
+               state.consecutive_failures += 1
                self._emit(type="scheduler_miss", node=target.node,
-                          loop=target.loop, deadline=deadline)
+                          loop=target.loop, deadline=deadline,
+                          consecutive_failures=state.consecutive_failures,
+                          breaker_state=state.breaker_state)
 
             task = asyncio.ensure_future(self._execute(target, state, deadline))
             state.active_task = task
 
-            # Give an instantaneous (or already-resolved) poll_fn a
-            # chance to update state.consecutive_failures before this
-            # loop computes the NEXT gap below. A poll_fn that
-            # genuinely blocks (e.g. the non-overlap test's held-open
-            # fixture) simply will not have finished yet -- next_gap
-            # below then still reflects the breaker state as of the
-            # last completed poll, which is the correct fixed-grid
-            # behavior: this loop never waits for the poll it just
-            # dispatched before deciding when the next one is due.
-            await asyncio.sleep(0)
+            # Wait up to the gap this dispatch would get if it turns
+            # out to succeed-or-not-yet-fail (computed from
+            # consecutive_failures as of the moment it was launched)
+            # for the task to actually finish, so a poll that fails
+            # ASYNCHRONOUSLY -- genuinely suspends (e.g. `await
+            # sleep(...)`) before raising -- still has its outcome
+            # folded into consecutive_failures before this loop
+            # commits to the NEXT deadline. Review round 1 finding 1:
+            # a plain ``await asyncio.sleep(0)`` here only caught a
+            # poll_fn that failed WITHOUT ever suspending; a poll_fn
+            # that awaited something first would not be done yet, so
+            # the third failure's backoff would not apply until a
+            # full extra normal-interval cycle later.
+            #
+            # The wait is bounded by the PROVISIONAL (pre-outcome) gap,
+            # not an unbounded wait for completion: a poll that
+            # legitimately overruns its own interval (the non-overlap
+            # case) must never stall this loop past its own next
+            # deadline. Fixed-grid, no-drift is preserved because the
+            # actual deadline is always computed as ``deadline + gap``
+            # below, never from whenever this wait happens to return --
+            # a fast-but-slow-ish successful poll (finishes well inside
+            # its own interval) simply has its outcome observed a
+            # little earlier, it does not shift the grid.
+            provisional_gap = self._next_gap(state, target)
+            await self._wait_for_task(task, provisional_gap)
 
-            if state.consecutive_failures >= self._failure_threshold:
-               exponent = state.consecutive_failures - self._failure_threshold + 1
-               gap = min(target.interval_sec * (2 ** exponent),
-                         self._backoff_cap_sec)
-            else:
-               gap = target.interval_sec
-            state.next_deadline = deadline + gap
+            state.next_deadline = deadline + self._next_gap(state, target)
       finally:
          # Two different endings need two different drain policies.
          # An explicit request_stop() is the urgent signal-driven case

@@ -330,6 +330,52 @@ class TestNonOverlap:
       misses = [e for e in events if e["type"] == "scheduler_miss"]
       assert misses == []
 
+   def test_three_consecutive_misses_open_the_breaker_and_apply_backoff(self):
+      """Design: an active poll cancelled/reaped at its own next
+      deadline is 'recorded as a scheduler failure' -- three
+      consecutive scheduler_miss events must open the same breaker a
+      poll_fn exception would, and the next gap must reflect backoff,
+      not the normal interval. Regression for review round 1 finding
+      2: a scheduler_miss did not increment consecutive_failures, so
+      repeated overruns never opened/backed off the target breaker.
+      """
+      clock = FakeClock()
+      events = []
+
+      async def poll_fn(node, loop):
+         # Never completes on its own -- every dispatch is reaped as
+         # a miss by the following deadline.
+         await clock.sleep(1000)
+
+      target = Target(node="n1", loop="counter", interval_sec=10)
+      scheduler = Scheduler(
+         targets=[target], poll_fn=poll_fn, clock=clock.time,
+         sleep=clock.sleep, duration_sec=200, on_event=events.append)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(scheduler.run())
+         # Dispatch at 0; misses (cancel+reap the prior attempt) at
+         # 10, 20, 30 -- three consecutive misses by deadline 30 --
+         # then continue far enough to observe the post-breaker gap.
+         await clock.advance(120)
+         scheduler.request_stop()
+         await clock.advance(10)
+         await run_task
+
+      _run(scenario())
+
+      misses = [e for e in events if e["type"] == "scheduler_miss"]
+      assert len(misses) >= 3
+      miss_deadlines = [m["deadline"] for m in misses]
+      assert miss_deadlines[:3] == [10.0, 20.0, 30.0]
+      # After the third consecutive miss (recorded at deadline 30),
+      # the breaker must be open: the next dispatch is delayed by
+      # backoff (interval * 2 = 20s), landing at 50, not the normal
+      # 40 -- so the 4th miss (the dispatch that starts at the new
+      # deadline gets reaped in turn) must be recorded at 50.
+      assert len(misses) >= 4
+      assert misses[3]["deadline"] == 50.0
+
 
 # --------------------------------------------------------------------------
 # Breaker: three-consecutive-failure threshold, backoff, recovery
@@ -394,6 +440,49 @@ class TestBreaker:
       assert gaps[6] == 300.0
       assert gaps[7] == 300.0
       assert max(gaps) <= 300.0
+
+   def test_backoff_applies_to_the_dispatch_right_after_an_asynchronous_third_failure(self):
+      """Regression for review round 1 finding 1: a poll_fn that
+      genuinely suspends (awaits something) before failing must still
+      have its failure incorporated before the scheduler computes the
+      NEXT gap -- backoff must start immediately after the third
+      completed failure, not one full normal-interval cycle later.
+
+      Reproduction from the review: interval=0.05, poll_fn awaits
+      0.01s then raises. Failures land at ~0, .05, .10 (all still
+      inside their own interval, since 0.01 < 0.05); the dispatch
+      immediately following the third failure must reflect backoff
+      (interval * 2 = 0.10s), landing at ~0.20, not ~0.15.
+      """
+      clock = FakeClock()
+      dispatch_times = []
+
+      async def poll_fn(node, loop):
+         dispatch_times.append(clock.time())
+         await clock.sleep(0.01)
+         raise RuntimeError("boom")
+
+      target = Target(node="n1", loop="counter", interval_sec=0.05)
+      scheduler = Scheduler(
+         targets=[target], poll_fn=poll_fn, clock=clock.time,
+         sleep=clock.sleep, duration_sec=1.0)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(scheduler.run())
+         await clock.advance(1.0)
+         await run_task
+
+      _run(scenario())
+
+      # First three dispatches happen on the normal 0.05s grid
+      # (failures 1, 2, 3 -- breaker opens on the third). The fourth
+      # dispatch, immediately following the third failure, must
+      # already reflect backoff: gap of 0.10s from the third
+      # dispatch, not the normal 0.05s.
+      assert dispatch_times[0] == pytest.approx(0.0)
+      assert dispatch_times[1] == pytest.approx(0.05)
+      assert dispatch_times[2] == pytest.approx(0.10)
+      assert dispatch_times[3] == pytest.approx(0.20)
 
    def test_success_resets_breaker_and_backoff(self):
       clock = FakeClock()
