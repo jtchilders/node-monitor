@@ -199,6 +199,7 @@ class TestBuildUsageObservationsMeasured:
       obs = observations[0]
       assert obs["pid"] == 42
       assert obs["unmeasured"] is False
+      assert obs["currently_present"] is True
       assert obs["cpu_seconds"] == pytest.approx(1.9)
       assert obs["category"] == "ai-coding-agent"
       assert obs["activity"] == "claude-code"
@@ -218,6 +219,7 @@ class TestBuildUsageObservationsMeasured:
 
       assert len(observations) == 1
       assert observations[0]["unmeasured"] is False
+      assert observations[0]["currently_present"] is True
       assert observations[0]["cpu_seconds"] == pytest.approx(0.4)
 
 
@@ -236,6 +238,7 @@ class TestBuildUsageObservationsExited:
       obs = observations[0]
       assert obs["pid"] == 55
       assert obs["unmeasured"] is True
+      assert obs["currently_present"] is False
       assert obs["cpu_seconds"] == 0.0
       assert obs["category"] == "jupyter"
       assert obs["activity"] == "jupyter-kernel"
@@ -255,6 +258,9 @@ class TestBuildUsageObservationsStartedBeforeWindow:
       assert len(observations) == 1
       obs = observations[0]
       assert obs["unmeasured"] is True
+      # Present in current_payload -- currently resident, unlike "exited" --
+      # only its CPU is unattributable, its gauge fields are real.
+      assert obs["currently_present"] is True
       assert obs["cpu_seconds"] == 0.0
       assert obs["category"] == "fs-scan"
 
@@ -275,6 +281,7 @@ class TestBuildUsageObservationsAmbiguous:
       assert len(observations) == 1
       obs = observations[0]
       assert obs["unmeasured"] is True
+      assert obs["currently_present"] is True
       assert obs["cpu_seconds"] == 0.0
 
 
@@ -282,7 +289,8 @@ class TestBuildUsageObservationsFirstSample:
    def test_no_previous_payload_marks_every_process_unmeasured(self):
       # First census of a run: no previous sample exists at all, so
       # cpu_delta.compute_cpu_delta is never called (there is nothing to
-      # diff against). Every process is present but unmeasurable.
+      # diff against). Every process is present but unmeasurable -- it
+      # is nonetheless genuinely resident right now.
       current = _census(10.0, [
          _row(1, 5, category="shell/session", activity="shell"),
          _row(2, 8, category="other", activity=None),
@@ -292,6 +300,7 @@ class TestBuildUsageObservationsFirstSample:
 
       assert len(observations) == 2
       assert all(obs["unmeasured"] is True for obs in observations)
+      assert all(obs["currently_present"] is True for obs in observations)
       assert all(obs["cpu_seconds"] == 0.0 for obs in observations)
 
 
@@ -316,10 +325,13 @@ class TestBuildUsageObservationsMixed:
       by_pid = {obs["pid"]: obs for obs in observations}
       assert set(by_pid) == {1, 2, 4}
       assert by_pid[1]["unmeasured"] is False
+      assert by_pid[1]["currently_present"] is True
       assert by_pid[1]["cpu_seconds"] == pytest.approx(0.7)
       assert by_pid[4]["unmeasured"] is False
+      assert by_pid[4]["currently_present"] is True
       assert by_pid[4]["cpu_seconds"] == pytest.approx(0.3)
       assert by_pid[2]["unmeasured"] is True
+      assert by_pid[2]["currently_present"] is False
       assert by_pid[2]["category"] == "jupyter"
       assert by_pid[2]["username"] == "bob"
 
@@ -341,14 +353,18 @@ def _make_accumulator(expected_count=15, system="polaris",
 
 def _process_row(pid, category="other", activity=None, username="jchilders",
                   cpu_seconds=0.0, rss_kb=1000, state="S", interactive=False,
-                  unmeasured=False):
+                  unmeasured=False, currently_present=True):
    """One 'observed process' entry as add_sample expects -- the shape the
    daemon builds by joining one census payload's process rows against
    cpu_delta.compute_cpu_delta's per-pid deltas/unmeasured lists for the
    SAME sample. ``unmeasured=True`` means this pid had no measurable CPU
    delta for this sample (new-but-before-window, exited, or the first
    sample of the run with nothing to diff against) -- cpu_seconds is
-   irrelevant/ignored in that case.
+   irrelevant/ignored in that case. ``currently_present=False`` means
+   this pid is NOT part of the current census (it is an "exited" entry
+   carried only for CPU attribution) and must never contribute to the
+   current sample's process-count/RSS/D-state/interactivity gauges --
+   only to unmeasured_count.
    """
    return {
       "pid": pid,
@@ -360,6 +376,7 @@ def _process_row(pid, category="other", activity=None, username="jchilders",
       "state": state,
       "interactive": interactive,
       "unmeasured": unmeasured,
+      "currently_present": currently_present,
    }
 
 
@@ -567,3 +584,138 @@ class TestContractCompliance:
       assert validated["source_hostname"] == "polaris-login-04.example.org"
       assert validated["interval_start_utc"] == "2026-09-09T00:00:00Z"
       assert validated["interval_end_utc"] == "2026-09-09T00:15:00Z"
+
+
+# --------------------------------------------------------------------------
+# Review round 1 findings -- bounded state, zero-fill, exited-process gauges
+# --------------------------------------------------------------------------
+
+class TestBoundedGrainState:
+   def test_rss_state_bounded_by_expected_count_not_process_count(self):
+      # Reviewer repro: one sample with 10,000 same-grain processes must
+      # retain O(expected_count) rss list entries, not O(process count) --
+      # a real login node with a busy grain (e.g. thousands of short-lived
+      # "shell/session" processes) must not make accumulator memory scale
+      # with process count across a whole 15-minute window.
+      acc = _make_accumulator(expected_count=15)
+      acc.add_sample([_process_row(pid, rss_kb=1000 + pid)
+                       for pid in range(10000)])
+
+      assert len(acc._grains[("other", "unknown", "jchilders")].rss_per_sample) == 1
+
+   def test_rss_percentiles_computed_over_per_sample_aggregates(self):
+      # The bounded aggregate must still be a meaningful RSS summary: one
+      # value per sample (e.g. the sample's total/representative RSS for
+      # the grain), not a single collapsed constant.
+      acc = _make_accumulator(expected_count=3)
+      acc.add_sample([_process_row(1, rss_kb=1000), _process_row(2, rss_kb=2000)])
+      acc.add_sample([_process_row(1, rss_kb=1500), _process_row(2, rss_kb=2500)])
+      acc.add_sample([_process_row(1, rss_kb=3000), _process_row(2, rss_kb=3000)])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      rss = records[0]["rss_kb"]
+      # Per-sample totals: 3000, 4000, 6000 -- max must be 6000, not a
+      # per-process value like 3000.
+      assert rss["max"] == 6000
+
+
+class TestZeroFilledGaugeCounts:
+   def test_grain_absence_in_a_later_sample_is_a_zero_not_an_omission(self):
+      # Reviewer repro: present, then a sample where the grain's process
+      # exited (no longer resident), then an empty census. Once a grain
+      # has appeared in the interval, EVERY subsequent successful sample
+      # must contribute a count for it -- zero when absent -- so
+      # process_count percentiles and sample_count reflect every
+      # successful census, not just the samples where the grain happened
+      # to have a resident process.
+      acc = _make_accumulator(expected_count=3)
+      acc.add_sample([_process_row(1, category="other", activity="shell",
+                                    username="alice", currently_present=True)])
+      acc.add_sample([_process_row(1, category="other", activity="shell",
+                                    username="alice", unmeasured=True,
+                                    currently_present=False)])
+      acc.add_sample([])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      record = records[0]
+      # Per-sample process counts must be [1, 0, 0] -- one entry per
+      # sample, zero-filled for the exited/empty samples, not [1]
+      # (silently omitting the two absent samples).
+      assert acc._grains[("other", "shell", "alice")].process_counts == [1, 0, 0]
+      assert record["process_count"]["p50"] == 0.0
+      assert record["process_count"]["max"] == 1
+      assert record["sample_count"] == 3
+      assert record["expected_count"] == 3
+
+   def test_grain_first_appearing_after_earlier_successful_samples_not_backfilled(self):
+      # A grain that does not exist until sample 3 must NOT retroactively
+      # gain zero-counts for samples 1-2 -- it did not exist as a grain
+      # yet, so there is nothing to zero-fill; sample_count for THIS
+      # grain reflects only samples from its first appearance onward.
+      acc = _make_accumulator(expected_count=3)
+      acc.add_sample([])
+      acc.add_sample([])
+      acc.add_sample([_process_row(1, category="other", activity="shell",
+                                    username="alice")])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      assert records[0]["sample_count"] == 1
+      assert records[0]["process_count"] == {"p50": 1, "p95": 1, "max": 1}
+
+
+class TestExitedProcessDoesNotPolluteCurrentGauges:
+   def test_exited_observation_contributes_unmeasured_not_gauge_state(self):
+      # Reviewer finding 3: an exited process's stale previous-sample row
+      # (rss_kb, state, interactive) must not be counted as a CURRENTLY
+      # resident process's gauge contribution -- it only affects
+      # unmeasured_count. This directly targets add_sample()'s handling
+      # of currently_present=False observations.
+      acc = _make_accumulator(expected_count=2)
+      acc.add_sample([_process_row(
+         55, category="jupyter", activity="jupyter-kernel", username="bob",
+         rss_kb=999999, state="D", interactive=True,
+         unmeasured=True, currently_present=False)])
+      acc.add_sample([])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      record = records[0]
+      assert record["unmeasured_count"] == 1
+      # The exited process's stale D-state/interactive/huge-RSS values
+      # must not leak into these gauges.
+      assert record["d_state_fraction"] == 0.0
+      assert record["interactivity_fraction"] == 0.0
+      assert record["rss_kb"]["max"] < 999999
+      # And it must not inflate process_count either.
+      assert record["process_count"]["max"] == 0
+
+   def test_exited_process_alongside_a_real_resident_in_same_sample(self):
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample([
+         _process_row(1, category="other", activity="shell", username="alice",
+                       rss_kb=2000, state="S", interactive=False,
+                       currently_present=True),
+         _process_row(2, category="other", activity="shell", username="alice",
+                       rss_kb=999999, state="D", interactive=True,
+                       unmeasured=True, currently_present=False),
+      ])
+
+      records = acc.finalize()
+
+      assert len(records) == 1
+      record = records[0]
+      # Only the resident process (pid 1) counts toward this sample's
+      # process count and gauges; the exited pid 2 contributes only
+      # unmeasured_count.
+      assert record["process_count"] == {"p50": 1, "p95": 1, "max": 1}
+      assert record["rss_kb"]["max"] == 2000
+      assert record["d_state_fraction"] == 0.0
+      assert record["interactivity_fraction"] == 0.0
+      assert record["unmeasured_count"] == 1

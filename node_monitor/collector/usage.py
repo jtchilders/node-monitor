@@ -105,7 +105,7 @@ def _row_by_pid_key(payload):
            for row in (payload or {}).get("processes", [])}
 
 
-def _observation_from_row(row, cpu_seconds, unmeasured):
+def _observation_from_row(row, cpu_seconds, unmeasured, currently_present):
    return {
       "pid": row["pid"],
       "category": row["category"],
@@ -116,6 +116,7 @@ def _observation_from_row(row, cpu_seconds, unmeasured):
       "state": row["state"],
       "interactive": row["interactive"],
       "unmeasured": unmeasured,
+      "currently_present": currently_present,
    }
 
 
@@ -154,8 +155,10 @@ def build_usage_observations(current_payload, previous_payload=None):
 
    if previous_payload is None:
       # First sample of a run for this node: nothing to diff against, so
-      # every process is present but entirely unmeasurable.
-      return [_observation_from_row(row, cpu_seconds=0.0, unmeasured=True)
+      # every process is present but entirely unmeasurable. Every row
+      # comes from current_payload, so every one is currently resident.
+      return [_observation_from_row(row, cpu_seconds=0.0, unmeasured=True,
+                                     currently_present=True)
               for row in current_rows.values()]
 
    previous_rows = _row_by_pid_key(previous_payload)
@@ -169,35 +172,45 @@ def build_usage_observations(current_payload, previous_payload=None):
       row = current_rows.get(key)
       if row is None:
          continue
-      observations.append(
-         _observation_from_row(row, delta["cpu_seconds"], unmeasured=False))
+      observations.append(_observation_from_row(
+         row, delta["cpu_seconds"], unmeasured=False, currently_present=True))
       consumed_keys.add(key)
 
    for entry in cpu_deltas["unmeasured"]:
       key = (entry["pid"], entry["start_time_ticks"])
       # "exited" pids have no row in current_payload (they are gone by
       # this sample) -- their only classifiable row is in the PREVIOUS
-      # payload. "started_before_window" pids are the opposite: present
-      # in current_payload, absent from previous_payload. Try current
-      # first (the common/typical case), fall back to previous.
-      row = current_rows.get(key) or previous_rows.get(key)
+      # payload, and they are NOT currently resident. "started_before_
+      # window" pids are the opposite: present in current_payload,
+      # absent from previous_payload, and ARE currently resident (their
+      # gauge fields -- rss/state/interactive -- are real point-in-time
+      # readings; only their CPU is unattributable).
+      current_row = current_rows.get(key)
+      if current_row is not None:
+         row, currently_present = current_row, True
+      else:
+         row, currently_present = previous_rows.get(key), False
       if row is None:
          # Neither payload has a row for this pid -- nothing to classify
          # it by. Skipped rather than fabricated into an ungrounded grain.
          continue
-      observations.append(
-         _observation_from_row(row, cpu_seconds=0.0, unmeasured=True))
+      observations.append(_observation_from_row(
+         row, cpu_seconds=0.0, unmeasured=True,
+         currently_present=currently_present))
       consumed_keys.add(key)
 
    for entry in cpu_deltas["anomalies"]:
       key = (entry["pid"], entry["start_time_ticks"])
       if key in consumed_keys:
          continue
-      row = current_rows.get(key) or previous_rows.get(key)
+      # An anomaly is always a (pid, start_time_ticks) present in BOTH
+      # samples (cpu_delta.py only raises "negative_delta" for a key it
+      # matched in both), so it is always currently resident.
+      row = current_rows.get(key)
       if row is None:
          continue
-      observations.append(
-         _observation_from_row(row, cpu_seconds=0.0, unmeasured=True))
+      observations.append(_observation_from_row(
+         row, cpu_seconds=0.0, unmeasured=True, currently_present=True))
       consumed_keys.add(key)
 
    return observations
@@ -240,40 +253,85 @@ class _GrainState:
    """Bounded accumulating state for one (category, activity, username)
    grain within a single 15-minute window.
 
-   Every list here is bounded by ``expected_count`` (the window's known
-   sample cadence), enforced by ``UsageIntervalAccumulator.add_sample``
-   never calling this class more than once per grain per sample -- a
-   grain observed in every sample of a 15-minute/60-second-census window
-   accumulates at most ``expected_count`` entries per list, never growing
-   with total process count across the run.
+   Review round 1 finding 1: state here must be bounded by
+   ``expected_count`` (the window's known sample cadence), NOT by total
+   process observation count -- a single busy sample with thousands of
+   same-grain processes must not make this state grow past what
+   ``expected_count`` already sized it for. Every list below holds
+   exactly one entry per SAMPLE this grain was reported in (whether the
+   grain had 0, 1, or 10,000 currently-resident processes in that
+   sample), so state is O(expected census samples in the window), never
+   O(process observations).
+
+   Review round 1 finding 2: once a grain has appeared in the window,
+   every subsequent sample ``add_sample`` is called with must contribute
+   an entry to ``process_counts``/``rss_per_sample`` for this grain --
+   zero when the grain has no currently-resident process in that
+   sample -- via ``note_sample`` (called once per sample per KNOWN grain,
+   whether or not that sample's process list touched this grain). A
+   grain's OWN first-seen sample is never backfilled retroactively (see
+   ``UsageIntervalAccumulator.add_sample``): "zero-fill forward from
+   here on", not "this grain secretly existed since sample 0".
+
+   Review round 1 finding 3: ``add_observation`` is called ONLY for
+   currently-resident (``currently_present=True``) observations -- an
+   ``unmeasured``/``currently_present=False`` ("exited") observation
+   updates ONLY ``unmeasured_count`` via ``note_unmeasured``, never the
+   process-count/RSS/D-state/interactivity gauges, because it describes
+   a process that is no longer part of the CURRENT census, carried only
+   so its final partial CPU interval is accounted for as unmeasured
+   rather than silently dropped.
    """
 
    def __init__(self):
       self.process_counts = []
+      self.rss_per_sample = []
       self.cpu_seconds = 0.0
-      self.rss_values = []
       self.d_state_observations = 0
       self.interactive_observations = 0
       self.total_observations = 0
       self.sample_indices = set()
       self.unmeasured_count = 0
+      # Internal accumulators for the sample CURRENTLY being built by
+      # add_sample -- reset by note_sample once that sample is closed
+      # out, so they never outlive one sample's worth of processing.
+      self._pending_process_count = 0
+      self._pending_rss_total = 0
 
-   def add_observation(self, sample_index, rss_kb, state, interactive,
-                        cpu_seconds, unmeasured):
-      self.sample_indices.add(sample_index)
+   def add_observation(self, rss_kb, state, interactive, cpu_seconds):
+      """Record one CURRENTLY-RESIDENT process observation for the
+      sample in progress. Never called for an exited/unmeasured-absent
+      observation -- see ``note_unmeasured``.
+      """
       self.total_observations += 1
-      self.rss_values.append(rss_kb)
+      self._pending_process_count += 1
+      self._pending_rss_total += rss_kb
       if state == "D":
          self.d_state_observations += 1
       if interactive:
          self.interactive_observations += 1
-      if unmeasured:
-         self.unmeasured_count += 1
-      else:
-         self.cpu_seconds += cpu_seconds
+      self.cpu_seconds += cpu_seconds
 
-   def note_process_count(self, count):
-      self.process_counts.append(count)
+   def note_unmeasured(self):
+      """Record one CPU-unmeasured observation (exited, started-before-
+      window, or an ambiguous/anomalous delta) -- never affects the
+      current-census gauges, only the explicit unmeasured count.
+      """
+      self.unmeasured_count += 1
+
+   def note_sample(self, sample_index):
+      """Close out the sample currently being built: commit its pending
+      process-count/RSS totals (zero if this grain had no currently-
+      resident process in this sample) and reset the pending
+      accumulators for the next sample. Bounded: exactly one entry is
+      appended per call, regardless of how many observations this sample
+      contributed.
+      """
+      self.sample_indices.add(sample_index)
+      self.process_counts.append(self._pending_process_count)
+      self.rss_per_sample.append(self._pending_rss_total)
+      self._pending_process_count = 0
+      self._pending_rss_total = 0
 
 
 class UsageIntervalAccumulator:
@@ -281,12 +339,11 @@ class UsageIntervalAccumulator:
 
    Consumes one "sample" at a time via ``add_sample`` -- one sample is
    the list of per-process observations the daemon derived from a single
-   census payload (already joined against ``cpu_delta.compute_cpu_delta``
-   results for that payload against the previous one; see
-   ``tests/test_usage.py``'s ``_process_row`` helper for the exact
-   per-process shape this expects: ``pid``, ``category``, ``activity``,
-   ``username``, ``cpu_seconds``, ``rss_kb``, ``state``, ``interactive``,
-   ``unmeasured``).
+   census payload via ``build_usage_observations`` (each with ``pid``,
+   ``category``, ``activity``, ``username``, ``cpu_seconds``, ``rss_kb``,
+   ``state``, ``interactive``, ``unmeasured``, and ``currently_present``
+   -- see that function and ``tests/test_usage.py``'s ``_process_row``
+   helper for the exact shape).
 
    ``finalize()`` produces one ``node_usage_intervals`` record per
    ``(category, activity, username)`` grain observed anywhere in the
@@ -298,6 +355,10 @@ class UsageIntervalAccumulator:
    window" even when empty) does not apply here because usage intervals
    are keyed by a grain that only exists once at least one process
    belongs to it -- an empty window simply has no grains.
+
+   Once a grain exists, every subsequent sample contributes a
+   process-count entry for it (zero when absent that sample) -- see
+   ``_GrainState``'s docstring for the review-round-1 rationale.
    """
 
    def __init__(self, system, source_hostname, interval_start_utc,
@@ -315,19 +376,25 @@ class UsageIntervalAccumulator:
       """Feed one sample's per-process observations, in collection order.
 
       ``processes``: iterable of per-process dicts (see class docstring
-      for the expected shape). Every process in a single sample belongs
-      to exactly one (category, activity, username) grain; a grain
-      observed more than once within the SAME sample (e.g. two processes
-      that happen to share category/activity/username) each still
-      contribute their own process-count unit and their own CPU/RSS/
-      state/interactivity observation -- only the grain's aggregate
-      process COUNT for this sample is what gets recorded once, as the
-      number of processes observed in this sample for that grain.
+      for the expected shape). A CURRENTLY-RESIDENT process
+      (``currently_present=True``) contributes to its grain's process
+      count/RSS/D-state/interactivity for this sample; an exited/
+      unmeasured-absent process (``currently_present=False``)
+      contributes ONLY to ``unmeasured_count`` and never touches this
+      sample's gauge state (review round 1 finding 3).
+
+      Every grain touched in ANY way this sample (present or exited) --
+      plus every grain already known from an earlier sample -- gets
+      exactly one process-count/RSS entry closed out for this sample via
+      ``_GrainState.note_sample``, so absence reads as an explicit zero
+      rather than a silent omission (review round 1 finding 2). A grain
+      that does not yet exist is never backfilled for samples before its
+      first appearance.
       """
       sample_index = self._sample_count
       self._sample_count += 1
 
-      counts_this_sample = {}
+      touched_keys = set()
       for process in processes:
          activity = process["activity"]
          if activity is None:
@@ -336,18 +403,30 @@ class UsageIntervalAccumulator:
             activity = _UNKNOWN_ACTIVITY
          key = (process["category"], activity, process["username"])
          grain = self._grains.setdefault(key, _GrainState())
-         grain.add_observation(
-            sample_index=sample_index,
-            rss_kb=process["rss_kb"],
-            state=process["state"],
-            interactive=process["interactive"],
-            cpu_seconds=process["cpu_seconds"],
-            unmeasured=process["unmeasured"],
-         )
-         counts_this_sample[key] = counts_this_sample.get(key, 0) + 1
+         touched_keys.add(key)
 
-      for key, count in counts_this_sample.items():
-         self._grains[key].note_process_count(count)
+         if process["unmeasured"]:
+            grain.note_unmeasured()
+         if process["currently_present"]:
+            grain.add_observation(
+               rss_kb=process["rss_kb"],
+               state=process["state"],
+               interactive=process["interactive"],
+               cpu_seconds=process["cpu_seconds"],
+            )
+
+      # Every grain already known (from an earlier sample) that this
+      # sample did NOT touch at all still gets a zero-count entry for
+      # this sample -- it is a known grain with no resident process
+      # right now, not an unknown one. A brand-new grain first appearing
+      # in THIS sample was already handled above via note_observation's
+      # pending accumulators; it must not ALSO get a second, duplicate
+      # note_sample call here.
+      for key, grain in self._grains.items():
+         if key not in touched_keys:
+            grain.note_sample(sample_index)
+      for key in touched_keys:
+         self._grains[key].note_sample(sample_index)
 
    def finalize(self):
       """Produce one ``node_usage_intervals`` record per observed grain.
@@ -369,11 +448,13 @@ class UsageIntervalAccumulator:
             "username": username,
             "process_count": _percentile_stats(grain.process_counts),
             "cpu_seconds": grain.cpu_seconds,
-            "rss_kb": _percentile_stats(grain.rss_values),
+            "rss_kb": _percentile_stats(grain.rss_per_sample),
             "d_state_fraction": (
-               grain.d_state_observations / grain.total_observations),
+               grain.d_state_observations / grain.total_observations
+               if grain.total_observations else 0.0),
             "interactivity_fraction": (
-               grain.interactive_observations / grain.total_observations),
+               grain.interactive_observations / grain.total_observations
+               if grain.total_observations else 0.0),
             "sample_count": len(grain.sample_indices),
             "expected_count": self._expected_count,
             "unmeasured_count": grain.unmeasured_count,
