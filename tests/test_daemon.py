@@ -356,6 +356,145 @@ class TestCleanRun:
 # fatal sink-write failure.
 # --------------------------------------------------------------------------
 
+class TestSourceHostnameProvenance:
+   """Review round 1 finding #1: every newly-wired record (node_hardware,
+   diagnostic_census, node_usage_intervals) must carry the probe's own
+   remote-reported ``hostname_fqdn`` as ``source_hostname``, never the
+   configured SSH-alias transport hostname. Design (PHASE0_DAEMON_DESIGN.md
+   line 25: "SSH aliases are transport identifiers only, never
+   provenance"; lines 108-110: provenance must use the unique
+   remote-reported FQDN).
+   """
+
+   def test_hardware_record_uses_reported_fqdn_not_configured_alias(
+         self, tmp_path):
+      config = _config(tmp_path, nodes=[
+         {"hostname": "ssh-alias", "role": "local"},
+      ], duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-fqdn-hw", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload(hostname="canonical.example.org")
+         if loop == "census":
+            return _census_payload(uptime_sec=1.0, hostname="canonical.example.org")
+         return _counter_payload(uptime_sec=1.0, hostname="canonical.example.org")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      hw_path = os.path.join(sink.run_dir, "node_hardware.jsonl")
+      with open(hw_path) as handle:
+         hw_lines = [json.loads(line) for line in handle]
+      assert hw_lines[0]["source_hostname"] == "canonical.example.org"
+
+   def test_census_and_usage_records_use_reported_fqdn_not_configured_alias(
+         self, tmp_path):
+      config = _config(tmp_path, nodes=[
+         {"hostname": "ssh-alias", "role": "local"},
+      ], duration_sec=10)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-fqdn-census", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload(hostname="canonical.example.org")
+         if loop == "census":
+            return _census_payload(uptime_sec=1.0, hostname="canonical.example.org")
+         return _counter_payload(uptime_sec=1.0, hostname="canonical.example.org")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      census_path = os.path.join(sink.run_dir, "diagnostic_censuses.jsonl")
+      with open(census_path) as handle:
+         census_lines = [json.loads(line) for line in handle]
+      assert census_lines
+      for record in census_lines:
+         assert record["source_hostname"] == "canonical.example.org"
+
+      usage_path = os.path.join(sink.run_dir, "node_usage_intervals.jsonl")
+      with open(usage_path) as handle:
+         usage_lines = [json.loads(line) for line in handle]
+      assert usage_lines
+      for record in usage_lines:
+         assert record["source_hostname"] == "canonical.example.org"
+
+
+# --------------------------------------------------------------------------
+# Hardware-collection-failure detail must be bounded/scrubbed, never a raw
+# exception string that might carry probe argv/secrets (review round 1
+# finding #2).
+# --------------------------------------------------------------------------
+
+class TestHardwareCollectionFailureDetailIsScrubbed:
+   def test_hardware_collection_failure_never_persists_raw_exception_text(
+         self, tmp_path):
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-hw-scrub", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0, "census": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            raise RuntimeError(
+               "probe failed: argv=/bin/tool --token SECRET_MARKER")
+         call_counts[loop] += 1
+         if loop == "census":
+            return _census_payload(uptime_sec=float(call_counts["census"]))
+         return _counter_payload(uptime_sec=float(call_counts["counter"]))
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      log_path = os.path.join(sink.run_dir, "node_collection_log.jsonl")
+      with open(log_path, "rb") as handle:
+         raw_bytes = handle.read()
+      assert b"SECRET_MARKER" not in raw_bytes
+      assert b"argv=" not in raw_bytes
+
+      with open(log_path) as handle:
+         entries = [json.loads(line) for line in handle]
+      failures = [e for e in entries if e["event"] == "hardware_collection_failed"]
+      assert len(failures) == 1
+      assert failures[0]["detail"]["error_type"] == "RuntimeError"
+      assert "SECRET_MARKER" not in failures[0]["detail"].get("error", "")
+
+
 class TestHardwareOnceCollection:
    def test_hardware_once_produces_one_record_per_configured_node(self, tmp_path):
       config = _config(tmp_path, nodes=[

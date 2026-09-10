@@ -188,11 +188,19 @@ class Daemon:
       if self._on_event is not None:
          self._on_event(fields)
 
-   def _new_counter_accumulator(self, node):
+   def _new_counter_accumulator(self, node, payload):
       now = self._wall_clock_fn()
+      # Design (PHASE0_DAEMON_DESIGN.md line 25): "SSH aliases are
+      # transport identifiers only, never provenance." node.hostname is
+      # the configured SSH-alias/transport identity; the record's
+      # source_hostname must instead be the probe's own remote-reported
+      # hostname_fqdn (review round 1 finding #1). Bookkeeping is still
+      # keyed by node.hostname throughout this module (it is the only
+      # identity known BEFORE a payload arrives), but every persisted
+      # record uses the reported FQDN.
       return CounterWindowAccumulator(
          system=self._config.system,
-         source_hostname=node.hostname,
+         source_hostname=payload.get("hostname_fqdn"),
          collector_hostname=self._config.local_node.hostname,
          probe_version=None,
          daemon_version=None,
@@ -222,7 +230,7 @@ class Daemon:
       """
       accumulator = self._counter_accumulators.get(node.hostname)
       if accumulator is None:
-         accumulator = self._new_counter_accumulator(node)
+         accumulator = self._new_counter_accumulator(node, payload)
          self._counter_accumulators[node.hostname] = accumulator
       accumulator.add_sample(payload)
       count = self._counter_sample_counts.get(node.hostname, 0) + 1
@@ -230,11 +238,13 @@ class Daemon:
       if count >= self._counter_expected_count:
          await self._flush_counter_window(node, payload)
 
-   def _new_usage_accumulator(self, node):
+   def _new_usage_accumulator(self, node, payload):
       now = self._wall_clock_fn()
+      # Same FQDN-provenance rule as _new_counter_accumulator: never the
+      # configured node.hostname alias.
       return UsageIntervalAccumulator(
          system=self._config.system,
-         source_hostname=node.hostname,
+         source_hostname=payload.get("hostname_fqdn"),
          interval_start_utc=now,
          interval_end_utc=now,
          expected_count=self._usage_expected_count,
@@ -274,7 +284,8 @@ class Daemon:
       if previous_payload is not None:
          cpu_deltas = compute_cpu_delta(previous_payload, payload)
       census_record = build_diagnostic_census(
-         self._config.system, node.hostname, payload, cpu_deltas=cpu_deltas)
+         self._config.system, payload.get("hostname_fqdn"), payload,
+         cpu_deltas=cpu_deltas)
       await self._sink.write_record("diagnostic_census", census_record)
 
       observations = build_usage_observations(payload, previous_payload)
@@ -282,7 +293,7 @@ class Daemon:
 
       accumulator = self._usage_accumulators.get(node.hostname)
       if accumulator is None:
-         accumulator = self._new_usage_accumulator(node)
+         accumulator = self._new_usage_accumulator(node, payload)
          self._usage_accumulators[node.hostname] = accumulator
       accumulator.add_sample(observations)
       count = self._usage_sample_counts.get(node.hostname, 0) + 1
@@ -331,12 +342,26 @@ class Daemon:
       a structured place to surface -- the Scheduler's own
       breaker/backoff bookkeeping only covers polls it schedules
       itself, not this one-shot pre-scheduler step.
+
+      Review round 1 finding #2: the probe never returned a payload
+      here, so the exception's own message is the only detail
+      available -- and a transport-layer exception's message can
+      legitimately embed the failed command's argv (design: "Raw
+      argv ... never persist"; PHASE0_DAEMON_DESIGN.md line 16/51/107).
+      Persist only the exception's class name (a bounded, closed
+      vocabulary of Python builtin/transport exception types, never
+      attacker-controlled free text) plus a fixed, non-parameterized
+      message -- never ``str(exc)`` verbatim.
       """
       record = {
          "system": self._config.system,
          "timestamp_utc": self._wall_clock_fn(),
          "event": "hardware_collection_failed",
-         "detail": {"source_hostname": node.hostname, "error": str(exc)},
+         "detail": {
+            "source_hostname": node.hostname,
+            "error_type": type(exc).__name__,
+            "error": "hardware probe failed; see error_type",
+         },
       }
       await self._sink.write_record("node_collection_log", record)
 
@@ -367,7 +392,7 @@ class Daemon:
       hardware = payload.get("hardware") or {}
       record = {
          "system": self._config.system,
-         "source_hostname": node.hostname,
+         "source_hostname": payload.get("hostname_fqdn"),
          "first_seen_utc": self._wall_clock_fn(),
          "probe_version": payload.get("probe_version"),
       }
