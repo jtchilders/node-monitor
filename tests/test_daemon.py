@@ -494,6 +494,78 @@ class TestHardwareCollectionFailureDetailIsScrubbed:
       assert failures[0]["detail"]["error_type"] == "RuntimeError"
       assert "SECRET_MARKER" not in failures[0]["detail"].get("error", "")
 
+   def test_hardware_collection_failure_hostile_custom_exception_class_name(
+         self, tmp_path):
+      """Review round 2 finding: ``type(exc).__name__`` reads the
+      exception class's own ``__name__`` attribute, which is mutable --
+      any custom exception subclass can set it to arbitrary, unbounded,
+      attacker-controlled text (including argv/secrets), so the round 1
+      fix (persisting ``type(exc).__name__`` on the theory that it is "a
+      bounded, closed vocabulary of Python builtin/transport exception
+      types") did not actually bound anything. The persisted
+      ``error_type`` must come from a fixed daemon-owned category
+      vocabulary resolved by identity/inheritance against known
+      exception classes -- never by reading any attribute off the
+      exception instance or its class -- so a hostile class name can
+      never reach the sink at all, let alone unbounded.
+      """
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-hw-hostile-exc",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0, "census": 0}
+
+      class HostileError(Exception):
+         pass
+
+      # Renaming a plain user-defined exception class is ordinary,
+      # legal Python -- nothing about this requires special privileges,
+      # which is exactly why type(exc).__name__ was never a safe/bounded
+      # value to persist.
+      HostileError.__name__ = (
+         "argv=/bin/tool --token SECRET_MARKER " + ("X" * 1000000))
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            raise HostileError("irrelevant message")
+         call_counts[loop] += 1
+         if loop == "census":
+            return _census_payload(uptime_sec=float(call_counts["census"]))
+         return _counter_payload(uptime_sec=float(call_counts["counter"]))
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      log_path = os.path.join(sink.run_dir, "node_collection_log.jsonl")
+      with open(log_path, "rb") as handle:
+         raw_bytes = handle.read()
+      assert b"SECRET_MARKER" not in raw_bytes
+      assert b"argv=" not in raw_bytes
+      # Nowhere near the 1,000,000-character hostile class name -- the
+      # whole log line, not just error_type, must stay small.
+      assert len(raw_bytes) < 2000
+
+      with open(log_path) as handle:
+         entries = [json.loads(line) for line in handle]
+      failures = [e for e in entries if e["event"] == "hardware_collection_failed"]
+      assert len(failures) == 1
+      error_type = failures[0]["detail"]["error_type"]
+      # Concrete, fixed maximum bound on the persisted category string,
+      # regardless of what the actual exception class calls itself.
+      assert len(error_type) <= 64
+      assert "SECRET_MARKER" not in error_type
+      assert "argv" not in error_type
+
 
 class TestHardwareOnceCollection:
    def test_hardware_once_produces_one_record_per_configured_node(self, tmp_path):

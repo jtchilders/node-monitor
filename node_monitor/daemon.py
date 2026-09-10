@@ -105,6 +105,46 @@ def _default_wall_clock():
    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
 
 
+# Fixed, daemon-owned vocabulary for ``_classify_hardware_failure`` below.
+# Every entry pairs a well-known builtin exception type with a FIXED
+# literal label -- never a value read off the exception instance or its
+# class (e.g. never ``type(exc).__name__``/``exc.__class__.__name__``,
+# both of which are ordinary, unprivileged, mutable Python attributes
+# that any custom exception subclass controls). Order matters: more
+# specific types are checked first (``TimeoutError`` is itself an
+# ``OSError`` subclass since Python 3.3, so it must be tested before the
+# broader ``OSError`` bucket or it would never be reached). The trailing
+# ``Exception`` entry is the closed fallback bucket for every other
+# exception this daemon has no more specific label for, INCLUDING any
+# attacker-controlled custom exception class/message content -- an
+# instance never contributes anything to the persisted label beyond
+# which one of these fixed literals it happens to match by inheritance.
+_HARDWARE_FAILURE_TYPE_MAP = (
+   (TimeoutError, "TimeoutError"),
+   (OSError, "OSError"),
+   (LookupError, "LookupError"),
+   (ValueError, "ValueError"),
+   (RuntimeError, "RuntimeError"),
+   (Exception, "Exception"),
+)
+_HARDWARE_FAILURE_TYPE_FALLBACK = "Exception"
+
+
+def _classify_hardware_failure(exc):
+   """Map ``exc`` to a fixed, bounded ``error_type`` label purely by
+   ``isinstance`` identity/inheritance against ``_HARDWARE_FAILURE_TYPE_
+   MAP`` -- never by reading any attribute off ``exc`` or ``type(exc)``.
+   A hostile custom exception class (including one with a renamed,
+   attacker-controlled, unbounded ``__name__`` -- review round 2 finding)
+   can only ever fall through to the fixed ``\"Exception\"`` bucket; it
+   has no way to influence the returned string itself.
+   """
+   for exc_type, label in _HARDWARE_FAILURE_TYPE_MAP:
+      if isinstance(exc, exc_type):
+         return label
+   return _HARDWARE_FAILURE_TYPE_FALLBACK
+
+
 class Daemon:
    """Orchestrates one Phase 0 run: config + transport + scheduler +
    the counter-rollup transform + sink.
@@ -348,10 +388,18 @@ class Daemon:
       available -- and a transport-layer exception's message can
       legitimately embed the failed command's argv (design: "Raw
       argv ... never persist"; PHASE0_DAEMON_DESIGN.md line 16/51/107).
-      Persist only the exception's class name (a bounded, closed
-      vocabulary of Python builtin/transport exception types, never
-      attacker-controlled free text) plus a fixed, non-parameterized
-      message -- never ``str(exc)`` verbatim.
+
+      Review round 2 finding: ``type(exc).__name__`` is NOT a bounded,
+      closed vocabulary -- it is the exception class's own ``__name__``
+      attribute, which is ordinary, unprivileged, mutable Python state
+      that any custom exception subclass (or even a plain ``Exception``
+      instance whose class has been renamed) fully controls, including
+      to arbitrary, unbounded, secret/argv-carrying text. Persist only
+      ``_classify_hardware_failure(exc)``'s fixed, daemon-owned category
+      label -- resolved purely by ``isinstance`` against a closed map of
+      known exception types, never by reading any attribute off the
+      exception instance or its class -- plus a fixed, non-parameterized
+      message. Never ``str(exc)`` or ``type(exc).__name__`` verbatim.
       """
       record = {
          "system": self._config.system,
@@ -359,7 +407,7 @@ class Daemon:
          "event": "hardware_collection_failed",
          "detail": {
             "source_hostname": node.hostname,
-            "error_type": type(exc).__name__,
+            "error_type": _classify_hardware_failure(exc),
             "error": "hardware probe failed; see error_type",
          },
       }
