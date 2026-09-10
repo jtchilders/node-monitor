@@ -2,47 +2,79 @@
 
 Design: PHASE0_DAEMON_DESIGN.md + PHASE0_DAEMON_IMPLEMENTATION_PLAN.md
 Task 7. Wires config, the probe transport, the independent scheduler,
-a per-node counter-rollup transform, and the atomic JSONL sink into one
-injectable orchestration coroutine that a test can drive end to end
-against a fake clock instead of a real 24-hour duration.
+per-node counter-rollup/census/usage transforms, and the atomic JSONL
+sink into one injectable orchestration coroutine that a test can drive
+end to end against a fake clock instead of a real 24-hour duration.
 
-INCREMENT SCOPE NOTE (2026-09-10 recovery direction on kanban task
-t_51db5d6c): this file implements only the first coherent slice of
-Task 7 -- a ``Daemon`` class with injectable clock/transport/sink/
-scheduler that runs the counter loop end to end (manifest -> at least
-one ``node_counter_samples`` rollup -> finalized summary -> DONE) and
-treats a fatal sink condition (disk-full / sink misuse) as a nonzero
-exit without finalizing. Census/usage/hardware wiring, structured
-``node_poll_failures``/``node_collection_log`` records, signal
-handling, and the partial-vs-clean acceptance evaluation are
-DEFERRED to a follow-up increment -- not implemented here. See the
-kanban card's review-recovery comment for the explicit scope cut.
+INCREMENT SCOPE NOTE (2026-09-10, second increment on kanban task
+t_14ece72e, building on the first increment's counter-loop-only
+orchestration core): this increment adds
 
-KNOWN GAP in this increment: a trailing partial counter window (fewer
-than ``rollup_interval_sec // counter_interval_sec`` samples when the
-run's duration/stop ends mid-window) is never flushed -- only a
-window that reaches its full expected sample count calls
-``CounterWindowAccumulator.finalize()``. The design's own accumulator
-already supports finalizing a degraded/partial window (see
-``metrics.CounterWindowAccumulator.finalize``'s docstring: "Always
-returns a record ... even for a window with zero samples"); wiring
-that flush into ``Daemon.run()``'s post-scheduler shutdown path is
-left to the deferred partial/clean-summary follow-up rather than
-implemented speculatively here without its own test.
+* one-time hardware collection per configured node (design:
+  "node_hardware: one record per node when first seen in the run"),
+  run sequentially BEFORE the scheduler starts -- it is not a
+  scheduled ``Target``/loop like counter and census, since it never
+  repeats within a run;
+* a ``census`` loop ``Target`` per node (alongside the existing
+  ``counter`` loop), wired through the existing
+  ``collector.usage.build_diagnostic_census``/``build_usage_
+  observations``/``UsageIntervalAccumulator`` and
+  ``collector.cpu_delta.compute_cpu_delta`` to produce
+  privacy-filtered ``diagnostic_census`` records every census poll
+  and bounded ``node_usage_intervals`` records every
+  ``usage_interval_sec // census_interval_sec`` census samples (the
+  same sample-count-windowing pattern the first increment already
+  used for the counter/rollup pair);
+* the minimum ``node_collection_log`` records needed by hardware-once
+  (a failed hwinfo poll has no other structured place to surface a
+  failure -- the Scheduler's own breaker bookkeeping only covers
+  polls it schedules itself, not this one-shot pre-scheduler step).
+
+Still DEFERRED to a follow-up increment: ``node_poll_failures``
+records for ordinary counter/census poll failures (those already
+degrade gracefully through the Scheduler's own breaker/backoff
+bookkeeping without a daemon-level record, exactly as the first
+increment left them), signal handling, the partial-vs-clean
+acceptance evaluation, and CLI/deploy/docs wiring -- none of those are
+needed to prove hardware-once/census/usage are correctly wired to the
+existing transport, contracts, scheduler, and sink.
+
+KNOWN GAP carried over from the first increment: a trailing partial
+counter window (fewer than ``rollup_interval_sec // counter_interval_
+sec`` samples when the run's duration/stop ends mid-window) is never
+flushed -- only a window that reaches its full expected sample count
+calls ``CounterWindowAccumulator.finalize()``. The identical gap now
+also applies to the analogous ``UsageIntervalAccumulator`` windowing
+added in this increment, for the same reason: the design's own
+accumulators already support finalizing a degraded/partial window,
+but wiring that flush into ``Daemon.run()``'s post-scheduler shutdown
+path is left to the deferred partial/clean-summary follow-up rather
+than implemented speculatively here without its own test.
 
 Nothing in this module imports a database driver, an ORM, or
 ``node_monitor.database``/``node_monitor.db`` -- design: "prove no
 database imports/connections" (Task 7 write-up). Only
-``node_monitor.collector.metrics`` and ``node_monitor.collector.
-scheduler``/``node_monitor.output.jsonl`` are imported, none of which
-touch PostgreSQL either (unlike ``node_monitor.collector.hardware``,
-which is deliberately NOT imported here).
+``node_monitor.collector.cpu_delta``, ``node_monitor.collector.
+metrics``, ``node_monitor.collector.scheduler``, ``node_monitor.
+collector.usage``, and ``node_monitor.output.jsonl`` are imported,
+none of which touch PostgreSQL either (unlike ``node_monitor.
+collector.hardware``, which is deliberately NOT imported here -- that
+module's ``upsert_hardware``/SQLAlchemy-based upsert is a future
+production-database concern, not this Phase 0 JSONL-only daemon's;
+this module builds its own minimal, pure ``node_hardware`` contract
+record straight from a raw hwinfo probe payload instead).
 """
 
 import time
 
+from node_monitor.collector.cpu_delta import compute_cpu_delta
 from node_monitor.collector.metrics import CounterWindowAccumulator
 from node_monitor.collector.scheduler import Scheduler, Target
+from node_monitor.collector.usage import (
+   UsageIntervalAccumulator,
+   build_diagnostic_census,
+   build_usage_observations,
+)
 from node_monitor.output.jsonl import Phase0SinkDiskFullError, Phase0SinkError
 
 # Exit codes for Daemon.run(). Design: "Output write/flush failure or
@@ -51,6 +83,22 @@ from node_monitor.output.jsonl import Phase0SinkDiskFullError, Phase0SinkError
 # these straight to a process exit status.
 EXIT_OK = 0
 EXIT_SINK_FATAL = 2
+
+# Every node_hardware contract field this daemon can fill in from a raw
+# hwinfo probe payload's ``payload["hardware"]`` sub-object, i.e.
+# node_monitor.output.contracts._HARDWARE_REQUIRED minus the four
+# bookkeeping fields (system, source_hostname, first_seen_utc,
+# probe_version) the daemon itself knows rather than reading from the
+# probe. Kept local to this module rather than imported from
+# collector.hardware (see module docstring: that module is the future
+# production-database upsert path and pulls in sqlalchemy, which this
+# Phase 0 JSONL-only daemon must never import even transitively).
+_HARDWARE_PROBE_FIELDS = (
+   "boot_id", "btime", "cpu_model", "cpu_logical", "sockets",
+   "cores_per_socket", "cpu_max_freq_khz", "numa_nodes", "mem_total_kb",
+   "swap_total_kb", "hugepage_size_kb", "kernel_release", "os_pretty_name",
+   "net_fs_mounts", "net_ifaces", "gpus",
+)
 
 
 def _default_wall_clock():
@@ -112,6 +160,23 @@ class Daemon:
       self._counter_accumulators = {}
       self._counter_sample_counts = {}
 
+      # Same sample-count-windowing pattern as the counter/rollup pair
+      # above, applied to the census/usage-interval pair: a
+      # UsageIntervalAccumulator per node, replaced every time its
+      # window rolls over, sized in CENSUS SAMPLE COUNT (usage_interval
+      # // census_interval) rather than a wall-clock boundary check.
+      self._usage_expected_count = max(
+         1, int(config.usage_interval_sec // config.census_interval_sec))
+      self._usage_accumulators = {}
+      self._usage_sample_counts = {}
+      # The immediately-preceding raw census payload per node, needed
+      # by collector.cpu_delta.compute_cpu_delta/build_usage_
+      # observations to attribute CPU between two consecutive samples.
+      # None for a node's first census of the run -- both helper
+      # functions already handle that "no previous sample yet" case
+      # explicitly rather than requiring a caller-side special case.
+      self._previous_census_payload = {}
+
       # Set the instant a fatal sink condition is observed; run()
       # checks this AFTER the scheduler stops to decide the exit code
       # and whether it is safe to finalize at all. Never cleared once
@@ -165,50 +230,166 @@ class Daemon:
       if count >= self._counter_expected_count:
          await self._flush_counter_window(node, payload)
 
+   def _new_usage_accumulator(self, node):
+      now = self._wall_clock_fn()
+      return UsageIntervalAccumulator(
+         system=self._config.system,
+         source_hostname=node.hostname,
+         interval_start_utc=now,
+         interval_end_utc=now,
+         expected_count=self._usage_expected_count,
+      )
+
+   async def _flush_usage_window(self, node):
+      accumulator = self._usage_accumulators.pop(node.hostname)
+      self._usage_sample_counts[node.hostname] = 0
+      records = accumulator.finalize()
+      # The accumulator was seeded with interval_end_utc == its own
+      # interval_start_utc (the window's own birth instant, before any
+      # sample was known) -- backfill the real end-of-window timestamp
+      # here, exactly mirroring _flush_counter_window's own
+      # window_end_utc backfill for the analogous counter/rollup pair.
+      now = self._wall_clock_fn()
+      for record in records:
+         record["interval_end_utc"] = now
+         await self._sink.write_record("node_usage_intervals", record)
+
+   async def _handle_census_poll(self, node, payload):
+      """Feed one raw census-loop payload into (1) a per-poll
+      privacy-filtered ``diagnostic_census`` record and (2) this node's
+      bounded 15-minute usage-interval accumulator, finalizing and
+      writing bounded ``node_usage_intervals`` records whenever the
+      window fills.
+
+      ``collector.cpu_delta.compute_cpu_delta`` needs two consecutive
+      raw payloads for the same node to attribute CPU -- ``None`` is
+      passed for both ``build_diagnostic_census``'s ``cpu_deltas`` and
+      ``build_usage_observations``'s ``previous_payload`` on a node's
+      first census of the run, exactly as both functions already
+      document handling explicitly.
+      """
+      previous_payload = self._previous_census_payload.get(node.hostname)
+
+      cpu_deltas = None
+      if previous_payload is not None:
+         cpu_deltas = compute_cpu_delta(previous_payload, payload)
+      census_record = build_diagnostic_census(
+         self._config.system, node.hostname, payload, cpu_deltas=cpu_deltas)
+      await self._sink.write_record("diagnostic_census", census_record)
+
+      observations = build_usage_observations(payload, previous_payload)
+      self._previous_census_payload[node.hostname] = payload
+
+      accumulator = self._usage_accumulators.get(node.hostname)
+      if accumulator is None:
+         accumulator = self._new_usage_accumulator(node)
+         self._usage_accumulators[node.hostname] = accumulator
+      accumulator.add_sample(observations)
+      count = self._usage_sample_counts.get(node.hostname, 0) + 1
+      self._usage_sample_counts[node.hostname] = count
+      if count >= self._usage_expected_count:
+         await self._flush_usage_window(node)
+
    async def _poll_fn(self, node, loop):
       payload = await self._transport_fn(node, loop)
-      if loop == "counter":
-         try:
+      try:
+         if loop == "counter":
             await self._handle_counter_poll(node, payload)
-         except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as exc:
-            # Design: "Output write/flush failure or low disk is
-            # fatal because JSONL is the only Phase 0 result." A real
-            # write/flush/fsync failure from the sink's own file
-            # handles (node_monitor/output/jsonl.py's `handle.write`,
-            # `handle.flush`, `os.fsync`) surfaces as a raw
-            # OSError/IOError, not a Phase0SinkError subclass -- only
-            # the *disk-full guard check* raises the dedicated
-            # Phase0SinkDiskFullError. Catch OSError alongside the
-            # sink's own exception types so an actual write failure
-            # is just as fatal as a pre-flight low-disk rejection
-            # (review round 1 finding: a raw OSError from
-            # write_record was previously left uncaught here, so the
-            # scheduler absorbed it as an ordinary poll failure and
-            # the run went on to finalize/DONE as if nothing had
-            # happened). Record the fatal condition and stop the
-            # scheduler from issuing any further polls -- there is no
-            # point burning the run's remaining duration against a
-            # sink that can no longer accept writes -- then re-raise
-            # so this poll's own outcome is visible to the
-            # scheduler's own failure/breaker bookkeeping like any
-            # other poll_fn exception.
-            self._fatal_error = exc
-            self._scheduler.request_stop()
-            raise
+         elif loop == "census":
+            await self._handle_census_poll(node, payload)
+      except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as exc:
+         # Design: "Output write/flush failure or low disk is fatal
+         # because JSONL is the only Phase 0 result." A real
+         # write/flush/fsync failure from the sink's own file handles
+         # (node_monitor/output/jsonl.py's `handle.write`,
+         # `handle.flush`, `os.fsync`) surfaces as a raw
+         # OSError/IOError, not a Phase0SinkError subclass -- only
+         # the *disk-full guard check* raises the dedicated
+         # Phase0SinkDiskFullError. Catch OSError alongside the
+         # sink's own exception types so an actual write failure is
+         # just as fatal as a pre-flight low-disk rejection (review
+         # round 1 finding: a raw OSError from write_record was
+         # previously left uncaught here, so the scheduler absorbed
+         # it as an ordinary poll failure and the run went on to
+         # finalize/DONE as if nothing had happened). This applies
+         # identically to every record type either loop handler can
+         # write (node_counter_samples, diagnostic_census,
+         # node_usage_intervals) -- record the fatal condition and
+         # stop the scheduler from issuing any further polls, then
+         # re-raise so this poll's own outcome is visible to the
+         # scheduler's own failure/breaker bookkeeping like any other
+         # poll_fn exception.
+         self._fatal_error = exc
+         self._scheduler.request_stop()
+         raise
       return payload
 
+   async def _log_hardware_collection_failure(self, node, exc):
+      """Write one ``node_collection_log`` record for a failed one-time
+      hardware probe. Design: a hwinfo probe failure is not fatal to
+      the run (only a sink write/flush failure is), but it still needs
+      a structured place to surface -- the Scheduler's own
+      breaker/backoff bookkeeping only covers polls it schedules
+      itself, not this one-shot pre-scheduler step.
+      """
+      record = {
+         "system": self._config.system,
+         "timestamp_utc": self._wall_clock_fn(),
+         "event": "hardware_collection_failed",
+         "detail": {"source_hostname": node.hostname, "error": str(exc)},
+      }
+      await self._sink.write_record("node_collection_log", record)
+
+   async def _collect_hardware(self, node):
+      """Collect and write the one-time ``node_hardware`` record for
+      ``node``. Called sequentially, once per configured node, BEFORE
+      the scheduler starts -- design: "node_hardware: one record per
+      node when first seen in the run", which this daemon treats as a
+      one-shot pre-scheduler step rather than a scheduled ``Target``/
+      loop, since it never repeats within a run.
+
+      A failed hwinfo probe itself is not fatal -- it is logged via
+      ``_log_hardware_collection_failure`` and the run proceeds with no
+      hardware baseline for this node. A failed *write* of either the
+      ``node_hardware`` record or the failure's own
+      ``node_collection_log`` record IS fatal (an ordinary
+      Phase0SinkDiskFullError/Phase0SinkError/OSError propagates
+      straight out of this method uncaught) -- identical contract to
+      every other sink write in this module; the caller (``run()``)
+      is the one place that maps that into ``EXIT_SINK_FATAL``.
+      """
+      try:
+         payload = await self._transport_fn(node, "hwinfo")
+      except Exception as exc:
+         await self._log_hardware_collection_failure(node, exc)
+         return
+
+      hardware = payload.get("hardware") or {}
+      record = {
+         "system": self._config.system,
+         "source_hostname": node.hostname,
+         "first_seen_utc": self._wall_clock_fn(),
+         "probe_version": payload.get("probe_version"),
+      }
+      for field in _HARDWARE_PROBE_FIELDS:
+         record[field] = hardware.get(field)
+      await self._sink.write_record("node_hardware", record)
+
    def _build_targets(self):
-      # Only the counter loop is wired in this increment -- see the
-      # module docstring's scope note. One target per configured node
+      # One counter Target and one census Target per configured node,
       # regardless of local/remote role: that distinction lives
       # entirely inside transport_fn, never in scheduling policy
       # (mirrors collector.scheduler's own local/remote-agnostic
-      # design).
-      return [
-         Target(node=node, loop="counter",
-                interval_sec=self._config.counter_interval_sec)
-         for node in self._config.nodes
-      ]
+      # design). Hardware collection is deliberately NOT a Target here
+      # -- see _collect_hardware's docstring for why it is a one-shot
+      # pre-scheduler step instead.
+      targets = []
+      for node in self._config.nodes:
+         targets.append(Target(node=node, loop="counter",
+                                interval_sec=self._config.counter_interval_sec))
+         targets.append(Target(node=node, loop="census",
+                                interval_sec=self._config.census_interval_sec))
+      return targets
 
    async def run(self):
       """Run every configured target to completion (or until a fatal
@@ -223,6 +404,21 @@ class Daemon:
       code but still produce a DONE-marked artifact that looks
       complete."
       """
+      # Hardware-once collection runs sequentially, BEFORE the scheduler
+      # starts -- design: "node_hardware: one record per node when
+      # first seen in the run". A fatal sink error here (a real
+      # write/flush failure or the disk guard, exactly like every
+      # other sink write in this module) must abort the run before the
+      # scheduler ever begins issuing counter/census polls -- there is
+      # no point starting a run whose own hardware baseline already
+      # failed to persist.
+      try:
+         for node in self._config.nodes:
+            await self._collect_hardware(node)
+      except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as exc:
+         self._fatal_error = exc
+         return EXIT_SINK_FATAL
+
       targets = self._build_targets()
       scheduler_kwargs = dict(
          targets=targets, poll_fn=self._poll_fn, clock=self._clock,
