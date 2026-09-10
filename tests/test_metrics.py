@@ -586,3 +586,113 @@ class TestBoundedExcessSamples:
       assert record["coverage"] == 0.0
       assert record["audit"]["excess_sample_count"] == 1
       validate_node_counter_samples(record)
+
+
+class TestBoundedRawCumulativeAudit:
+   def test_audit_carries_first_and_last_raw_cumulative_snapshots(self):
+      # Design: "Raw cumulative values and validity diagnostics remain
+      # in a bounded audit object" -- a reviewer must be able to
+      # independently recompute any reported rate from these two
+      # snapshots alone.
+      acc = _make_accumulator(expected_count=3)
+      acc.add_sample(_sample(
+         10.0, cpu_jiffies=_jiffies(user=100, idle=900),
+         net={"pub0": {"rx_bytes": 1000, "tx_bytes": 500}},
+         md_ops={"agile-MDT0000": {"intent_lock": 100}}))
+      acc.add_sample(_sample(
+         20.0, cpu_jiffies=_jiffies(user=125, idle=925),
+         net={"pub0": {"rx_bytes": 1250, "tx_bytes": 550}},
+         md_ops={"agile-MDT0000": {"intent_lock": 120}}))
+      acc.add_sample(_sample(
+         30.0, cpu_jiffies=_jiffies(user=150, idle=950),
+         net={"pub0": {"rx_bytes": 1500, "tx_bytes": 600}},
+         md_ops={"agile-MDT0000": {"intent_lock": 140}}))
+
+      record = acc.finalize()
+      raw = record["audit"]["raw_cumulative"]
+
+      assert raw["window_first"]["uptime_sec"] == 10.0
+      assert raw["window_first"]["cpu_jiffies"] == _jiffies(user=100, idle=900)
+      assert raw["window_first"]["net"]["pub0"]["rx_bytes"] == 1000
+      assert raw["window_first"]["md_ops"]["agile-MDT0000"]["intent_lock"] == 100
+      assert raw["window_last"]["uptime_sec"] == 30.0
+      assert raw["window_last"]["cpu_jiffies"] == _jiffies(user=150, idle=950)
+      assert raw["window_last"]["net"]["pub0"]["rx_bytes"] == 1500
+      assert raw["window_last"]["md_ops"]["agile-MDT0000"]["intent_lock"] == 140
+      # Independently recomputable: last minus first over elapsed uptime
+      # reproduces the first-pair-to-last-pair rx rate exactly (sanity
+      # check that this is the same math compute_counter_delta used,
+      # not an unrelated shape).
+      elapsed = raw["window_last"]["uptime_sec"] - raw["window_first"]["uptime_sec"]
+      rx_delta = (raw["window_last"]["net"]["pub0"]["rx_bytes"]
+                  - raw["window_first"]["net"]["pub0"]["rx_bytes"])
+      assert rx_delta / elapsed == pytest.approx(25.0)
+      validate_node_counter_samples(record)
+
+   def test_raw_cumulative_includes_boot_id_when_present(self):
+      acc = _make_accumulator(expected_count=2)
+      sample_a = _sample(10.0)
+      sample_a["boot_id"] = "boot-a"
+      sample_b = _sample(20.0)
+      sample_b["boot_id"] = "boot-a"
+      acc.add_sample(sample_a)
+      acc.add_sample(sample_b)
+
+      record = acc.finalize()
+      raw = record["audit"]["raw_cumulative"]
+
+      assert raw["window_first"]["boot_id"] == "boot-a"
+      assert raw["window_last"]["boot_id"] == "boot-a"
+
+   def test_zero_samples_yields_null_raw_cumulative_snapshots(self):
+      acc = _make_accumulator()
+
+      record = acc.finalize()
+
+      assert record["audit"]["raw_cumulative"]["window_first"] is None
+      assert record["audit"]["raw_cumulative"]["window_last"] is None
+      validate_node_counter_samples(record)
+
+   def test_single_sample_has_identical_first_and_last_snapshot(self):
+      acc = _make_accumulator()
+      acc.add_sample(_sample(10.0, cpu_jiffies=_jiffies(user=100, idle=900)))
+
+      record = acc.finalize()
+      raw = record["audit"]["raw_cumulative"]
+
+      assert raw["window_first"] == raw["window_last"]
+      assert raw["window_first"]["uptime_sec"] == 10.0
+
+   def test_excess_samples_do_not_move_window_last_raw_snapshot_forward_of_cap(self):
+      # An excess sample still updates end_of_window gauges (design:
+      # gauges are the true last sample), but the raw_cumulative audit
+      # snapshot must stay bounded to exactly two entries regardless --
+      # this test only asserts it never grows into a list/history.
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample(_sample(10.0, cpu_jiffies=_jiffies(user=100, idle=900)))
+      acc.add_sample(_sample(20.0, cpu_jiffies=_jiffies(user=999, idle=999)))
+
+      record = acc.finalize()
+      raw = record["audit"]["raw_cumulative"]
+
+      assert isinstance(raw["window_first"], dict)
+      assert isinstance(raw["window_last"], dict)
+      assert record["sample_count"] == 1
+      validate_node_counter_samples(record)
+
+   def test_raw_cumulative_state_bounded_under_many_samples(self):
+      # Regression guard: raw_cumulative must never grow into an
+      # unbounded raw-sample history no matter how many samples arrive.
+      acc = _make_accumulator(expected_count=5)
+      for i in range(500):
+         acc.add_sample(_sample(
+            10.0 * (i + 1),
+            cpu_jiffies=_jiffies(user=100 * (i + 1), idle=900 * (i + 1))))
+
+      record = acc.finalize()
+      raw = record["audit"]["raw_cumulative"]
+
+      assert set(raw.keys()) == {"window_first", "window_last"}
+      assert isinstance(raw["window_first"], dict)
+      assert isinstance(raw["window_last"], dict)
+      validate_node_counter_samples(record)

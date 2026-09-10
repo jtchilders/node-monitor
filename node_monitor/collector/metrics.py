@@ -63,6 +63,31 @@ def _get_counters(sample):
    return sample.get("counters") or {}
 
 
+def _raw_cumulative_snapshot(sample):
+   """Bounded raw-cumulative snapshot of one sample, for the audit object.
+
+   Design: "Raw cumulative values and validity diagnostics remain in a
+   bounded audit object" (PHASE0_DAEMON_DESIGN.md "Output contract").
+   This captures exactly the cumulative fields ``compute_counter_delta``
+   itself deltas -- ``cpu_jiffies``, per-interface ``net`` byte counters,
+   and per-target/operation ``md_ops`` counts -- plus ``uptime_sec`` and
+   ``boot_id`` as the boundary/identity context needed to interpret them,
+   so a human auditing a finalized record can independently recompute
+   (or sanity-check) any reported rate from the two boundary snapshots
+   alone. It is always exactly one sample's worth of data (never a list
+   growing with sample count), which is what keeps the accumulator's
+   audit state bounded regardless of how many samples a window receives.
+   """
+   counters = _get_counters(sample)
+   return {
+      "uptime_sec": sample.get("uptime_sec"),
+      "boot_id": sample.get("boot_id"),
+      "cpu_jiffies": counters.get("cpu_jiffies"),
+      "net": counters.get("net"),
+      "md_ops": counters.get("md_ops"),
+   }
+
+
 def _compute_cpu_busy_pct(counters_a, counters_b):
    jiffies_a = counters_a.get("cpu_jiffies")
    jiffies_b = counters_b.get("cpu_jiffies")
@@ -336,10 +361,15 @@ class CounterWindowAccumulator:
 
    Design: "Raw cumulative values and validity diagnostics remain in a
    bounded audit object" -- the ``audit`` field on the finalized record
-   carries only summary counts/reasons, not raw counter payloads. The
-   only raw counter values retained anywhere are ``end_of_window``'s
-   point-in-time gauges, taken from the single last sample seen (bounded
-   by construction, never a history).
+   carries summary counts/reasons plus ``raw_cumulative``: exactly TWO
+   raw-counter snapshots (the window's first accepted sample and its
+   true last sample, whichever the two are), each reduced to only the
+   cumulative fields the rate math itself uses (``uptime_sec``,
+   ``boot_id``, ``cpu_jiffies``, ``net``, ``md_ops``) so the record is
+   independently auditable -- a reviewer can recompute any reported rate
+   from these two snapshots alone -- without ever growing with sample
+   count. ``end_of_window``'s point-in-time gauges are likewise always
+   exactly one sample's worth of data.
    """
 
    def __init__(self, system, source_hostname, collector_hostname,
@@ -358,6 +388,7 @@ class CounterWindowAccumulator:
       self._excess_sample_count = 0
       self._previous_sample = None
       self._last_sample = None
+      self._first_sample = None
 
       self._cpu_busy_values = []
       # {iface: {field: [values]}} -- per-interface field lists, built up
@@ -388,6 +419,10 @@ class CounterWindowAccumulator:
 
       self._sample_count += 1
       self._last_sample = sample
+      if self._first_sample is None:
+         # Only ever set once, on the first accepted sample of the
+         # window -- bounded regardless of sample count.
+         self._first_sample = sample
 
       if self._previous_sample is not None:
          delta = compute_counter_delta(self._previous_sample, sample)
@@ -449,6 +484,14 @@ class CounterWindowAccumulator:
          "meets_minimum_samples": self._sample_count >= _MINIMUM_VALID_SAMPLES,
          "invalid_pairs": list(self._invalid_pairs),
          "excess_sample_count": self._excess_sample_count,
+         "raw_cumulative": {
+            "window_first": (
+               _raw_cumulative_snapshot(self._first_sample)
+               if self._first_sample else None),
+            "window_last": (
+               _raw_cumulative_snapshot(self._last_sample)
+               if self._last_sample else None),
+         },
       }
 
       return {
