@@ -245,6 +245,47 @@ class TestLustreTargetOperationReset:
       assert delta["lustre_md_ops"] == {}
 
 
+class TestBootIdChange:
+   def test_boot_id_change_invalidates_whole_pair_even_with_increasing_uptime(self):
+      # Explicit boot-identity mismatch must invalidate the pair even
+      # when uptime_sec alone still looks like a normal, increasing
+      # interval -- design: "No rate spans reboot, boot-ID change,
+      # reset...". A fast reboot can land inside one probe interval and
+      # still leave uptime_sec monotonic-looking by coincidence.
+      sample_a = _sample(100.0)
+      sample_a["boot_id"] = "boot-a"
+      sample_a["counters"]["net"] = {"eth0": {"rx_bytes": 100, "tx_bytes": 100}}
+      sample_b = _sample(110.0)
+      sample_b["boot_id"] = "boot-b"
+      sample_b["counters"]["net"] = {"eth0": {"rx_bytes": 200, "tx_bytes": 200}}
+
+      delta = compute_counter_delta(sample_a, sample_b)
+
+      assert delta["invalid_reason"] == "boot_id_change"
+      assert delta["elapsed_sec"] is None
+      assert delta["network"] == {}
+
+   def test_same_boot_id_is_unaffected(self):
+      sample_a = _sample(100.0)
+      sample_a["boot_id"] = "boot-a"
+      sample_b = _sample(110.0)
+      sample_b["boot_id"] = "boot-a"
+
+      delta = compute_counter_delta(sample_a, sample_b)
+
+      assert delta["invalid_reason"] is None
+
+   def test_missing_boot_id_field_is_not_compared(self):
+      # remote_probe.py's counter loop does not currently emit boot_id;
+      # its absence must not be treated as a mismatch.
+      sample_a = _sample(100.0)
+      sample_b = _sample(110.0)
+
+      delta = compute_counter_delta(sample_a, sample_b)
+
+      assert delta["invalid_reason"] is None
+
+
 class TestMissingFields:
    def test_missing_counters_key_entirely(self):
       sample_a = {"uptime_sec": 10.0}
@@ -457,4 +498,91 @@ class TestContractCompliance:
       record = acc.finalize()
 
       assert record["probe_version"] == 4
+      validate_node_counter_samples(record)
+
+
+class TestBoundedExcessSamples:
+   def test_excess_samples_do_not_inflate_coverage_past_one(self):
+      # Design: node_counter_samples' coverage contract is [0, 1].
+      # A scheduler bug/duplicate delivery that feeds more samples than
+      # expected_count must not push coverage above 1.0 or the contract
+      # validator raises -- see review round 1 finding 3.
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample(_sample(10.0))
+      acc.add_sample(_sample(20.0))
+
+      record = acc.finalize()
+
+      assert record["sample_count"] == 1
+      assert record["coverage"] == 1.0
+      validate_node_counter_samples(record)
+
+   def test_excess_sample_still_updates_end_of_window_gauges(self):
+      # An excess sample is still the true last sample chronologically;
+      # end-of-window gauges must reflect it, not silently ignore it.
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample(_sample(10.0, load1=1.0))
+      acc.add_sample(_sample(20.0, load1=9.0))
+
+      record = acc.finalize()
+
+      assert record["end_of_window"]["load1"] == 9.0
+
+   def test_excess_sample_recorded_in_bounded_audit_counter(self):
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample(_sample(10.0))
+      acc.add_sample(_sample(20.0))
+      acc.add_sample(_sample(30.0))
+
+      record = acc.finalize()
+
+      assert record["audit"]["excess_sample_count"] == 2
+
+   def test_excess_sample_contributes_no_rate_or_invalid_pair(self):
+      acc = _make_accumulator(expected_count=1)
+      acc.add_sample(_sample(10.0, net={"pub0": {"rx_bytes": 0, "tx_bytes": 0}}))
+      # Excess sample, would otherwise compute a normal rate.
+      acc.add_sample(_sample(20.0, net={"pub0": {"rx_bytes": 1000, "tx_bytes": 0}}))
+
+      record = acc.finalize()
+
+      assert record["rates"]["network"] == {}
+      assert record["audit"]["invalid_pairs"] == []
+
+   def test_many_excess_samples_keep_state_bounded(self):
+      # Regression guard for the unbounded-accumulator finding: feeding
+      # far more samples than expected_count must not let later "excess"
+      # deltas leak into the rate distributions. The first three samples
+      # (two accepted pairs) produce a small, known rx rate; every
+      # excess sample after that carries a huge rx delta that would
+      # blow out max/p95 if accumulator state were not actually bounded.
+      acc = _make_accumulator(expected_count=3)
+      acc.add_sample(_sample(10.0, net={"pub0": {"rx_bytes": 0, "tx_bytes": 0}}))
+      acc.add_sample(_sample(20.0, net={"pub0": {"rx_bytes": 1000, "tx_bytes": 0}}))
+      acc.add_sample(_sample(30.0, net={"pub0": {"rx_bytes": 2000, "tx_bytes": 0}}))
+      for i in range(197):
+         acc.add_sample(_sample(
+            40.0 + 10.0 * i,
+            net={"pub0": {"rx_bytes": 10_000_000 * (i + 1), "tx_bytes": 0}}))
+
+      record = acc.finalize()
+
+      assert record["sample_count"] == 3
+      assert record["coverage"] == 1.0
+      assert record["audit"]["excess_sample_count"] == 197
+      rx_stats = record["rates"]["network"]["pub0"]["rx_bytes_per_sec"]
+      # Both accepted pairs were exactly 100 B/s; a bug that let excess
+      # samples leak in would push max into the millions.
+      assert rx_stats["max"] == pytest.approx(100.0)
+      validate_node_counter_samples(record)
+
+   def test_zero_expected_count_treats_first_sample_as_excess(self):
+      acc = _make_accumulator(expected_count=0)
+      acc.add_sample(_sample(10.0))
+
+      record = acc.finalize()
+
+      assert record["sample_count"] == 0
+      assert record["coverage"] == 0.0
+      assert record["audit"]["excess_sample_count"] == 1
       validate_node_counter_samples(record)

@@ -22,8 +22,12 @@ rather than per-process CPU:
 * No rate spans a reboot, boot-ID change, reset, negative counter, or an
   elapsed interval that is not strictly positive (design: "Metric
   semantics" first bullet). ``compute_counter_delta`` marks a pair
-  ``invalid_reason="reboot_or_reset"`` and returns null rates rather
-  than ever clamping a negative delta to zero.
+  ``invalid_reason="reboot_or_reset"`` (uptime went backwards or is
+  unchanged) or ``invalid_reason="boot_id_change"`` (an explicit
+  boot-identity field differs between the two samples, which can happen
+  even when uptime_sec still looks monotonically increasing across a
+  very fast reboot within one probe interval) and returns null rates
+  rather than ever clamping a negative delta to zero.
 * A counter series is independent of every other series: an interface
   reset excludes only that interface, a Lustre target/operation reset
   excludes only that (target, operation) pair, and a CPU-jiffy reset
@@ -165,8 +169,9 @@ def compute_counter_delta(sample_a, sample_b):
 
    Returns a dict:
       "elapsed_sec": remote uptime delta, or None if invalid.
-      "invalid_reason": None, or "missing_uptime" / "reboot_or_reset" --
-         set whenever no rate in this pair can be trusted at all.
+      "invalid_reason": None, or "missing_uptime" / "reboot_or_reset" /
+         "boot_id_change" -- set whenever no rate in this pair can be
+         trusted at all.
       "cpu_busy_pct": aggregate CPU busy percentage for the interval, or
          None if unknowable (missing/reset jiffies, or the whole pair is
          invalid).
@@ -181,9 +186,13 @@ def compute_counter_delta(sample_a, sample_b):
    counter, or invalid elapsed interval." A negative or zero
    ``uptime_sec`` delta invalidates the WHOLE pair (every rate in it is
    untrustworthy, since the shared time denominator itself is broken);
-   a reset on one field/interface/target invalidates only that one
-   series, per cpu_delta.py's compute_cpu_delta precedent of scoping
-   anomalies to what they actually affect.
+   an explicit boot-identity change between the two samples invalidates
+   the whole pair the same way, even if ``uptime_sec`` still looks like
+   it increased (a fast reboot can land inside one probe interval and
+   still leave uptime_sec monotonic-looking by coincidence); a reset on
+   one field/interface/target invalidates only that one series, per
+   cpu_delta.py's compute_cpu_delta precedent of scoping anomalies to
+   what they actually affect.
    """
    uptime_a = sample_a.get("uptime_sec")
    uptime_b = sample_b.get("uptime_sec")
@@ -191,6 +200,25 @@ def compute_counter_delta(sample_a, sample_b):
       return {
          "elapsed_sec": None,
          "invalid_reason": "missing_uptime",
+         "cpu_busy_pct": None,
+         "network": {},
+         "lustre_md_ops": {},
+      }
+
+   # Design: "No rate spans reboot, boot-ID change, reset...". Checked
+   # ahead of the elapsed-interval check on purpose: an explicit
+   # boot-identity mismatch is a stronger, independent signal than the
+   # uptime_sec heuristic and must invalidate the pair even in the (rare)
+   # case a fast reboot leaves uptime_sec looking monotonically
+   # increasing. A sample missing the field entirely (most callers today,
+   # since remote_probe.py's counter loop does not yet emit it) is simply
+   # not compared -- this is an optional input, not a required one.
+   boot_id_a = sample_a.get("boot_id")
+   boot_id_b = sample_b.get("boot_id")
+   if boot_id_a is not None and boot_id_b is not None and boot_id_a != boot_id_b:
+      return {
+         "elapsed_sec": None,
+         "invalid_reason": "boot_id_change",
          "cpu_busy_pct": None,
          "network": {},
          "lustre_md_ops": {},
@@ -292,13 +320,26 @@ class CounterWindowAccumulator:
    Consumes raw counter-loop probe payloads one at a time via
    ``add_sample`` (in collection order) and produces exactly one
    ``node_counter_samples`` record via ``finalize``. State held between
-   calls is bounded regardless of how many samples arrive: only the
-   previous raw sample (for the next delta) plus small running lists of
-   already-computed per-pair rates, never the full sample history.
+   calls is bounded by ``expected_count`` regardless of how many times
+   ``add_sample`` is actually called: at most ``expected_count`` samples
+   ever count toward ``sample_count``/coverage, so at most
+   ``expected_count - 1`` per-pair deltas ever grow the rate lists or the
+   invalid-pairs audit list. A scheduler bug, duplicate delivery, or a
+   replayed sample cannot make this accumulator's memory grow without
+   bound, and cannot inflate ``finalize()``'s coverage past 1.0 (the
+   ``node_counter_samples`` contract requires coverage in [0, 1]).
+   Samples received once that cap is reached are "excess": they still
+   update the end-of-window gauges (design: gauges come from the true
+   LAST sample of the window, so an excess sample cannot be silently
+   ignored for that purpose) and a bounded excess counter, but
+   contribute no rate, no invalid-pair entry, and no sample_count.
 
    Design: "Raw cumulative values and validity diagnostics remain in a
    bounded audit object" -- the ``audit`` field on the finalized record
-   carries only summary counts/reasons, not raw counter payloads.
+   carries only summary counts/reasons, not raw counter payloads. The
+   only raw counter values retained anywhere are ``end_of_window``'s
+   point-in-time gauges, taken from the single last sample seen (bounded
+   by construction, never a history).
    """
 
    def __init__(self, system, source_hostname, collector_hostname,
@@ -314,20 +355,37 @@ class CounterWindowAccumulator:
       self._expected_count = expected_count
 
       self._sample_count = 0
+      self._excess_sample_count = 0
       self._previous_sample = None
       self._last_sample = None
 
       self._cpu_busy_values = []
       # {iface: {field: [values]}} -- per-interface field lists, built up
-      # pair by pair; bounded by the number of interfaces actually seen,
-      # never by sample count (each pair contributes at most one value
-      # per field per interface already present).
+      # pair by pair; bounded because at most expected_count - 1 pairs
+      # are ever accepted (see _at_capacity), regardless of how many
+      # times add_sample is called.
       self._network_values = {}
       self._lustre_values = {}
       self._invalid_pairs = []
 
+   def _at_capacity(self):
+      # expected_count is contract-validated to be >= 0 (never negative);
+      # zero means the window expected no samples at all, so the very
+      # first call is already "excess" under this same check -- there is
+      # no separate zero-expected special case to maintain.
+      return self._sample_count >= self._expected_count
+
    def add_sample(self, sample):
       """Feed one raw counter-loop probe payload, in collection order."""
+      if self._at_capacity():
+         # Excess sample: bounded accumulator state must not grow past
+         # what expected_count already sized it for. Still the true last
+         # sample chronologically, so the end-of-window gauges (read from
+         # self._last_sample in finalize()) must still reflect it.
+         self._excess_sample_count += 1
+         self._last_sample = sample
+         return
+
       self._sample_count += 1
       self._last_sample = sample
 
@@ -390,6 +448,7 @@ class CounterWindowAccumulator:
       audit = {
          "meets_minimum_samples": self._sample_count >= _MINIMUM_VALID_SAMPLES,
          "invalid_pairs": list(self._invalid_pairs),
+         "excess_sample_count": self._excess_sample_count,
       }
 
       return {
