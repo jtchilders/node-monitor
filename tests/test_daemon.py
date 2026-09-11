@@ -2010,6 +2010,54 @@ class TestSignalHandling:
       assert signal.getsignal(signal.SIGINT) == before_int
       assert signal.getsignal(signal.SIGTERM) == before_term
 
+   def test_custom_pre_existing_handlers_restored_after_clean_completion(
+         self, tmp_path):
+      """Reviewer regression (t_90c962e7 review round 1): a caller with
+      its own pre-existing custom SIGINT/SIGTERM handler (e.g. an
+      embedding process) must get that EXACT handler back after a
+      clean ``Daemon.run()`` completion -- not Python's SIG_DFL.
+      ``asyncio.loop.remove_signal_handler()`` alone always resets a
+      signal to SIG_DFL regardless of what was installed before
+      ``add_signal_handler``, so this only passes if
+      ``_remove_signal_handlers`` explicitly restores the disposition
+      captured before ``_install_signal_handlers`` ran -- the prior
+      default-happens-to-match-SIG_DFL tests above cannot catch this
+      class of bug.
+      """
+      import signal
+
+      def custom_int(signum, frame):
+         pass
+
+      def custom_term(signum, frame):
+         pass
+
+      prior_int = signal.signal(signal.SIGINT, custom_int)
+      prior_term = signal.signal(signal.SIGTERM, custom_term)
+      try:
+         config = _config(tmp_path, duration_sec=5)
+         output_root = os.path.join(str(tmp_path), "phase0-runs")
+         sink = Phase0Sink(
+            output_root, "daemon-run-custom-signal-cleanup",
+            metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+         clock = FakeClock()
+
+         daemon = Daemon(config, sink, _make_transport_fn(),
+                          clock=clock.time, sleep=clock.sleep)
+
+         async def scenario():
+            run_task = asyncio.ensure_future(daemon.run())
+            await clock.advance(config.duration_sec)
+            return await run_task
+
+         exit_code = _run(scenario())
+         assert exit_code == EXIT_OK
+         assert signal.getsignal(signal.SIGINT) is custom_int
+         assert signal.getsignal(signal.SIGTERM) is custom_term
+      finally:
+         signal.signal(signal.SIGINT, prior_int)
+         signal.signal(signal.SIGTERM, prior_term)
+
 
 # --------------------------------------------------------------------------
 # Fatal sink error propagates nonzero and skips finalize/DONE

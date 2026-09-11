@@ -998,9 +998,10 @@ class Daemon:
       """Install SIGINT/SIGTERM handlers, in the running event loop,
       that call ``self._scheduler.request_stop()`` -- the same orderly
       stop request an external caller already exercises directly in
-      tests (``daemon._scheduler.request_stop()``). Returns the list of
-      signals actually installed, so ``run()`` can remove exactly
-      those in its ``finally`` block.
+      tests (``daemon._scheduler.request_stop()``). Returns a list of
+      ``(signal, prior_disposition)`` pairs for exactly the signals
+      actually installed, so ``run()`` can restore precisely those
+      prior dispositions in its ``finally`` block.
 
       Design: "SIGINT/SIGTERM stops dispatch, gives active polls a
       bounded grace period, reaps children, flushes files, and writes
@@ -1020,6 +1021,14 @@ class Daemon:
       their own handlers independently, never leaking one run's
       handler into the next.
 
+      The prior disposition is captured via ``signal.getsignal()``
+      immediately before ``loop.add_signal_handler`` overwrites it,
+      NOT assumed to be ``SIG_DFL``: an embedding process may already
+      have its own custom SIGINT/SIGTERM handler installed (e.g. via
+      ``signal.signal()``), and that exact handler -- not the
+      platform default -- must come back once this Daemon's own run
+      finishes (see ``_remove_signal_handlers``).
+
       ``signal.SIGINT``/``signal.SIGTERM`` are looked up fresh here
       rather than imported as module-level constants purely so a test
       can monkeypatch ``signal.SIGINT``/``signal.SIGTERM`` if it ever
@@ -1029,6 +1038,7 @@ class Daemon:
       loop = asyncio.get_running_loop()
       installed = []
       for sig in (signal.SIGINT, signal.SIGTERM):
+         prior = signal.getsignal(sig)
          try:
             loop.add_signal_handler(sig, self._scheduler.request_stop)
          except (NotImplementedError, RuntimeError):
@@ -1043,13 +1053,37 @@ class Daemon:
             # without special-casing platform detection at every call
             # site.
             continue
-         installed.append(sig)
+         installed.append((sig, prior))
       return installed
 
    def _remove_signal_handlers(self, installed):
+      """Restore each signal's EXACT prior disposition (captured by
+      ``_install_signal_handlers`` before this Daemon's own handler
+      was installed), rather than resetting to SIG_DFL.
+
+      ``loop.remove_signal_handler(sig)`` alone always resets a
+      signal's disposition to ``SIG_DFL`` regardless of what was
+      installed before ``add_signal_handler`` -- that would silently
+      clobber a caller's own pre-existing custom SIGINT/SIGTERM
+      handler, so it is never sufficient on its own to restore a
+      caller's prior disposition.
+
+      However it is NOT safe to skip either: the event loop tracks
+      each signal it has wired via ``add_signal_handler`` in its own
+      internal bookkeeping (``BaseEventLoop._signal_handlers`` on the
+      Unix loop) and, on ``loop.close()``, force-resets to ``SIG_DFL``
+      any signal still present in that bookkeeping -- even if
+      ``signal.signal()`` was called directly in the meantime to
+      restore something else. Calling ``loop.remove_signal_handler(sig)``
+      first clears that bookkeeping entry (and un-wires this Daemon's
+      callback); only THEN is ``signal.signal(sig, prior)`` durable
+      across the loop's eventual close (e.g. inside ``asyncio.run()``'s
+      own cleanup).
+      """
       loop = asyncio.get_running_loop()
-      for sig in installed:
+      for sig, prior in installed:
          loop.remove_signal_handler(sig)
+         signal.signal(sig, prior)
 
    async def run(self):
       """Run every configured target to completion (or until a fatal
