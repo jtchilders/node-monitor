@@ -52,6 +52,7 @@ consecutive failures, and backoff deadline"):
 
 import asyncio
 import dataclasses
+import inspect
 import time
 
 
@@ -187,8 +188,29 @@ class Scheduler:
       if self._stop_event is not None:
          self._stop_event.set()
 
-   def _emit(self, **fields):
-      self._on_event(fields)
+   async def _emit(self, **fields):
+      """Call ``self._on_event(fields)`` and, if it returns an awaitable
+      (an async ``on_event`` -- e.g. Daemon._observe_scheduler_event,
+      which persists a structured record for a scheduler_miss before
+      returning), await it before this coroutine's own caller
+      proceeds. A plain synchronous ``on_event`` (every test in this
+      module passes ``events.append``, matching a synchronous callable)
+      returns ``None``, which is not awaitable, so this is a no-op
+      extra check for those callers -- no behavior change for them.
+
+      Awaiting HERE, at the single call site every event type already
+      funnels through, rather than firing the handler as a detached
+      task, is what keeps a caller-side record write for a
+      scheduler_miss deterministic and non-racing with this same
+      target's very next dispatch decision (design: "Avoid async
+      fire-and-forget races") -- the overlap-handling code in
+      ``_run_target`` below does not proceed to launch the next
+      attempt, and a fatal write failure surfaced by the handler is
+      not silently lost, until the awaited handler itself returns.
+      """
+      result = self._on_event(fields)
+      if inspect.isawaitable(result):
+         await result
 
    async def run(self):
       """Run every target concurrently until each one's own deadline
@@ -356,10 +378,27 @@ class Scheduler:
             if state.active_task is not None and not state.active_task.done():
                await self._cancel_and_reap(state.active_task)
                state.consecutive_failures += 1
-               self._emit(type="scheduler_miss", node=target.node,
-                          loop=target.loop, deadline=deadline,
-                          consecutive_failures=state.consecutive_failures,
-                          breaker_state=state.breaker_state)
+               await self._emit(type="scheduler_miss", node=target.node,
+                                 loop=target.loop, deadline=deadline,
+                                 consecutive_failures=state.consecutive_failures,
+                                 breaker_state=state.breaker_state)
+               if self._stop_requested:
+                  # A fatal condition observed while awaiting the
+                  # miss-emit handler above (e.g. Daemon._observe_
+                  # scheduler_event's own sink write failing and
+                  # calling request_stop()) must stop THIS target's
+                  # loop before it launches a further, doomed dispatch
+                  # in the same iteration -- the top-of-loop
+                  # self._stop_requested check above already runs
+                  # before every dispatch decision except this one,
+                  # since the miss branch reaches its own dispatch
+                  # further down without looping back through the top
+                  # first. state.active_task was already
+                  # cancelled/reaped just above, so the shared
+                  # end-of-loop drain in the ``finally`` block below
+                  # (request_stop()'s own bounded-grace path) has
+                  # nothing further to wait on for this iteration.
+                  break
 
             task = asyncio.ensure_future(self._execute(target, state, deadline))
             state.active_task = task
@@ -439,7 +478,7 @@ class Scheduler:
             raise
          except Exception as exc:
             state.consecutive_failures += 1
-            self._emit(
+            await self._emit(
                type="failure", node=target.node, loop=target.loop,
                deadline=deadline, error=exc,
                consecutive_failures=state.consecutive_failures,
@@ -448,7 +487,7 @@ class Scheduler:
          else:
             recovered = state.consecutive_failures >= self._failure_threshold
             state.consecutive_failures = 0
-            self._emit(
+            await self._emit(
                type="success", node=target.node, loop=target.loop,
                deadline=deadline, result=result, recovered=recovered)
             return result

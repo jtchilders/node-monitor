@@ -11,12 +11,50 @@ t_c5cf59c4, building on the second increment's hardware/census/usage
 orchestration): this increment adds structured ``node_poll_failures``
 records for ORDINARY scheduled counter/census probe failures only
 (design: "node_poll_failures: one record per failed or skipped poll
-with bounded/scrubbed detail and breaker state"). Explicitly excluded
-from "ordinary": ``scheduler_miss`` (a same-node/same-loop overlap
-recorded entirely inside ``collector.scheduler.Scheduler``'s own
-bookkeeping/events -- this daemon-level path only ever sees an actual
-``transport_fn`` invocation attempt, never a skipped/overlapped one,
-so it structurally cannot double-record a miss).
+with bounded/scrubbed detail and breaker state"). At the time of that
+increment, ``scheduler_miss`` (a same-node/same-loop overlap recorded
+entirely inside ``collector.scheduler.Scheduler``'s own bookkeeping/
+events -- this daemon-level path only ever saw an actual
+``transport_fn`` invocation attempt, never a skipped/overlapped one)
+was explicitly excluded.
+
+FOLLOW-UP INCREMENT SCOPE NOTE (2026-09-10, kanban task t_d18ac4ae):
+this increment closes that gap. ``_observe_scheduler_event`` -- already
+installed as the Scheduler's own ``on_event`` to mirror its per-target
+``consecutive_failures``/``breaker_state`` (see the comment on that
+method below) -- is now itself ``async`` and, for every
+``scheduler_miss`` event, writes exactly one schema-valid
+``node_poll_failures`` record via ``_record_scheduler_miss`` (or the
+same ``node_collection_log`` pre-FQDN fallback
+``_record_ordinary_poll_failure`` already uses, before any FQDN has
+ever been established for that node) with ``failure_type=
+"scheduler_miss"``, ``loop``, and the Scheduler's own JUST-COMPUTED
+``consecutive_failures``/``breaker_state`` for that exact miss --
+unlike the ordinary-failure path, no anticipation is needed here: a
+scheduler_miss event already carries the Scheduler's authoritative
+post-increment state directly, because ``_observe_scheduler_event`` is
+called synchronously (now awaited) from inside
+``Scheduler._run_target`` right after it increments
+``state.consecutive_failures`` for this exact miss, not before. Event
+forwarding to this module's OWN ``on_event`` (this Daemon's own
+caller-supplied hook) is unchanged.
+
+Making ``Scheduler``'s own ``_emit`` await whatever its ``on_event``
+returns (see ``collector/scheduler.py``'s own ``_emit`` docstring) is
+what keeps this miss-triggered write deterministic rather than a
+fire-and-forget race: ``Scheduler._run_target`` does not proceed to
+consider dispatching this target's next attempt until the awaited
+handler -- including this module's own sink write -- has returned (or
+raised). A sink write/flush/OSError failure recording a miss is fatal
+by the exact same contract as every other sink write in this module
+(design: "Output write/flush failure or low disk is fatal"): it sets
+``self._fatal_error`` and calls ``self._scheduler.request_stop()``,
+and ``Scheduler._run_target`` checks ``self._stop_requested``
+immediately after the awaited miss-emit call returns (in addition to
+its existing top-of-loop check) so a fatal condition observed here
+stops this target's OWN loop before it launches a further, doomed
+dispatch in the same iteration -- request_stop()'s usual bounded-grace
+drain then reaps whatever is already in flight for every target.
 
 Every ordinary poll failure's ``source_hostname`` is the node's
 remote-reported FQDN from the most recent PRIOR successful poll of any
@@ -351,13 +389,15 @@ class Daemon:
       if self._on_event is not None:
          self._on_event(fields)
 
-   def _observe_scheduler_event(self, event):
+   async def _observe_scheduler_event(self, event):
       """Update ``self._scheduler_state`` -- this module's mirror of
       ``collector.scheduler.Scheduler``'s own per-(node, loop)
       ``consecutive_failures``/``breaker_state`` -- from every event
-      the Scheduler emits, then forward the event unchanged to
-      whatever ``on_event`` callable this Daemon itself was
-      constructed with (if any).
+      the Scheduler emits, persist a structured ``node_poll_failures``
+      (or pre-FQDN ``node_collection_log``) record for a
+      ``scheduler_miss`` event specifically, then forward the event
+      unchanged to whatever ``on_event`` callable this Daemon itself
+      was constructed with (if any).
 
       Installed as the Scheduler's OWN ``on_event`` (see ``run()``
       below) rather than merely observing failures from inside
@@ -365,14 +405,37 @@ class Daemon:
       inside ``Scheduler._run_target`` for a same-node/same-loop
       overlap that this module's ``_poll_fn`` never itself sees (no
       ``transport_fn`` invocation happens for a miss) -- the ONLY way
-      this module can learn a miss occurred, and fold it into the
-      state an immediately-following ordinary failure's
-      node_poll_failures record must report, is by watching the
-      Scheduler's own event stream directly (review round 2 finding:
-      a same-node/same-loop miss immediately followed by an ordinary
-      transport failure must open the breaker at the combined count,
-      not just the ordinary-failure-only count this module could see
-      on its own).
+      this module can learn a miss occurred at all, let alone record
+      it or fold it into an immediately-following ordinary failure's
+      own node_poll_failures record, is by watching the Scheduler's
+      own event stream directly (review round 2 finding on the prior
+      increment: a same-node/same-loop miss immediately followed by an
+      ordinary transport failure must open the breaker at the combined
+      count, not just the ordinary-failure-only count this module
+      could see on its own).
+
+      This method is itself ``async`` (a prior increment's version was
+      sync) and ``Scheduler._emit`` (see ``collector/scheduler.py``)
+      awaits whatever it returns -- ``Scheduler._run_target`` does not
+      proceed to its own next-dispatch decision for this target until
+      this coroutine (including the miss's own sink write below) has
+      returned or raised. This is what keeps the miss-triggered write
+      serialized/deterministic rather than a detached, fire-and-forget
+      background task racing the scheduler's own subsequent bookkeeping
+      for the same target.
+
+      A sink write/flush/OSError failure recording a miss is fatal by
+      the exact same contract as every other sink write in this module
+      (design: "Output write/flush failure or low disk is fatal") --
+      this method still forwards the event to ``self._on_event`` (via
+      the ``finally`` block) before re-raising, so an observer that
+      only cares about event forwarding (this module's own caller, or
+      a test asserting on the raw event stream) is not starved of the
+      final event just because that same event's sink write happened
+      to be the one that failed; the fatal condition itself is
+      recorded via ``self._fatal_error``/``self._scheduler.
+      request_stop()`` exactly like ``_poll_fn``'s own sink-failure
+      handling, so the run still stops, nonzero, without a false DONE.
       """
       event_type = event.get("type")
       if event_type in ("scheduler_miss", "failure"):
@@ -384,8 +447,100 @@ class Daemon:
          node = event["node"]
          key = (node.hostname, event["loop"])
          self._scheduler_state[key] = (0, BREAKER_CLOSED)
-      if self._on_event is not None:
-         self._on_event(event)
+
+      try:
+         if event_type == "scheduler_miss":
+            try:
+               await self._record_scheduler_miss(event)
+            except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as sink_exc:
+               # Same fatal contract as every other sink write in this
+               # module. Deliberately NOT re-raised past this point:
+               # Scheduler itself is agnostic to sink exception types
+               # and does not need to see this exception to react
+               # correctly -- request_stop() (called here) already
+               # flips self._stop_requested/self._stop_event, which
+               # Scheduler._run_target checks immediately after this
+               # awaited call returns (see that method's own comment)
+               # to stop this target's own loop before it launches a
+               # further, doomed dispatch in the same iteration.
+               # Daemon.run() itself checks self._fatal_error (set
+               # here) right after self._scheduler.run() returns to
+               # produce EXIT_SINK_FATAL -- propagating this exception
+               # up through Scheduler's own asyncio.gather() would only
+               # risk an unhandled-exception crash out of run() instead
+               # of that defined, clean nonzero result.
+               self._fatal_error = sink_exc
+               self._scheduler.request_stop()
+      finally:
+         if self._on_event is not None:
+            self._on_event(event)
+
+   async def _record_scheduler_miss(self, event):
+      """Write one structured record for a ``scheduler_miss`` event --
+      a same-node/same-loop overlap that ``Scheduler._run_target``
+      cancelled and reaped before dispatching a new attempt for that
+      same target. ``node_poll_failures`` (``failure_type=
+      "scheduler_miss"``) once this node's FQDN has been established by
+      a prior successful poll of any kind, or the same pre-FQDN
+      ``node_collection_log`` fallback ``_record_ordinary_poll_failure``
+      uses (never the configured SSH-alias hostname as
+      ``source_hostname``) before that.
+
+      Unlike ``_record_ordinary_poll_failure``, no "prior mirrored
+      count plus one" anticipation is needed here: ``event[
+      "consecutive_failures"]``/``event["breaker_state"]`` ARE already
+      the Scheduler's own authoritative POST-increment state for this
+      exact miss -- ``Scheduler._run_target`` increments
+      ``state.consecutive_failures`` and reads ``state.breaker_state``
+      BEFORE emitting this event (see that method's own non-overlap
+      handling), unlike an ordinary ``poll_fn`` failure, which this
+      module's ``_poll_fn``/``_record_ordinary_poll_failure`` must
+      persist BEFORE the Scheduler's own ``_execute`` has had a chance
+      to observe and count it.
+
+      ``detail`` is a fixed, non-parameterized literal (never the
+      Scheduler's own event fields verbatim beyond the bounded
+      loop/count/state values already checked against contracts.py's
+      own closed vocabularies) -- mirroring every other bounded-detail
+      discipline in this module.
+      """
+      node = event["node"]
+      loop = event["loop"]
+      count = event["consecutive_failures"]
+      breaker_state = event["breaker_state"]
+      established_fqdn = self._established_fqdn.get(node.hostname)
+
+      if established_fqdn is None:
+         # Same honest-gap fallback as _record_ordinary_poll_failure:
+         # no FQDN has ever been established for this node, so a
+         # node_poll_failures record (whose source_hostname is
+         # REQUIRED, non-nullable) cannot be written honestly yet.
+         record = {
+            "system": self._config.system,
+            "timestamp_utc": self._wall_clock_fn(),
+            "event": "poll_failed_before_fqdn_established",
+            "detail": {
+               "configured_hostname": node.hostname,
+               "loop": loop,
+               "failure_type": "scheduler_miss",
+               "consecutive_failures": count,
+               "breaker_state": breaker_state,
+            },
+         }
+         await self._sink.write_record("node_collection_log", record)
+         return
+
+      record = {
+         "system": self._config.system,
+         "source_hostname": established_fqdn,
+         "loop": loop,
+         "timestamp_utc": self._wall_clock_fn(),
+         "failure_type": "scheduler_miss",
+         "detail": "scheduler_miss: same-node/same-loop overlap; see failure_type",
+         "consecutive_failures": count,
+         "breaker_state": breaker_state,
+      }
+      await self._sink.write_record("node_poll_failures", record)
 
    def _new_counter_accumulator(self, node, payload):
       now = self._wall_clock_fn()

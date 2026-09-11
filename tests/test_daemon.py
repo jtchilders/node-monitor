@@ -790,9 +790,11 @@ class TestCensusAndUsageWiring:
 # Ordinary counter/census poll failures: node_poll_failures once the
 # node's FQDN is established from a prior successful poll, falling back
 # to node_collection_log (never the configured alias as provenance) when
-# it is not yet established. Excludes scheduler_miss (the scheduler's
-# own bookkeeping, tested separately in test_scheduler.py) -- this
-# increment covers only ordinary transport-layer poll failures.
+# it is not yet established. scheduler_miss (the scheduler's own
+# same-node/same-loop overlap bookkeeping) is covered by its own
+# TestSchedulerMissPersisted class below, added in the follow-up
+# increment (kanban task t_d18ac4ae) that closed the exclusion this
+# increment originally carried.
 # --------------------------------------------------------------------------
 
 class TestOrdinaryPollFailuresPersisted:
@@ -1005,57 +1007,6 @@ class TestOrdinaryPollFailuresPersisted:
       assert len(records) == 2
       assert [r["consecutive_failures"] for r in records] == [1, 2]
 
-   def test_scheduler_miss_never_produces_a_node_poll_failures_record(self, tmp_path):
-      """Regression/exclusion: a same-node/same-loop overlap
-      (``scheduler_miss``) is the scheduler's own bookkeeping concern,
-      not an ordinary poll failure this increment covers -- a cancelled
-      in-flight poll must never itself be recorded as a poll failure.
-      """
-      config = _config(tmp_path, duration_sec=100000)
-      output_root = os.path.join(str(tmp_path), "phase0-runs")
-      sink = Phase0Sink(
-         output_root, "daemon-run-pollfail-5", metadata={"system": config.system},
-         disk_usage_fn=_full_disk_usage)
-      clock = FakeClock()
-      call_counts = {"counter": 0}
-
-      async def transport_fn(node, loop):
-         if loop == "hwinfo":
-            return _hwinfo_payload()
-         if loop == "counter":
-            call_counts["counter"] += 1
-            return _counter_payload(uptime_sec=float(call_counts["counter"]))
-         # Never completes on its own -- every census dispatch is
-         # cancelled and reaped as a scheduler_miss by the following
-         # deadline, exactly like tests/test_scheduler.py's own
-         # equivalent scenario. A finite duration_sec would instead
-         # have the scheduler's natural-end path await this
-         # never-completing task forever (see collector/scheduler.py's
-         # own _run_target finally block), so this scenario relies on
-         # request_stop() -- exactly mirroring tests/test_scheduler.py's
-         # own miss scenario -- to end the run instead of letting
-         # duration_sec elapse.
-         await clock.sleep(1000)
-         return _census_payload(uptime_sec=1.0)
-
-      daemon = Daemon(config, sink, transport_fn,
-                       clock=clock.time, sleep=clock.sleep)
-
-      async def scenario():
-         run_task = asyncio.ensure_future(daemon.run())
-         # Dispatch census at 0; misses (cancel+reap the prior attempt)
-         # at 1, 2, 3 -- comfortably past the first scheduler_miss.
-         await clock.advance(3)
-         daemon._scheduler.request_stop()
-         await clock.advance(10)  # let the bounded grace period elapse
-         return await run_task
-
-      exit_code = _run(scenario())
-      assert exit_code == EXIT_OK
-
-      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
-      assert not os.path.exists(poll_failures_path)
-
    def test_prior_scheduler_misses_are_folded_into_the_next_ordinary_failure_record(
          self, tmp_path):
       """Regression for review round 2 finding: a same-node/same-loop
@@ -1068,6 +1019,13 @@ class TestOrdinaryPollFailuresPersisted:
       ordinary failure alone as count 1/closed, which would silently
       under-report how many consecutive non-successes this target has
       actually accumulated.
+
+      Each of the two prior misses ALSO now persists its own
+      ``node_poll_failures`` record (see TestSchedulerMissPersisted
+      below, added in the follow-up increment that closed the
+      original exclusion) -- this test filters those out by
+      ``failure_type`` to isolate the ordinary failure's own record,
+      which is what it was written to check.
       """
       config = _config(tmp_path, duration_sec=100000)
       output_root = os.path.join(str(tmp_path), "phase0-runs")
@@ -1126,9 +1084,18 @@ class TestOrdinaryPollFailuresPersisted:
       with open(poll_failures_path) as handle:
          records = [json.loads(line) for line in handle]
       census_records = [r for r in records if r["loop"] == "census"]
-      assert len(census_records) == 1
-      record = census_records[0]
-      validate_node_poll_failures(record)
+      for record in census_records:
+         validate_node_poll_failures(record)
+
+      miss_records = [r for r in census_records if r["failure_type"] == "scheduler_miss"]
+      ordinary_records = [
+         r for r in census_records if r["failure_type"] != "scheduler_miss"]
+      assert len(miss_records) == 2
+      assert [r["consecutive_failures"] for r in miss_records] == [1, 2]
+      assert [r["breaker_state"] for r in miss_records] == ["closed", "closed"]
+
+      assert len(ordinary_records) == 1
+      record = ordinary_records[0]
       # Two scheduler_miss overlaps (consecutive_failures 1, then 2)
       # plus this one ordinary failure must report count 3 -- exactly
       # matching collector.scheduler.Scheduler's own authoritative
@@ -1221,6 +1188,209 @@ class TestOrdinaryPollFailuresPersisted:
          return await run_task
 
       assert _run(scenario()) == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
+
+# --------------------------------------------------------------------------
+# scheduler_miss persistence at the daemon boundary (kanban task
+# t_d18ac4ae, closing the exclusion the prior increment carried): a
+# same-node/same-loop overlap now writes exactly one schema-valid
+# node_poll_failures record (or the pre-FQDN node_collection_log
+# fallback) with failure_type="scheduler_miss" and the Scheduler's own
+# authoritative consecutive_failures/breaker_state for that exact miss.
+# --------------------------------------------------------------------------
+
+class TestSchedulerMissPersisted:
+   def test_scheduler_miss_writes_a_node_poll_failures_record(self, tmp_path):
+      config = _config(tmp_path, duration_sec=100000)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-schedmiss-1", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload(hostname="canonical.example.org")
+         if loop == "counter":
+            call_counts["counter"] += 1
+            return _counter_payload(
+               uptime_sec=float(call_counts["counter"]),
+               hostname="canonical.example.org")
+         # Never completes on its own -- every census dispatch is
+         # cancelled and reaped as a scheduler_miss by the following
+         # deadline, exactly like tests/test_scheduler.py's own
+         # equivalent scenario.
+         await clock.sleep(1000)
+         return _census_payload(uptime_sec=1.0, hostname="canonical.example.org")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         # Dispatch census at 0; misses (cancel+reap the prior attempt)
+         # at 1, 2, 3 -- comfortably past the first scheduler_miss.
+         await clock.advance(3)
+         daemon._scheduler.request_stop()
+         await clock.advance(10)  # let the bounded grace period elapse
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
+      assert os.path.exists(poll_failures_path)
+      with open(poll_failures_path) as handle:
+         records = [json.loads(line) for line in handle]
+      miss_records = [r for r in records if r["loop"] == "census"]
+      assert len(miss_records) >= 3
+      for index, record in enumerate(miss_records[:3]):
+         validate_node_poll_failures(record)
+         assert record["system"] == "polaris"
+         assert record["source_hostname"] == "canonical.example.org"
+         assert record["failure_type"] == "scheduler_miss"
+         assert record["consecutive_failures"] == index + 1
+      assert [r["breaker_state"] for r in miss_records[:3]] == \
+         ["closed", "closed", "open"]
+
+   def test_scheduler_miss_before_fqdn_established_uses_collection_log_never_alias(
+         self, tmp_path):
+      """Same honest-gap rule as the ordinary-failure path: before any
+      poll for this node has ever succeeded, no FQDN has been
+      established, so a scheduler_miss must surface via
+      node_collection_log instead of node_poll_failures, and must
+      never persist the configured SSH-alias hostname as a validated
+      source_hostname.
+      """
+      config = _config(tmp_path, nodes=[
+         {"hostname": "ssh-alias", "role": "local"},
+      ], duration_sec=100000)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-schedmiss-2", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            raise RuntimeError("simulated hwinfo failure")
+         if loop == "counter":
+            raise RuntimeError("simulated ordinary counter failure")
+         # census never completes -- always a scheduler_miss.
+         await clock.sleep(1000)
+         return _census_payload(uptime_sec=1.0)
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(3)
+         daemon._scheduler.request_stop()
+         await clock.advance(10)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
+      assert not os.path.exists(poll_failures_path)
+
+      log_path = os.path.join(sink.run_dir, "node_collection_log.jsonl")
+      assert os.path.exists(log_path)
+      with open(log_path, "rb") as handle:
+         raw_bytes = handle.read()
+      assert b"ssh-alias" in raw_bytes  # under the honestly-named key only
+      with open(log_path) as handle:
+         entries = [json.loads(line) for line in handle]
+      miss_entries = [
+         e for e in entries
+         if e["event"] == "poll_failed_before_fqdn_established"
+         and e["detail"]["loop"] == "census"
+         and e["detail"]["failure_type"] == "scheduler_miss"]
+      assert len(miss_entries) >= 3
+      for entry in miss_entries:
+         validate_node_collection_log(entry)
+         assert entry["detail"]["configured_hostname"] == "ssh-alias"
+         assert "source_hostname" not in entry["detail"]
+
+   def test_scheduler_miss_record_forwards_event_to_daemon_on_event(self, tmp_path):
+      """The persisted record must not come at the cost of dropping
+      event forwarding to this Daemon's own caller-supplied on_event --
+      a caller that only wants the raw event stream (e.g. for its own
+      logging) must keep seeing every scheduler_miss exactly as before.
+      """
+      config = _config(tmp_path, duration_sec=100000)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-schedmiss-3", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      observed_events = []
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         if loop == "counter":
+            return _counter_payload(uptime_sec=1.0)
+         await clock.sleep(1000)
+         return _census_payload(uptime_sec=1.0)
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep,
+                       on_event=observed_events.append)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(3)
+         daemon._scheduler.request_stop()
+         await clock.advance(10)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      misses = [e for e in observed_events if e.get("type") == "scheduler_miss"]
+      assert len(misses) >= 3
+
+   def test_scheduler_miss_sink_write_failure_is_fatal_and_never_writes_done(
+         self, tmp_path):
+      """Same fatal-sink contract as every other write in this module:
+      a write/flush/OSError failure recording a scheduler_miss must
+      stop the run nonzero and never finalize/DONE -- never absorbed
+      as an ordinary poll outcome.
+      """
+      config = _config(tmp_path, duration_sec=100000)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      real_sink = Phase0Sink(
+         output_root, "daemon-run-schedmiss-sink-fatal",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      sink = _SelectiveWriteFailsSink(real_sink, "node_poll_failures")
+      clock = FakeClock()
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         if loop == "counter":
+            return _counter_payload(uptime_sec=1.0)
+         await clock.sleep(1000)
+         return _census_payload(uptime_sec=1.0)
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(3)
+         daemon._scheduler.request_stop()
+         await clock.advance(10)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_SINK_FATAL
       assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
       assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
 
