@@ -1796,6 +1796,222 @@ class TestTrailingPartialWindowFlush:
 
 
 # --------------------------------------------------------------------------
+# Real OS signal handling (SIGINT/SIGTERM): orchestration-layer-only,
+# installed only while a scheduler is actually running, and produces a
+# valid partial (not fatal, not falsely-clean) summary + DONE.
+#
+# Each scenario runs in a SEPARATE subprocess (not this test process
+# itself): sending a real SIGTERM/SIGINT to the pytest process before
+# Daemon.run() has had a chance to install its own handler would use
+# Python's default disposition (terminate the whole process, killing
+# the test runner along with it) rather than exercising the
+# not-yet-implemented handler -- exactly the RED failure mode this
+# increment's tests must observe safely. A subprocess crashing (or
+# hanging, bounded by subprocess.run's own timeout) is a normal,
+# harmless test failure instead.
+# --------------------------------------------------------------------------
+
+_SIGNAL_SCENARIO_SCRIPT = r"""
+import asyncio
+import json
+import os
+import signal
+import sys
+
+sys.path.insert(0, {repo_root!r})
+sys.path.insert(0, {fixtures_dir!r})
+
+from node_monitor.config import load_config
+from node_monitor.daemon import Daemon, EXIT_OK
+from node_monitor.output.jsonl import Phase0Sink
+from fake_clock import FakeClock
+
+home = {home!r}
+output_root = os.path.join(home, "phase0-runs")
+os.makedirs(output_root, exist_ok=True)
+raw = {{
+   "system": "polaris",
+   "nodes": [{{"hostname": "polaris-login-04.example.org", "role": "local"}}],
+   "output_root": "~/phase0-runs",
+   "probe_python": "/usr/bin/python3.11",
+   "counter_interval_sec": 1,
+   "rollup_interval_sec": 100,
+   "census_interval_sec": 1,
+   "usage_interval_sec": 100,
+   "duration_sec": 100000,
+}}
+config = load_config(raw, home=home)
+sink = Phase0Sink(output_root, {run_id!r}, metadata={{"system": config.system}})
+clock = FakeClock()
+
+call_counts = {{}}
+
+async def transport_fn(node, loop):
+   if loop == "hwinfo":
+      return {{"probe_version": 4, "loop": "hwinfo",
+               "hostname_fqdn": node.hostname,
+               "wall_clock_utc": "2026-01-01T00:00:00Z", "hardware": {{}}}}
+   key = (node.hostname, loop)
+   call_counts[key] = call_counts.get(key, 0) + 1
+   n = call_counts[key]
+   if loop == "counter":
+      return {{
+         "probe_version": 4, "loop": "counter", "hostname_fqdn": node.hostname,
+         "uptime_sec": float(n),
+         "counters": {{
+            "cpu_jiffies": {{"user": 100 + n, "nice": 0, "system": 50,
+                            "idle": 900, "iowait": 0, "irq": 0,
+                            "softirq": 0, "steal": 0}},
+            "net": {{}}, "md_ops": {{}},
+            "mem": {{"available_kb": 1000, "cached_kb": 200, "shmem_kb": 10}},
+            "load1": 0.1, "load5": 0.2, "load15": 0.3,
+            "procs_running": 1, "procs_total": 100, "socket_count": 5,
+         }},
+      }}
+   return {{"probe_version": 4, "loop": "census", "hostname_fqdn": node.hostname,
+            "wall_clock_utc": "2026-01-01T00:00:00Z", "uptime_sec": float(n),
+            "counters": {{"clk_tck": 100}}, "processes": []}}
+
+daemon = Daemon(config, sink, transport_fn, clock=clock.time, sleep=clock.sleep)
+
+async def main():
+   run_task = asyncio.ensure_future(daemon.run())
+   await clock.advance(3)
+   os.kill(os.getpid(), signal.{sig_name})
+   # Give the real asyncio signal callback a chance to actually run
+   # (add_signal_handler delivers on a later loop iteration, not
+   # synchronously) before advancing virtual time again.
+   for _ in range(5):
+      await asyncio.sleep(0)
+   await clock.advance(10)  # let the bounded grace period elapse
+   exit_code = await asyncio.wait_for(run_task, timeout=10.0)
+   print(json.dumps({{
+      "exit_code": exit_code,
+      "run_dir": sink.run_dir,
+      "ok": exit_code == EXIT_OK,
+   }}))
+
+asyncio.run(main())
+"""
+
+
+def _run_signal_scenario(tmp_path, run_id, sig_name):
+   import json
+   import subprocess
+
+   repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+   fixtures_dir = os.path.join(repo_root, "tests", "fixtures")
+   script = _SIGNAL_SCENARIO_SCRIPT.format(
+      repo_root=repo_root, fixtures_dir=fixtures_dir,
+      home=str(tmp_path), run_id=run_id, sig_name=sig_name)
+   result = subprocess.run(
+      [sys.executable, "-c", script], capture_output=True, text=True,
+      timeout=30)
+   assert result.returncode == 0, (
+      "signal scenario subprocess failed: returncode=%r stdout=%r stderr=%r"
+      % (result.returncode, result.stdout, result.stderr))
+   return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+class TestSignalHandling:
+   def test_sigterm_triggers_orderly_stop_and_valid_partial_summary(
+         self, tmp_path):
+      """Sending a real SIGTERM to the daemon process while Daemon.run()
+      is active must stop dispatch, drain the in-flight grace period,
+      flush trailing windows, and finalize a valid (EXIT_OK) summary +
+      DONE -- exactly the same orderly-stop outcome an externally
+      called ``daemon._scheduler.request_stop()`` already produces
+      (see TestTrailingPartialWindowFlush's own
+      ``test_residual_windows_flushed_on_externally_requested_orderly_
+      stop``), but driven by an actual OS signal instead of a direct
+      method call. Design: "SIGINT/SIGTERM stops dispatch, gives
+      active polls a bounded grace period, reaps children, flushes
+      files, and writes a partial summary."
+      """
+      outcome = _run_signal_scenario(tmp_path, "daemon-run-sigterm", "SIGTERM")
+      assert outcome["ok"] is True
+
+      rollup_path = os.path.join(outcome["run_dir"], "node_counter_samples.jsonl")
+      assert os.path.exists(rollup_path)
+      with open(rollup_path) as handle:
+         rollup_records = [json.loads(line) for line in handle]
+      assert len(rollup_records) == 1
+      validate_node_counter_samples(rollup_records[0])
+      assert 0 < rollup_records[0]["sample_count"] < 100
+
+      assert os.path.exists(os.path.join(outcome["run_dir"], "summary.json"))
+      assert os.path.exists(os.path.join(outcome["run_dir"], "DONE"))
+
+   def test_sigint_triggers_orderly_stop_and_valid_partial_summary(
+         self, tmp_path):
+      """Same contract as the SIGTERM case above, for SIGINT (Ctrl-C) --
+      design names both signals explicitly ("SIGINT/SIGTERM stops
+      dispatch...").
+      """
+      outcome = _run_signal_scenario(tmp_path, "daemon-run-sigint", "SIGINT")
+      assert outcome["ok"] is True
+      assert os.path.exists(os.path.join(outcome["run_dir"], "summary.json"))
+      assert os.path.exists(os.path.join(outcome["run_dir"], "DONE"))
+
+   def test_signal_handlers_not_installed_before_run_starts(self, tmp_path):
+      """Design: handlers belong to the orchestration layer's own
+      run-scoped lifecycle, not import time or object construction --
+      merely importing node_monitor.daemon or constructing a Daemon
+      must never touch process-wide signal state. Run in-process (no
+      subprocess needed: nothing here ever sends a signal, so there is
+      no risk of killing the test runner) and asserts the SIGINT/
+      SIGTERM disposition observed before either action is bit-for-bit
+      the same disposition observed after.
+      """
+      import signal
+
+      before_int = signal.getsignal(signal.SIGINT)
+      before_term = signal.getsignal(signal.SIGTERM)
+
+      import node_monitor.daemon  # noqa: F401 (import side effects only)
+
+      config = _config(tmp_path)
+      # Constructing a Daemon must not require or touch a running loop,
+      # nor install any signal handler.
+      Daemon(config, sink=None, transport_fn=None)
+
+      assert signal.getsignal(signal.SIGINT) == before_int
+      assert signal.getsignal(signal.SIGTERM) == before_term
+
+   def test_signal_handlers_removed_after_clean_completion(self, tmp_path):
+      """Once Daemon.run() returns via a clean finite-duration
+      completion (no signal involved), the process's SIGINT/SIGTERM
+      disposition must be restored to whatever it was before run()
+      started -- handlers are scoped to exactly one run() call, never
+      leaked into whatever runs next in the same process.
+      """
+      import signal
+
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-signal-cleanup",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      before_int = signal.getsignal(signal.SIGINT)
+      before_term = signal.getsignal(signal.SIGTERM)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+      assert signal.getsignal(signal.SIGINT) == before_int
+      assert signal.getsignal(signal.SIGTERM) == before_term
+
+
+# --------------------------------------------------------------------------
 # Fatal sink error propagates nonzero and skips finalize/DONE
 # --------------------------------------------------------------------------
 

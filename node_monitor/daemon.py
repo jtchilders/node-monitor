@@ -169,6 +169,8 @@ this module builds its own minimal, pure ``node_hardware`` contract
 record straight from a raw hwinfo probe payload instead).
 """
 
+import asyncio
+import signal
 import time
 
 from node_monitor.collector.cpu_delta import compute_cpu_delta
@@ -992,6 +994,63 @@ class Daemon:
                                 interval_sec=self._config.census_interval_sec))
       return targets
 
+   def _install_signal_handlers(self):
+      """Install SIGINT/SIGTERM handlers, in the running event loop,
+      that call ``self._scheduler.request_stop()`` -- the same orderly
+      stop request an external caller already exercises directly in
+      tests (``daemon._scheduler.request_stop()``). Returns the list of
+      signals actually installed, so ``run()`` can remove exactly
+      those in its ``finally`` block.
+
+      Design: "SIGINT/SIGTERM stops dispatch, gives active polls a
+      bounded grace period, reaps children, flushes files, and writes
+      a partial summary." ``Scheduler.request_stop()`` already
+      implements the drain/grace/reap half of that contract (see
+      ``collector/scheduler.py``); this method's only job is wiring an
+      OS signal to that existing, already-tested entrypoint -- it must
+      never touch scheduler/sink internals directly.
+
+      Deliberately NOT installed at import time or in ``__init__``:
+      handlers must exist only while an event loop -- and therefore a
+      live ``self._scheduler`` -- is actually running this Daemon's
+      own ``run()`` coroutine (``loop.add_signal_handler`` also
+      requires a running loop to bind to on this project's Python
+      3.9). Two consecutive ``Daemon.run()`` calls in the same process
+      (e.g. two tests in the same pytest session) install and remove
+      their own handlers independently, never leaking one run's
+      handler into the next.
+
+      ``signal.SIGINT``/``signal.SIGTERM`` are looked up fresh here
+      rather than imported as module-level constants purely so a test
+      can monkeypatch ``signal.SIGINT``/``signal.SIGTERM`` if it ever
+      needs a synthetic signal number -- no test in this increment
+      does, but it costs nothing.
+      """
+      loop = asyncio.get_running_loop()
+      installed = []
+      for sig in (signal.SIGINT, signal.SIGTERM):
+         try:
+            loop.add_signal_handler(sig, self._scheduler.request_stop)
+         except (NotImplementedError, RuntimeError):
+            # add_signal_handler is unsupported on some platforms
+            # (notably Windows' ProactorEventLoop) and inside a thread
+            # that is not the main thread. Design's signal-handling
+            # contract only applies to the real orchestration process,
+            # which always runs Daemon.run() on the main thread of a
+            # POSIX host (Polaris) -- silently skipping here rather
+            # than crashing the run keeps this method safe to call
+            # from any test environment (e.g. a pytest worker thread)
+            # without special-casing platform detection at every call
+            # site.
+            continue
+         installed.append(sig)
+      return installed
+
+   def _remove_signal_handlers(self, installed):
+      loop = asyncio.get_running_loop()
+      for sig in installed:
+         loop.remove_signal_handler(sig)
+
    async def run(self):
       """Run every configured target to completion (or until a fatal
       sink error stops the scheduler early), then finalize the sink
@@ -1037,7 +1096,20 @@ class Daemon:
          scheduler_kwargs["sleep"] = self._sleep
       self._scheduler = self._scheduler_cls(**scheduler_kwargs)
 
-      await self._scheduler.run()
+      # Design: "SIGINT/SIGTERM stops dispatch, gives active polls a
+      # bounded grace period, reaps children, flushes files, and
+      # writes a partial summary." Handlers are installed only for the
+      # duration of self._scheduler.run() -- never earlier (there is
+      # no live scheduler to stop before this point) and always
+      # removed in the finally block below, even if the scheduler run
+      # itself raises, so a signal delivered after this Daemon.run()
+      # call returns can never fire a handler bound to an already-
+      # finished (or a DIFFERENT, later) run's scheduler.
+      installed_signals = self._install_signal_handlers()
+      try:
+         await self._scheduler.run()
+      finally:
+         self._remove_signal_handlers(installed_signals)
 
       if self._fatal_error is not None:
          return EXIT_SINK_FATAL
