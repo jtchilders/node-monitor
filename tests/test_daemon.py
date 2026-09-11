@@ -56,6 +56,7 @@ from node_monitor.daemon import Daemon, EXIT_OK, EXIT_SINK_FATAL  # noqa: E402
 from node_monitor.output.contracts import (  # noqa: E402
    validate_diagnostic_census,
    validate_node_collection_log,
+   validate_node_counter_samples,
    validate_node_hardware,
    validate_node_poll_failures,
    validate_node_usage_intervals,
@@ -192,6 +193,36 @@ def _census_payload(uptime_sec, pids=(1,), utime_ticks=100,
             "interactive": False,
          }
          for pid in pids
+      ],
+   }
+
+
+def _census_payload_multi_grain(uptime_sec, hostname="polaris-login-04.example.org"):
+   """Two-grain variant of ``_census_payload``: one process each for two
+   distinct ``(category, activity, username)`` grains, so a test can
+   assert a trailing usage-interval flush produces one record PER
+   grain rather than just one record overall.
+   """
+   return {
+      "probe_version": 4,
+      "loop": "census",
+      "hostname_fqdn": hostname,
+      "wall_clock_utc": "2026-09-09T00:00:00Z",
+      "uptime_sec": uptime_sec,
+      "counters": {"clk_tck": 100},
+      "processes": [
+         {
+            "pid": 1, "start_time_ticks": 5, "utime_ticks": 100,
+            "stime_ticks": 0, "category": "other", "activity": None,
+            "username": "alice", "rss_kb": 1000, "state": "S",
+            "interactive": False,
+         },
+         {
+            "pid": 2, "start_time_ticks": 5, "utime_ticks": 100,
+            "stime_ticks": 0, "category": "compute", "activity": None,
+            "username": "bob", "rss_kb": 2000, "state": "S",
+            "interactive": False,
+         },
       ],
    }
 
@@ -1438,6 +1469,330 @@ class TestRawArgvNeverPersistedEndToEnd:
          raw_bytes = handle.read()
       assert b"secret-token" not in raw_bytes
       assert b"cmdline" not in raw_bytes
+
+
+# --------------------------------------------------------------------------
+# Trailing partial-window flush on orderly stop (kanban task t_c2f01685):
+# a nonempty residual counter/usage accumulator that never reached its own
+# expected_count sample cadence is finalized and written exactly once, on
+# both ways Daemon.run() can reach the post-scheduler flush point with no
+# fatal error already observed -- the run's own finite duration_sec
+# elapsing, or an externally requested orderly request_stop(). An empty
+# (no-sample-yet) window is never emitted, and a window that already
+# reached its full expected_count is never double-flushed (it was already
+# popped out of the accumulator dict by its own ordinary at-capacity
+# flush). A sink write failure while flushing a trailing window is fatal
+# by the same contract as every other sink write in this module.
+# --------------------------------------------------------------------------
+
+class TestTrailingPartialWindowFlush:
+   def test_residual_counter_only_window_is_flushed_on_finite_duration_end(
+         self, tmp_path):
+      """rollup_interval_sec=4 (4-sample counter window) but
+      usage_interval_sec=3 (3-sample usage window) over a 6-second run:
+      the usage window completes cleanly twice (3+3=6 census samples),
+      but the counter window only ever receives 4 counter samples --
+      one full window plus... no, exactly one 4-sample window fits in
+      6 dispatches with 2 left over. The counter accumulator therefore
+      still holds a nonempty, never-reached-capacity residual window
+      (2 samples) when duration_sec elapses; that residual must be
+      flushed as its own degraded node_counter_samples record with
+      sample_count=2 and expected_count=4 -- never silently dropped,
+      never a phantom third full-capacity record.
+      """
+      config = _config(
+         tmp_path, rollup_interval_sec=4, usage_interval_sec=3, duration_sec=6)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-trailing-counter", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      rollup_path = os.path.join(sink.run_dir, "node_counter_samples.jsonl")
+      with open(rollup_path) as handle:
+         records = [json.loads(line) for line in handle]
+      for record in records:
+         validate_node_counter_samples(record)
+      sample_counts = sorted(r["sample_count"] for r in records)
+      # One full 4-sample window plus one trailing 2-sample residual --
+      # never a phantom second full window, never a silently dropped
+      # residual.
+      assert sample_counts == [2, 4]
+      trailing = [r for r in records if r["sample_count"] == 2][0]
+      assert trailing["expected_count"] == 4
+      assert 0.0 <= trailing["coverage"] < 1.0
+      assert trailing["source_hostname"] == "polaris-login-04.example.org"
+
+      # The accumulator must be gone afterward -- flushed, not merely
+      # inspected -- so a second flush attempt could never double-count.
+      assert daemon._counter_accumulators == {}
+
+   def test_residual_usage_grains_are_flushed_on_finite_duration_end(
+         self, tmp_path):
+      """Symmetric case for node_usage_intervals: rollup_interval_sec=3
+      (clean) but usage_interval_sec=4 over a 6-second run leaves the
+      usage accumulator holding a nonempty 2-sample residual across
+      TWO grains (two distinct processes/users in every census
+      payload) when duration_sec elapses. Both grains' records must be
+      flushed -- one per (category, activity, username) -- each with
+      sample_count=2/expected_count=4, never zero records and never a
+      third full-capacity pair.
+      """
+      config = _config(
+         tmp_path, rollup_interval_sec=3, usage_interval_sec=4, duration_sec=6)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-trailing-usage", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0, "census": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         call_counts[loop] += 1
+         n = call_counts[loop]
+         if loop == "census":
+            return _census_payload_multi_grain(uptime_sec=float(n))
+         return _counter_payload(uptime_sec=float(n))
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      usage_path = os.path.join(sink.run_dir, "node_usage_intervals.jsonl")
+      with open(usage_path) as handle:
+         records = [json.loads(line) for line in handle]
+      for record in records:
+         validate_node_usage_intervals(record)
+
+      trailing = [r for r in records if r["sample_count"] == 2]
+      # Exactly one trailing record per grain -- never zero, never
+      # duplicated, never merged into a single row.
+      assert len(trailing) == 2
+      grains = {(r["category"], r["username"]) for r in trailing}
+      assert grains == {("other", "alice"), ("compute", "bob")}
+      for record in trailing:
+         assert record["expected_count"] == 4
+         assert record["source_hostname"] == "polaris-login-04.example.org"
+
+      assert daemon._usage_accumulators == {}
+
+   def test_clean_run_with_no_residual_windows_flushes_nothing_extra(
+         self, tmp_path):
+      """rollup_interval_sec == usage_interval_sec == counter/census
+      cadence over a duration that is an exact multiple of both means
+      every window reaches its own expected_count on its own via the
+      ordinary per-poll flush path -- no residual accumulator is ever
+      left behind for the trailing flush to act on. Asserts the
+      trailing flush is a true no-op here: no extra/duplicate record
+      beyond what the ordinary at-capacity flushes already produced,
+      and every record has the full expected_count as its own
+      sample_count (never a short one).
+      """
+      config = _config(
+         tmp_path, rollup_interval_sec=3, usage_interval_sec=3, duration_sec=6)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-trailing-none", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      # Nothing left in either accumulator dict before the trailing
+      # flush even ran (proves the "no residual" premise), and still
+      # nothing afterward (proves the trailing flush touched nothing).
+      assert daemon._counter_accumulators == {}
+      assert daemon._usage_accumulators == {}
+
+      rollup_path = os.path.join(sink.run_dir, "node_counter_samples.jsonl")
+      with open(rollup_path) as handle:
+         rollup_records = [json.loads(line) for line in handle]
+      assert len(rollup_records) == 2
+      for record in rollup_records:
+         validate_node_counter_samples(record)
+         assert record["sample_count"] == record["expected_count"] == 3
+
+      usage_path = os.path.join(sink.run_dir, "node_usage_intervals.jsonl")
+      with open(usage_path) as handle:
+         usage_records = [json.loads(line) for line in handle]
+      assert len(usage_records) == 2
+      for record in usage_records:
+         validate_node_usage_intervals(record)
+         assert record["sample_count"] == record["expected_count"] == 3
+
+   def test_residual_windows_flushed_on_externally_requested_orderly_stop(
+         self, tmp_path):
+      """The card's other trigger besides finite-duration completion:
+      an externally requested orderly ``request_stop()`` mid-run.
+      Long rollup/usage windows (never naturally completing within the
+      few virtual seconds this test advances) must still each flush
+      their nonempty residual once the scheduler's bounded grace period
+      drains and run() reaches its post-scheduler trailing-flush point
+      with no fatal error observed.
+      """
+      config = _config(
+         tmp_path, rollup_interval_sec=100, usage_interval_sec=100,
+         duration_sec=100000)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-trailing-stop", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(3)
+         daemon._scheduler.request_stop()
+         await clock.advance(10)  # let the bounded grace period elapse
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      rollup_path = os.path.join(sink.run_dir, "node_counter_samples.jsonl")
+      assert os.path.exists(rollup_path)
+      with open(rollup_path) as handle:
+         rollup_records = [json.loads(line) for line in handle]
+      assert len(rollup_records) == 1
+      validate_node_counter_samples(rollup_records[0])
+      assert 0 < rollup_records[0]["sample_count"] < 100
+
+      usage_path = os.path.join(sink.run_dir, "node_usage_intervals.jsonl")
+      assert os.path.exists(usage_path)
+      with open(usage_path) as handle:
+         usage_records = [json.loads(line) for line in handle]
+      assert len(usage_records) >= 1
+      for record in usage_records:
+         validate_node_usage_intervals(record)
+         assert 0 < record["sample_count"] < 100
+
+      assert daemon._counter_accumulators == {}
+      assert daemon._usage_accumulators == {}
+
+   def test_no_residual_window_when_no_sample_was_ever_accepted(self, tmp_path):
+      """Every scheduled poll fails before any sample is ever accepted
+      into either accumulator: no accumulator is ever CREATED for this
+      node (an accumulator only comes into existence immediately
+      before its own first add_sample call -- see daemon.py's
+      _handle_counter_poll/_handle_census_poll), so the trailing flush
+      must never fabricate an empty node_counter_samples/node_usage_
+      intervals record out of nothing.
+      """
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-trailing-nosample",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         raise RuntimeError("every scheduled poll fails")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      rollup_path = os.path.join(sink.run_dir, "node_counter_samples.jsonl")
+      assert not os.path.exists(rollup_path)
+      usage_path = os.path.join(sink.run_dir, "node_usage_intervals.jsonl")
+      assert not os.path.exists(usage_path)
+
+   def test_trailing_counter_window_sink_write_failure_is_fatal_without_finalizing(
+         self, tmp_path):
+      """Same fatal-sink contract as every ordinary write_record() call
+      in this module, applied to the trailing-flush call site: a write
+      failure recording the residual counter window must stop the run
+      nonzero and never finalize/DONE.
+      """
+      config = _config(
+         tmp_path, rollup_interval_sec=100, usage_interval_sec=3, duration_sec=3)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      real_sink = Phase0Sink(
+         output_root, "daemon-run-trailing-counter-fatal",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      sink = _SelectiveWriteFailsSink(real_sink, "node_counter_samples")
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
+   def test_trailing_usage_window_sink_write_failure_is_fatal_without_finalizing(
+         self, tmp_path):
+      """Symmetric fatal-sink case for the trailing usage-interval
+      flush.
+      """
+      config = _config(
+         tmp_path, rollup_interval_sec=3, usage_interval_sec=100, duration_sec=3)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      real_sink = Phase0Sink(
+         output_root, "daemon-run-trailing-usage-fatal",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      sink = _SelectiveWriteFailsSink(real_sink, "node_usage_intervals")
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
 
 
 # --------------------------------------------------------------------------

@@ -108,17 +108,52 @@ scheduler_miss preceded an ordinary failure for the same target).
 Still DEFERRED to a follow-up increment: signal handling, the
 partial-vs-clean acceptance evaluation, and CLI/deploy/docs wiring.
 
-KNOWN GAP carried over from the first increment: a trailing partial
-counter window (fewer than ``rollup_interval_sec // counter_interval_
-sec`` samples when the run's duration/stop ends mid-window) is never
-flushed -- only a window that reaches its full expected sample count
-calls ``CounterWindowAccumulator.finalize()``. The identical gap now
-also applies to the analogous ``UsageIntervalAccumulator`` windowing
-added in this increment, for the same reason: the design's own
-accumulators already support finalizing a degraded/partial window,
-but wiring that flush into ``Daemon.run()``'s post-scheduler shutdown
-path is left to the deferred partial/clean-summary follow-up rather
-than implemented speculatively here without its own test.
+FOLLOW-UP INCREMENT SCOPE NOTE (2026-09-10, kanban task t_c2f01685):
+this increment closes the trailing-partial-window gap carried over
+from the first increment (see the removed "KNOWN GAP" note this
+paragraph replaces). ``Daemon.run()`` now calls
+``_flush_trailing_windows`` immediately after ``self._scheduler.run()``
+returns and before ``finalize_summary()``/``write_done()`` -- but only
+when ``self._fatal_error`` is still ``None`` at that point, i.e. on
+exactly the two paths the card scopes this to: the run's own finite
+``duration_sec`` elapsing, or an externally requested orderly
+``request_stop()`` (a caller-driven stop, not a fatal sink condition
+observed DURING the run -- that path already returns ``EXIT_SINK_
+FATAL`` one line above, before this method is ever reached, so a
+fatal-then-flush ordering ambiguity never arises). ``_flush_trailing_
+counter_windows``/``_flush_trailing_usage_windows`` finalize and write
+exactly one record (or, for usage, one record per grain) per node
+whose ``CounterWindowAccumulator``/``UsageIntervalAccumulator`` is
+still present in ``self._counter_accumulators``/``self._usage_
+accumulators`` at that instant -- i.e. every node with a nonempty
+in-flight window that never reached its own ``expected_count`` sample
+cadence before the scheduler stopped dispatching further polls.
+
+Never emits an empty window and never duplicates an already-completed
+one: an accumulator is only ever created, in ``_handle_counter_poll``/
+``_handle_census_poll``, immediately before that same call's own
+``add_sample`` (no ``await`` in between), so any accumulator still
+present here has by construction already accepted at least one
+sample; a node whose window already reached its full expected count
+was already popped out of these same dicts by ``_flush_counter_
+window``/``_flush_usage_window`` at capacity (inside the ordinary
+per-poll handlers), so this method can only ever see the ones that
+did NOT reach full capacity, never a second copy of one that did. A
+sink write/flush failure while flushing a trailing window is fatal by
+the exact same contract as every other sink write in this module
+(design: "Output write/flush failure or low disk is fatal") -- ``run()``
+catches it exactly like the hardware-collection and finalize/write_done
+boundaries already do, mapping it to ``EXIT_SINK_FATAL`` without ever
+calling ``finalize_summary()``/``write_done()`` afterward.
+
+``_flush_counter_window``/``_flush_usage_window`` now take the node's
+``hostname`` string directly rather than a whole ``node`` object --
+both methods only ever read ``node.hostname`` (to key their own
+accumulator dicts), and the trailing-window flush path above only
+ever has a hostname on hand (from the accumulator dict's own keys),
+never a live ``Target``/``NodeConfig`` object to reach one through;
+every ordinary per-poll call site was updated to pass ``node.hostname``
+instead, with no behavior change at those call sites.
 
 Nothing in this module imports a database driver, an ORM, or
 ``node_monitor.database``/``node_monitor.db`` -- design: "prove no
@@ -349,6 +384,16 @@ class Daemon:
       # explicitly rather than requiring a caller-side special case.
       self._previous_census_payload = {}
 
+      # The most recent raw counter-loop payload accepted for a node,
+      # keyed by node.hostname -- kept purely so a TRAILING (never
+      # reached full expected_count) counter window can still backfill
+      # its record's probe_version at flush time (see
+      # _flush_trailing_windows/_flush_counter_window) exactly the way
+      # an ordinary full-window flush already does from its own
+      # just-arrived payload. Updated on every accepted counter poll,
+      # not just the one that happens to fill a window.
+      self._last_counter_payload = {}
+
       # The most recent remote-reported FQDN observed from ANY
       # successful poll (hwinfo, counter, or census) for a node, keyed
       # by node.hostname (the only identity known before a payload
@@ -563,9 +608,9 @@ class Daemon:
          expected_count=self._counter_expected_count,
       )
 
-   async def _flush_counter_window(self, node, payload):
-      accumulator = self._counter_accumulators.pop(node.hostname)
-      self._counter_sample_counts[node.hostname] = 0
+   async def _flush_counter_window(self, hostname, payload):
+      accumulator = self._counter_accumulators.pop(hostname)
+      self._counter_sample_counts[hostname] = 0
       record = accumulator.finalize()
       # The accumulator was seeded with probe_version=daemon_version=
       # None before the first sample was known -- backfill both from
@@ -587,10 +632,11 @@ class Daemon:
          accumulator = self._new_counter_accumulator(node, payload)
          self._counter_accumulators[node.hostname] = accumulator
       accumulator.add_sample(payload)
+      self._last_counter_payload[node.hostname] = payload
       count = self._counter_sample_counts.get(node.hostname, 0) + 1
       self._counter_sample_counts[node.hostname] = count
       if count >= self._counter_expected_count:
-         await self._flush_counter_window(node, payload)
+         await self._flush_counter_window(node.hostname, payload)
 
    def _new_usage_accumulator(self, node, payload):
       now = self._wall_clock_fn()
@@ -604,9 +650,9 @@ class Daemon:
          expected_count=self._usage_expected_count,
       )
 
-   async def _flush_usage_window(self, node):
-      accumulator = self._usage_accumulators.pop(node.hostname)
-      self._usage_sample_counts[node.hostname] = 0
+   async def _flush_usage_window(self, hostname):
+      accumulator = self._usage_accumulators.pop(hostname)
+      self._usage_sample_counts[hostname] = 0
       records = accumulator.finalize()
       # The accumulator was seeded with interval_end_utc == its own
       # interval_start_utc (the window's own birth instant, before any
@@ -653,7 +699,7 @@ class Daemon:
       count = self._usage_sample_counts.get(node.hostname, 0) + 1
       self._usage_sample_counts[node.hostname] = count
       if count >= self._usage_expected_count:
-         await self._flush_usage_window(node)
+         await self._flush_usage_window(node.hostname)
 
    async def _poll_fn(self, node, loop):
       try:
@@ -866,6 +912,70 @@ class Daemon:
          record[field] = hardware.get(field)
       await self._sink.write_record("node_hardware", record)
 
+   async def _flush_trailing_counter_windows(self):
+      """Finalize and write a ``node_counter_samples`` record for every
+      node whose counter-rollup window never reached its own
+      ``expected_count`` sample cadence before the scheduler stopped
+      dispatching further polls -- design: "one row per node per
+      complete 60-second window" is not honestly satisfiable for a
+      window that never completed, but the design's own accumulator
+      already supports finalizing a degraded/partial one (mirroring
+      ``CounterWindowAccumulator.finalize()``'s own "always returns a
+      record ... even for a window with zero samples" contract, here
+      applied to the trailing case of "some samples, but never enough
+      to reach expected_count on its own").
+
+      Iterates over a snapshot (``list(...)``) of ``self._counter_
+      accumulators`` rather than the live dict: ``_flush_counter_window``
+      pops its own entry out of that same dict as it runs, which would
+      raise ``RuntimeError: dictionary changed size during iteration``
+      against the live dict/its default view.  Every accumulator still
+      present here is, by construction, nonempty -- see this method's
+      call site (``run()``) and the module docstring's "never emits an
+      empty window" note for why a still-present accumulator can never
+      have zero samples.
+      """
+      for hostname in list(self._counter_accumulators):
+         payload = self._last_counter_payload.get(hostname, {})
+         await self._flush_counter_window(hostname, payload)
+
+   async def _flush_trailing_usage_windows(self):
+      """Finalize and write ``node_usage_intervals`` record(s) for
+      every node whose usage-interval window never reached its own
+      ``expected_count`` sample cadence before the scheduler stopped
+      dispatching further polls -- the usage-interval analogue of
+      ``_flush_trailing_counter_windows`` above, for the same reason
+      (see that method's docstring). ``UsageIntervalAccumulator.
+      finalize()`` already produces one record per ``(category,
+      activity, username)`` grain observed in the window regardless of
+      how many samples it actually received, so no separate empty-vs-
+      partial handling is needed here beyond simply calling it.
+
+      Same snapshot-iteration rationale as ``_flush_trailing_counter_
+      windows``: ``_flush_usage_window`` pops its own entry out of
+      ``self._usage_accumulators`` as it runs.
+      """
+      for hostname in list(self._usage_accumulators):
+         await self._flush_usage_window(hostname)
+
+   async def _flush_trailing_windows(self):
+      """Flush every node's trailing (never-reached-expected_count)
+      counter and usage window -- called once, from ``run()``, after
+      the scheduler has fully stopped dispatching (either the run's
+      own finite ``duration_sec`` elapsed, or an externally requested
+      orderly ``request_stop()``) and only when no fatal sink condition
+      was already observed during the run (see ``run()``'s own
+      ``self._fatal_error`` check immediately before this is called).
+
+      Counter and usage windows are independent per-node accumulators
+      with no ordering dependency between them (unlike, say, a census
+      poll's own diagnostic-then-usage sequencing) -- flushing counter
+      windows first is an arbitrary but stable choice, not a
+      correctness requirement.
+      """
+      await self._flush_trailing_counter_windows()
+      await self._flush_trailing_usage_windows()
+
    def _build_targets(self):
       # One counter Target and one census Target per configured node,
       # regardless of local/remote role: that distinction lives
@@ -930,6 +1040,25 @@ class Daemon:
       await self._scheduler.run()
 
       if self._fatal_error is not None:
+         return EXIT_SINK_FATAL
+
+      # Orderly post-scheduler flush of any trailing (never-reached-
+      # expected_count) counter/usage window -- design's own
+      # accumulators already support finalizing a degraded/partial
+      # window; this is that flush's one call site, reached on both
+      # ways run() gets here with no fatal error yet observed: the
+      # run's own finite duration_sec elapsing, or an externally
+      # requested orderly request_stop(). A sink write/flush failure
+      # while flushing a trailing window is fatal by the exact same
+      # contract as every other sink write in this module (design:
+      # "Output write/flush failure or low disk is fatal") -- mapped
+      # to EXIT_SINK_FATAL here, before finalize_summary()/write_done()
+      # are ever reached, exactly like the hardware-collection boundary
+      # above.
+      try:
+         await self._flush_trailing_windows()
+      except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as exc:
+         self._fatal_error = exc
          return EXIT_SINK_FATAL
 
       try:
