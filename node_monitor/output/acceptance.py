@@ -203,6 +203,44 @@ def _percentile_threshold(samples, maximum):
    return {"value": p95, "required": maximum, "met": p95 <= maximum}
 
 
+def _expected_poll_count(duration_sec, interval_sec):
+   """Number of dispatches ``collector.scheduler.Scheduler`` actually
+   makes for a target with this ``interval_sec`` over a run of this
+   ``duration_sec``, computed by walking the SAME fixed grid the
+   scheduler itself walks (``deadline = 0``, then repeatedly
+   ``deadline += interval_sec``, dispatching once per deadline while
+   ``deadline < duration_sec`` -- see ``Scheduler._run_target``'s own
+   ``if state.next_deadline >= end_time: break``) rather than by
+   computing ``ceil(duration_sec / interval_sec)`` directly.
+
+   This matters because floating-point division does not reliably
+   match repeated floating-point addition: for
+   ``duration_sec=2.1, interval_sec=0.3``, Python evaluates
+   ``2.1 / 0.3 == 7.000000000000001``, so a direct
+   ``math.ceil(duration_sec / interval_sec)`` reports 8 expected polls,
+   but the scheduler's own repeated-addition grid
+   (``0.0, 0.3, 0.6, ..., 1.8``) dispatches only 7 times before its
+   8th deadline (``2.1000000000000005``) lands at-or-past
+   ``end_time=2.1``. Walking the identical grid here, rather than
+   re-deriving an equivalent-looking closed form, is what keeps this
+   count exactly consistent with the scheduler's own t=0/duration
+   boundary semantics for every input, not just the ones where the
+   two approaches happen to agree.
+
+   The loop is bounded by construction: both ``duration_sec`` and
+   ``interval_sec`` are already validated finite and strictly
+   positive by the time this runs, so ``deadline`` strictly increases
+   by a fixed positive step each iteration and must eventually reach
+   ``duration_sec``.
+   """
+   deadline = 0.0
+   count = 0
+   while deadline < duration_sec:
+      count += 1
+      deadline += interval_sec
+   return count
+
+
 def _coverage_threshold(nodes, totals, duration_sec, interval_sec, minimum):
    """Per-node coverage threshold dict: {hostname: {"value", "required",
    "met", "expected_count", "actual_count"}} -- one entry for EVERY
@@ -210,19 +248,16 @@ def _coverage_threshold(nodes, totals, duration_sec, interval_sec, minimum):
    (``totals.get(hostname, 0)``), so a node that never once succeeded
    can never be silently absent from the summary.
 
-   ``expected_count`` is ``ceil(duration_sec / interval_sec)``,
-   matching ``collector.scheduler.Scheduler``'s own dispatch grid: a
-   target's first dispatch happens at ``t=0`` (not after waiting one
-   full interval), so a run whose duration is shorter than one
-   interval still gets exactly one dispatch, not zero -- e.g.
-   ``duration_sec=5.0, interval_sec=10.0`` dispatches once, at
-   ``t=0``, then stops because the next deadline (``t=10``) is at or
-   past the run's end time. Flooring that same ratio would report
-   zero expected polls (and therefore an "unavailable" coverage
-   verdict) for a node that in fact had one honest chance to be
-   polled and was not.
+   ``expected_count`` is computed by ``_expected_poll_count``, which
+   walks ``collector.scheduler.Scheduler``'s own fixed dispatch grid
+   rather than a closed-form ratio: a target's first dispatch happens
+   at ``t=0`` (not after waiting one full interval), so a run whose
+   duration is shorter than one interval still gets exactly one
+   dispatch, not zero -- e.g. ``duration_sec=5.0, interval_sec=10.0``
+   dispatches once, at ``t=0``, then stops because the next deadline
+   (``t=10``) is at or past the run's end time.
    """
-   expected_count = math.ceil(duration_sec / interval_sec)
+   expected_count = _expected_poll_count(duration_sec, interval_sec)
    result = {}
    for hostname in nodes:
       actual_count = totals.get(hostname, 0)

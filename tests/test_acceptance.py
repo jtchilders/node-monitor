@@ -193,6 +193,55 @@ class TestExpectedCountBoundaries:
       assert node["expected_count"] == 3
       assert node["met"] is True
 
+   def test_decimal_boundary_matches_scheduler_not_naive_ceil_division(self):
+      # Reviewer regression: duration_sec=2.1, interval_sec=0.3.
+      # Python evaluates 2.1 / 0.3 == 7.000000000000001, so a naive
+      # math.ceil(duration_sec / interval_sec) reports 8 expected
+      # polls. The real Scheduler, walking its own fixed
+      # deadline-accumulation grid with a FakeClock, dispatches
+      # exactly 7 times: [0.0, 0.3, 0.6, 0.8999999999999999, 1.2,
+      # 1.5, 1.8] -- its 8th deadline (2.1000000000000005) lands at
+      # or past end_time=2.1 and is never dispatched. 7 actual
+      # successes against an expected_count of 7 must report full
+      # (1.0) coverage, never a false failure from an inflated
+      # denominator of 8.
+      result = _evaluate(
+         nodes=["a.example.org"], counter_totals={"a.example.org": 7},
+         duration_sec=2.1, counter_interval_sec=0.3)
+      node = result["thresholds"]["counter_coverage_per_node"]["a.example.org"]
+      assert node["expected_count"] == 7
+      assert node["value"] == 1.0
+      assert node["met"] is True
+
+   def test_decimal_boundary_just_below_end_time_still_dispatches(self):
+      # duration_sec=0.8999999999999999 (the same value that shows up
+      # as a computed deadline above) is strictly greater than the
+      # third grid deadline (0.6) at interval 0.3, so the scheduler's
+      # own "while deadline < duration_sec" dispatches a 4th time (at
+      # 0.8999999999999999 itself is NOT < duration_sec of the exact
+      # same value, so only 3 fire) -- exercised here directly against
+      # a value just above the third deadline to prove the boundary is
+      # inclusive on the low side without relying on ceil at all.
+      result = _evaluate(
+         nodes=["a.example.org"], counter_totals={"a.example.org": 4},
+         duration_sec=0.91, counter_interval_sec=0.3)
+      node = result["thresholds"]["counter_coverage_per_node"]["a.example.org"]
+      assert node["expected_count"] == 4
+      assert node["met"] is True
+
+   def test_decimal_boundary_just_above_a_deadline_does_not_dispatch_again(self):
+      # duration_sec exactly equal to a grid deadline must not count
+      # that deadline itself (Scheduler's own "next_deadline >=
+      # end_time" stops BEFORE dispatching at end_time) -- duration
+      # 0.6 with interval 0.3 dispatches at 0.0 and 0.3 only (2), not
+      # a 3rd time at 0.6.
+      result = _evaluate(
+         nodes=["a.example.org"], counter_totals={"a.example.org": 2},
+         duration_sec=0.6, counter_interval_sec=0.3)
+      node = result["thresholds"]["counter_coverage_per_node"]["a.example.org"]
+      assert node["expected_count"] == 2
+      assert node["met"] is True
+
 
 # --------------------------------------------------------------------------
 # Minimum five valid samples per complete counter rollup
