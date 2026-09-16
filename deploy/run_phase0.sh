@@ -155,27 +155,68 @@ LOG_FILE="$LOG_DIR/phase0-$RUN_ID.log"
 # --------------------------------------------------------------------
 # Idempotent duplicate refusal.
 #
-# The lock file records ONE line: "<pid> <session_name>". A candidate
-# lock is only ever trusted as "still running" when BOTH of the
-# following hold -- never PID liveness alone, which is exactly the
-# pgrep-text-match failure mode this card explicitly forbids:
+# The lock file records EXACTLY one line, two whitespace-separated
+# fields: "<pid> <session_name>", where <session_name> always has the
+# shape "node-monitor-phase0-<launcher-pid>" this script itself always
+# writes. `_read_lock_fields` refuses to trust anything that does not
+# match that exact grammar (missing second field, non-numeric pid,
+# wrong session-name shape) -- a malformed or foreign lock file is
+# always treated as NOT a live daemon, never partially parsed.
+#
+# A well-formed lock is only ever trusted as "still running" when ALL
+# of the following hold -- never PID liveness alone, which is exactly
+# the pgrep-text-match failure mode this card explicitly forbids, and
+# never a generic "looks like node-monitor/screen" match, which would
+# accept an unrelated screen session or a recycled PID:
 #
 #   1. `kill -0 "$pid"` succeeds (the PID exists and is ours to signal
 #      -- a harmless existence probe, never a real signal).
-#   2. `ps -o command= -p "$pid"` still names a node-monitor/screen
-#      invocation for THIS session -- so a PID recycled by the OS onto
-#      an unrelated process after the daemon exited is never mistaken
-#      for a live duplicate.
+#   2. `ps -o command= -p "$pid"` shows THIS EXACT recorded session
+#      name as the `-dmS` argument screen was launched with -- not a
+#      substring match against a different invocation's own current
+#      $SESSION_NAME (which can never identify a PRIOR session) and
+#      not a loose `*node-monitor*`/`*screen*` match.
 # --------------------------------------------------------------------
-_lock_pid_is_live() {
-   local pid="$1"
+_read_lock_fields() {
+   # On success, sets LOCK_PID/LOCK_SESSION and returns 0. On any
+   # malformed content, clears both and returns 1 -- the caller must
+   # never treat a partially-parsed field as trustworthy.
+   LOCK_PID=""
+   LOCK_SESSION=""
+   local line field_count pid session suffix
+   line="$(head -n 1 "$1" 2>/dev/null || true)"
+   field_count="$(printf '%s\n' "$line" | awk '{print NF}')"
+   if [ "$field_count" != "2" ]; then
+      return 1
+   fi
+   pid="$(printf '%s\n' "$line" | awk '{print $1}')"
+   session="$(printf '%s\n' "$line" | awk '{print $2}')"
+   case "$pid" in
+      ''|*[!0-9]*) return 1 ;;
+   esac
+   case "$session" in
+      node-monitor-phase0-*)
+         suffix="${session#node-monitor-phase0-}"
+         case "$suffix" in
+            ''|*[!0-9]*) return 1 ;;
+         esac
+         ;;
+      *) return 1 ;;
+   esac
+   LOCK_PID="$pid"
+   LOCK_SESSION="$session"
+   return 0
+}
+
+_pid_matches_session() {
+   local pid="$1" session="$2"
    if ! kill -0 "$pid" 2>/dev/null; then
       return 1
    fi
    local cmd
    cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
    case "$cmd" in
-      *"$SESSION_NAME"*|*node-monitor*|*screen*)
+      *"-dmS $session "*|*"-dmS $session")
          return 0
          ;;
       *)
@@ -184,15 +225,67 @@ _lock_pid_is_live() {
    esac
 }
 
+# --------------------------------------------------------------------
+# Atomic launch-lock acquisition (`mkdir` is POSIX-atomic: exactly one
+# concurrent caller can ever create a given directory). This closes the
+# TOCTOU window between "check no live lock" and "write our own claim"
+# that previously let two invocations launched close together both
+# observe no lock and both launch a duplicate daemon. No dependency on
+# `flock`/`lockfile`, which are not guaranteed present on Polaris.
+# --------------------------------------------------------------------
+LOCK_CLAIM_DIR="$LOCK_FILE.claim"
+
+_release_claim() {
+   rm -rf "$LOCK_CLAIM_DIR" 2>/dev/null || true
+}
+
+_claim_lock() {
+   local attempt claimer_pid
+   for attempt in $(seq 1 100); do
+      if mkdir "$LOCK_CLAIM_DIR" 2>/dev/null; then
+         echo "$$" > "$LOCK_CLAIM_DIR/pid"
+         return 0
+      fi
+      # The claim dir already exists: either a concurrent invocation is
+      # actively racing us right now (expected, brief -- keep retrying),
+      # or a PREVIOUS invocation crashed while holding it and left it
+      # behind permanently. Only ever break the second case, and only
+      # by checking the actual claimer's own recorded pid via `kill -0`
+      # (an existence probe) -- never by directory age/mtime alone.
+      claimer_pid="$(cat "$LOCK_CLAIM_DIR/pid" 2>/dev/null || true)"
+      case "$claimer_pid" in
+         ''|*[!0-9]*) claimer_pid="" ;;
+      esac
+      if [ -n "$claimer_pid" ] && ! kill -0 "$claimer_pid" 2>/dev/null; then
+         rm -rf "$LOCK_CLAIM_DIR" 2>/dev/null || true
+         continue
+      fi
+      sleep 0.1
+   done
+   return 1
+}
+
+if ! _claim_lock; then
+   echo "run_phase0.sh: could not acquire the launch lock (contended by " \
+        "another invocation); claim dir: $LOCK_CLAIM_DIR" >&2
+   exit 1
+fi
+# Release the claim on every exit path (success, refusal, or error) --
+# this invocation's own foreground process is short-lived (it returns
+# once the launched screen session's pid is confirmed below), so the
+# claim is held only for that brief window, never for the daemon's
+# full run.
+trap _release_claim EXIT
+
 if [ -f "$LOCK_FILE" ]; then
-   existing_pid="$(awk '{print $1}' "$LOCK_FILE" 2>/dev/null || true)"
-   if [ -n "$existing_pid" ] && _lock_pid_is_live "$existing_pid"; then
+   if _read_lock_fields "$LOCK_FILE" && \
+         _pid_matches_session "$LOCK_PID" "$LOCK_SESSION"; then
       echo "run_phase0.sh: a Phase 0 daemon is already running " \
-           "(pid $existing_pid, lock file $LOCK_FILE)" >&2
+           "(pid $LOCK_PID, session $LOCK_SESSION, lock file $LOCK_FILE)" >&2
       exit 1
    fi
-   echo "run_phase0.sh: stale lock file found (pid $existing_pid no " \
-        "longer live); reclaiming $LOCK_FILE" >&2
+   echo "run_phase0.sh: stale or malformed lock file found; " \
+        "reclaiming $LOCK_FILE" >&2
    rm -f "$LOCK_FILE"
 fi
 
