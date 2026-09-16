@@ -281,6 +281,79 @@ class TestDaemonSmoke:
 
 
 # --------------------------------------------------------------------------
+# _config_to_raw: daemon smoke's config-reconstruction helper must
+# preserve every already-loaded node's ssh_target exactly (bug found
+# independently after t_88d97d8e merged at 41e7c64: _config_to_raw
+# rebuilt each node from only hostname/role, silently discarding a
+# configured remote ssh_target on every daemon smoke invocation).
+# --------------------------------------------------------------------------
+
+class TestConfigToRaw:
+   def _mixed_config(self, tmp_path, home_dir, remote_ssh_target):
+      raw = {
+         "system": "polaris",
+         "nodes": [
+            {"hostname": "ctr-local.example.org", "role": "local"},
+            {
+               "hostname": "ctr-remote.example.org",
+               "role": "remote",
+               "ssh_target": remote_ssh_target,
+            },
+         ],
+         "output_root": "~/phase0-runs",
+         "probe_python": _probe_python(),
+      }
+      os.makedirs(os.path.join(home_dir, "phase0-runs"), exist_ok=True)
+      return load_config(raw, home=home_dir)
+
+   def test_preserves_explicit_remote_ssh_target(self, tmp_path):
+      home_dir = str(tmp_path / "home")
+      os.makedirs(home_dir, exist_ok=True)
+      config = self._mixed_config(
+         tmp_path, home_dir, remote_ssh_target="polaris-login-01.head")
+
+      raw = cli_main._config_to_raw(config)
+
+      remote_raw = next(
+         n for n in raw["nodes"] if n["hostname"] == "ctr-remote.example.org")
+      assert remote_raw.get("ssh_target") == "polaris-login-01.head"
+      # Reloading the reconstructed raw mapping must reproduce the exact
+      # same effective_ssh_target -- not silently fall back to hostname.
+      reloaded = load_config(raw, home=home_dir)
+      reloaded_remote = next(
+         n for n in reloaded.nodes if n.hostname == "ctr-remote.example.org")
+      assert reloaded_remote.effective_ssh_target == "polaris-login-01.head"
+
+   def test_preserves_omission_when_ssh_target_is_none(self, tmp_path):
+      home_dir = str(tmp_path / "home")
+      os.makedirs(home_dir, exist_ok=True)
+      raw_config = {
+         "system": "polaris",
+         "nodes": [
+            {"hostname": "ctr-local.example.org", "role": "local"},
+            {"hostname": "ctr-remote.example.org", "role": "remote"},
+         ],
+         "output_root": "~/phase0-runs",
+         "probe_python": _probe_python(),
+      }
+      os.makedirs(os.path.join(home_dir, "phase0-runs"), exist_ok=True)
+      config = load_config(raw_config, home=home_dir)
+
+      raw = cli_main._config_to_raw(config)
+
+      remote_raw = next(
+         n for n in raw["nodes"] if n["hostname"] == "ctr-remote.example.org")
+      assert "ssh_target" not in remote_raw
+      # Reloading must not reject the reconstructed mapping (a stray
+      # ssh_target=None key would fail _validate_node's non-empty-string
+      # check) and must fall back to hostname exactly as before.
+      reloaded = load_config(raw, home=home_dir)
+      reloaded_remote = next(
+         n for n in reloaded.nodes if n.hostname == "ctr-remote.example.org")
+      assert reloaded_remote.effective_ssh_target == "ctr-remote.example.org"
+
+
+# --------------------------------------------------------------------------
 # validate-run: structural artifact validation over a completed run dir
 # --------------------------------------------------------------------------
 
