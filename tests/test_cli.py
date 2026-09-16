@@ -54,7 +54,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "fixtures"))
 
 import fake_proc  # noqa: E402
 
+from node_monitor.cli import main as cli_main  # noqa: E402
 from node_monitor.cli.main import cli  # noqa: E402
+from node_monitor.collector import transport  # noqa: E402
+from node_monitor.config import load_config  # noqa: E402
 from node_monitor.output.jsonl import validate_jsonl_artifact  # noqa: E402
 
 
@@ -337,3 +340,220 @@ class TestUsesRealArtifactValidator:
       from node_monitor.output import jsonl as jsonl_mod
 
       assert validate_jsonl_artifact is jsonl_mod.validate_jsonl_artifact
+
+
+# --------------------------------------------------------------------------
+# validate-run: DONE + truncated final line must fail (review round 1
+# finding #2, kanban task t_3d9d7387). A truncated final line without a
+# DONE flag is unaffected -- DONE absence already fails on its own.
+# --------------------------------------------------------------------------
+
+class TestValidateRunDonePlusTruncated:
+   def test_done_with_truncated_final_line_fails(self, tmp_path):
+      run_dir = tmp_path / "phase0-truncated-1"
+      run_dir.mkdir()
+      (run_dir / "DONE").write_text("2026-01-01T00:00:00Z\n")
+      # No trailing newline on the final line -- exactly what
+      # validate_jsonl_artifact's own truncated_final_line=True case
+      # detects (see node_monitor/output/jsonl.py).
+      (run_dir / "x.jsonl").write_bytes(
+         b'{"ok":1}\n{"broken":')
+
+      result = _invoke(["validate-run", str(run_dir)])
+
+      assert result.exit_code != 0, result.output
+      assert "truncated" in result.output.lower()
+      assert "done" in result.output.lower()
+
+   def test_truncated_final_line_without_done_still_fails_on_done_alone(
+         self, tmp_path):
+      """Sanity: a truncated line with no DONE flag was already an
+      INVALID run before this fix (missing DONE), and remains one --
+      this fix must not weaken that pre-existing, unrelated check.
+      """
+      run_dir = tmp_path / "phase0-truncated-2"
+      run_dir.mkdir()
+      (run_dir / "x.jsonl").write_bytes(b'{"ok":1}\n{"broken":')
+
+      result = _invoke(["validate-run", str(run_dir)])
+
+      assert result.exit_code != 0, result.output
+      assert "done" in result.output.lower()
+
+   def test_truncated_without_malformed_and_without_done_reports_truncated_but_not_malformed(
+         self, tmp_path):
+      """Confirms validate-run still surfaces the underlying
+      truncated_final_line=True detail even though this file has zero
+      OTHER malformed lines -- proving the new DONE+truncated failure
+      is a distinct check from the pre-existing malformed-line check.
+      """
+      run_dir = tmp_path / "phase0-truncated-3"
+      run_dir.mkdir()
+      (run_dir / "x.jsonl").write_bytes(b'{"ok":1}\n{"broken":')
+
+      result = _invoke(["validate-run", str(run_dir)])
+
+      assert "truncated_final_line=True" in result.output
+      assert "malformed=0" in result.output
+
+
+# --------------------------------------------------------------------------
+# Mixed local/remote transport dispatch (review round 1 finding #1,
+# kanban task t_3d9d7387): the CLI must wire local nodes to
+# collector.transport.run_local_probe and remote nodes to
+# collector.transport.run_remote_probe -- never reject a config
+# declaring a remote node. Exercised directly against
+# ``cli_main._make_transport_fn`` (not a full Daemon.run()) with
+# ``collector.transport``'s own run_local_probe/run_remote_probe
+# monkeypatched -- exactly what the card allows ("tests may monkeypatch
+# transport only where needed to avoid network") -- so these tests
+# never touch a real network or a real login node.
+# --------------------------------------------------------------------------
+
+class TestMixedTransportDispatch:
+   def _config(self, tmp_path, home_dir):
+      raw = {
+         "system": "polaris",
+         "nodes": [
+            {"hostname": "dispatch-local.example.org", "role": "local"},
+            {"hostname": "dispatch-remote.example.org", "role": "remote"},
+         ],
+         "output_root": "~/phase0-runs",
+         "probe_python": _probe_python(),
+         "ssh_connect_timeout_sec": 4,
+      }
+      os.makedirs(os.path.join(home_dir, "phase0-runs"), exist_ok=True)
+      return load_config(raw, home=home_dir)
+
+   def test_local_node_dispatches_to_run_local_probe(
+         self, tmp_path, monkeypatch):
+      home_dir = str(tmp_path / "home")
+      os.makedirs(home_dir, exist_ok=True)
+      config = self._config(tmp_path, home_dir)
+
+      calls = {"local": None, "remote": None}
+
+      async def fake_run_local_probe(**kwargs):
+         calls["local"] = kwargs
+         return transport.ProbeResult(
+            payload={"loop": kwargs["loop"], "probe_version": 4,
+                     "hostname_fqdn": "dispatch-local.example.org"},
+            exit_code=0, stdout_bytes=10, stderr="", stderr_truncated=False,
+            wall_seconds=0.01)
+
+      async def fake_run_remote_probe(**kwargs):
+         calls["remote"] = kwargs
+         raise AssertionError("run_remote_probe must not be called for a local node")
+
+      monkeypatch.setattr(cli_main.transport, "run_local_probe", fake_run_local_probe)
+      monkeypatch.setattr(cli_main.transport, "run_remote_probe", fake_run_remote_probe)
+
+      transport_fn = cli_main._make_transport_fn(config, probe_version=4)
+      local_node = config.local_node
+
+      import asyncio
+      result = asyncio.run(transport_fn(local_node, "counter"))
+
+      assert calls["local"] is not None
+      assert calls["remote"] is None
+      assert calls["local"]["probe_python"] == config.probe_python
+      assert calls["local"]["expected_probe_version"] == 4
+      assert result.payload["hostname_fqdn"] == "dispatch-local.example.org"
+
+   def test_remote_node_dispatches_to_run_remote_probe(
+         self, tmp_path, monkeypatch):
+      home_dir = str(tmp_path / "home")
+      os.makedirs(home_dir, exist_ok=True)
+      config = self._config(tmp_path, home_dir)
+
+      calls = {"local": None, "remote": None}
+
+      async def fake_run_local_probe(**kwargs):
+         calls["local"] = kwargs
+         raise AssertionError("run_local_probe must not be called for a remote node")
+
+      async def fake_run_remote_probe(**kwargs):
+         calls["remote"] = kwargs
+         return transport.ProbeResult(
+            payload={"loop": kwargs["loop"], "probe_version": 4,
+                     "hostname_fqdn": kwargs["hostname"]},
+            exit_code=0, stdout_bytes=10, stderr="", stderr_truncated=False,
+            wall_seconds=0.01)
+
+      monkeypatch.setattr(cli_main.transport, "run_local_probe", fake_run_local_probe)
+      monkeypatch.setattr(cli_main.transport, "run_remote_probe", fake_run_remote_probe)
+
+      transport_fn = cli_main._make_transport_fn(config, probe_version=4)
+      remote_node = config.remote_nodes[0]
+
+      import asyncio
+      result = asyncio.run(transport_fn(remote_node, "census"))
+
+      assert calls["remote"] is not None
+      assert calls["local"] is None
+      assert calls["remote"]["hostname"] == "dispatch-remote.example.org"
+      assert calls["remote"]["expected_fqdn"] == "dispatch-remote.example.org"
+      assert calls["remote"]["connect_timeout_sec"] == config.ssh_connect_timeout_sec
+      # Project-owned SSH config, never the operator's ~/.ssh/config.
+      assert calls["remote"]["ssh_config_path"].startswith(config.output_root)
+      assert os.path.exists(calls["remote"]["ssh_config_path"])
+      assert result.payload["hostname_fqdn"] == "dispatch-remote.example.org"
+
+   def test_remote_probe_failure_propagates(self, tmp_path, monkeypatch):
+      """A remote transport failure (e.g. SSH auth/timeout) must
+      propagate out of transport_fn unchanged -- Daemon._poll_fn's own
+      existing failure handling (already tested at the Daemon level)
+      is what turns this into a recorded node_poll_failures/
+      node_collection_log entry; this CLI layer must not swallow or
+      transform it.
+      """
+      home_dir = str(tmp_path / "home")
+      os.makedirs(home_dir, exist_ok=True)
+      config = self._config(tmp_path, home_dir)
+
+      async def fake_run_remote_probe(**kwargs):
+         raise transport.SSHAuthError("ssh failed (exit 255): permission denied")
+
+      monkeypatch.setattr(cli_main.transport, "run_remote_probe", fake_run_remote_probe)
+
+      transport_fn = cli_main._make_transport_fn(config, probe_version=4)
+      remote_node = config.remote_nodes[0]
+
+      import asyncio
+      with pytest.raises(transport.SSHAuthError):
+         asyncio.run(transport_fn(remote_node, "counter"))
+
+
+# --------------------------------------------------------------------------
+# Quarantine boundary (review round 1 finding #3, kanban task
+# t_3d9d7387): the CLI must never import node_monitor.collector.
+# remote_probe at runtime (README.md: "never imported by the daemon").
+# --------------------------------------------------------------------------
+
+class TestRemoteProbeQuarantine:
+   def test_cli_main_module_does_not_import_remote_probe(self):
+      assert not hasattr(cli_main, "PROBE_VERSION")
+      assert "node_monitor.collector.remote_probe" not in {
+         name for name in dir(cli_main) if not name.startswith("_")}
+
+   def test_remote_probe_not_in_cli_main_globals(self):
+      import node_monitor.collector.remote_probe as remote_probe_mod
+
+      # cli_main must never hold a reference to the quarantined module
+      # or any of its members under any name.
+      for value in vars(cli_main).values():
+         assert value is not remote_probe_mod
+
+   def test_resolve_probe_version_uses_subprocess_not_import(self, tmp_path):
+      """_resolve_probe_version must obtain PROBE_VERSION by executing
+      the shipped probe's own --version contract as a subprocess, and
+      must return the same integer the real probe module reports --
+      without this test module itself needing to import remote_probe
+      for anything other than reading its PROBE_VERSION to compare
+      against (never invoked as part of the CLI's own runtime).
+      """
+      import node_monitor.collector.remote_probe as remote_probe_mod
+
+      version = cli_main._resolve_probe_version(_probe_python())
+
+      assert version == remote_probe_mod.PROBE_VERSION

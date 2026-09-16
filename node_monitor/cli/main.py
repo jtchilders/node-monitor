@@ -7,9 +7,10 @@ PLANNING.md section 15 ("CLI surface"):
 ``node-monitor daemon dry-run --out FILE  # Phase 0: JSON to file, no DB``.
 
 This module is intentionally thin: it resolves a strict
-``node_monitor.config.Phase0Config``, wires the real local-invocation
-transport (``node_monitor.collector.transport.run_local_probe``) and a
-real ``node_monitor.output.jsonl.Phase0Sink`` into a
+``node_monitor.config.Phase0Config``, wires the real transport
+(``node_monitor.collector.transport.run_local_probe``/
+``run_remote_probe``, dispatched per node by role) and a real
+``node_monitor.output.jsonl.Phase0Sink`` into a
 ``node_monitor.daemon.Daemon``, runs it to completion, and maps its
 exit code straight through to the process exit code. No orchestration,
 retry, or scheduling policy of its own -- every one of those already
@@ -18,14 +19,19 @@ never invent a parallel path around them (card: "Clarify command
 behavior from the authoritative design/plan and existing APIs rather
 than inventing parallel orchestration").
 
-Scope for THIS increment (Task 7 CLI split): local-node-only end-to-end
-execution. Every configured node must be local (``role: local``) --
-remote/SSH fan-out wiring (``collector.transport.run_remote_probe``,
-per-node SSH config/control-directory setup) is out of scope here and
-is rejected up front with a clear diagnostic rather than silently
-skipping remote nodes or half-wiring SSH. This mirrors the design's own
-scope note ("this increment adds ... CLI ... wiring") and the plan's
-explicit deferral of deploy/docs to Task 8.
+Mixed local/remote dispatch (review round 1 fix, kanban task
+t_3d9d7387): every configured local node (``role: local``) is polled
+via the existing ``collector.transport.run_local_probe``; every
+configured remote node (``role: remote``) is polled via the existing
+``collector.transport.run_remote_probe`` over a project-owned SSH
+config/control directory (``collector.transport.write_ssh_config`` --
+never the operator's interactive ``~/.ssh/config``), with
+``BatchMode=yes``/``ConnectTimeout`` already baked into that generated
+config and ``expected_fqdn=node.hostname`` enforced per poll (design:
+"SSH aliases are transport identifiers only, never provenance").
+Which transport a given ``(node, loop)`` poll uses is decided purely
+by ``node.is_local`` inside ``_make_transport_fn`` -- no separate
+code path, and no upfront rejection of remote nodes.
 
 ``daemon dry-run`` / ``daemon smoke`` share one internal implementation
 (``_run_daemon``): ``smoke`` is exactly ``dry-run`` with one additional,
@@ -40,13 +46,13 @@ bounded-duration variant of the same run, not a different code path.
 
 import asyncio
 import os
+import subprocess
 import sys
 
 import click
 import yaml
 
 from node_monitor.collector import transport
-from node_monitor.collector.remote_probe import PROBE_VERSION
 from node_monitor.config import ConfigError, load_config
 from node_monitor.daemon import EXIT_OK, Daemon
 from node_monitor.output.jsonl import (
@@ -56,16 +62,18 @@ from node_monitor.output.jsonl import (
    validate_jsonl_artifact,
 )
 
-# node_monitor/collector/remote_probe.py's own local-invocation path,
-# passed to transport.run_local_probe as the interpreter that runs it.
-# The daemon never imports remote_probe.py's module body for its own
-# behavior (README.md: "never imported by the daemon" -- that
-# constraint is about the DAEMON's runtime import graph on a login
-# node, not about a CLI-only constant); PROBE_VERSION is read here
-# purely to pass the exact same expected version transport.py's own
-# validate_probe_payload() already enforces per poll, so a probe/CLI
-# version skew fails loudly as a validation error instead of silently
-# comparing against a duplicated literal that could drift.
+# node_monitor/collector/remote_probe.py -- the ONLY probe binary this CLI
+# ever invokes, for both local nodes (by path, see _make_transport_fn) and
+# remote nodes (this same file piped over SSH stdin). This module must
+# never import that file as a Python module: README.md's "never imported
+# by the daemon" is exactly this CLI's own runtime import graph, not just
+# a future daemon process's -- the probe is quarantined at Python 3.6 and
+# is only ever imported by its own test suite. The expected probe_version
+# transport.validate_probe_payload() enforces per poll is instead obtained
+# by actually executing the shipped probe's own ``--version`` contract as
+# a subprocess (see _resolve_probe_version) -- never by reading
+# node_monitor.collector.remote_probe.PROBE_VERSION off an imported
+# module object.
 _REMOTE_PROBE_SCRIPT_PATH = os.path.join(
    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
    "collector", "remote_probe.py")
@@ -106,21 +114,38 @@ def _load_config_or_exit(config_path, home):
       _exit(1, "invalid configuration: %s" % (exc,), err=True)
 
 
-def _require_local_only(config):
-   """This CLI increment only wires the local-invocation transport
-   (see module docstring's scope note) -- reject a config declaring
-   any remote node up front with a clear diagnostic, rather than
-   silently never polling it or crashing deep inside a missing SSH
-   wiring path.
+def _resolve_probe_version(probe_python):
+   """Obtain the shipped probe's expected ``probe_version`` WITHOUT
+   ever importing ``node_monitor.collector.remote_probe`` as a Python
+   module (README.md: "never imported by the daemon"; the probe is
+   quarantined at Python 3.6 and this CLI must never pull it into its
+   own 3.9+ runtime import graph). Instead, this executes the shipped
+   probe script's own documented ``--version`` contract
+   (``remote_probe.py``'s ``_parse_args``: writes the integer
+   ``PROBE_VERSION`` to stdout and exits 0) as a real, short-lived,
+   argument-only subprocess -- using ``config.probe_python`` itself so
+   the very same interpreter that will run every real poll is what
+   answers this version query, and a genuinely broken/incompatible
+   interpreter fails loudly here rather than 24 hours into a canary.
    """
-   remote = [node.hostname for node in config.remote_nodes]
-   if remote:
-      _exit(
-         1,
-         "this CLI increment only supports local-node execution; "
-         "remove remote node(s) from config or run a future release: "
-         "%s" % ", ".join(remote),
-         err=True)
+   try:
+      result = subprocess.run(
+         [probe_python, _REMOTE_PROBE_SCRIPT_PATH, "--version"],
+         capture_output=True, text=True, timeout=30)
+   except OSError as exc:
+      _exit(1, "could not execute probe_python %r to resolve the "
+                "expected probe version: %s" % (probe_python, exc),
+            err=True)
+      return  # pragma: no cover -- _exit always raises SystemExit
+   if result.returncode != 0:
+      _exit(1, "probe --version exited %d: %s"
+                % (result.returncode, result.stderr.strip()), err=True)
+      return  # pragma: no cover
+   try:
+      return int(result.stdout.strip())
+   except ValueError:
+      _exit(1, "probe --version did not print an integer: %r"
+                % (result.stdout,), err=True)
 
 
 def _print_status(config, config_path, run_dir):
@@ -132,43 +157,86 @@ def _print_status(config, config_path, run_dir):
    click.echo("duration_sec: %s" % config.duration_sec)
 
 
-def _make_local_transport_fn(config):
+def _make_transport_fn(config, probe_version):
    """Build the ``transport_fn(node, loop)`` callable ``Daemon`` expects,
-   wired to the REAL ``collector.transport.run_local_probe`` for every
-   configured (already validated all-local, see ``_require_local_only``)
-   node -- never a test double. Returns a ``collector.transport.
-   ProbeResult`` (not a plain payload dict), which ``Daemon._poll_fn``'s
-   own ``_normalize_probe_result`` boundary already unwraps.
+   dispatching each poll to the REAL production transport for that
+   node's configured role -- never a test double, never a single
+   local-only path. Local nodes (``node.is_local``) go through
+   ``collector.transport.run_local_probe`` exactly as before; remote
+   nodes go through the existing ``collector.transport.run_remote_probe``
+   over a project-owned SSH config/control directory this function
+   creates once via ``collector.transport.write_ssh_config`` (never the
+   operator's interactive ``~/.ssh/config`` -- design/PLANNING.md 4.3),
+   with ``BatchMode=yes``/``ConnectTimeout`` already baked into that
+   generated config and passed again explicitly on the ssh command line
+   (``build_remote_argv``'s own belt-and-suspenders contract). Every
+   remote poll validates ``expected_fqdn=node.hostname`` -- the
+   configured SSH alias this daemon dialed -- against the probe's own
+   remote-reported FQDN, catching a fan-out that silently probed the
+   same physical host twice under two different aliases.
+
+   Returns a ``collector.transport.ProbeResult`` (not a plain payload
+   dict) either way, which ``Daemon._poll_fn``'s own
+   ``_normalize_probe_result`` boundary already unwraps.
    """
    hard_timeout_sec = max(
       config.counter_timeout_sec, config.census_timeout_sec
    ) + _HARD_TIMEOUT_GRACE_SEC
 
-   async def transport_fn(node, loop):
+   ssh_dir = os.path.join(config.output_root, "ssh")
+   os.makedirs(ssh_dir, exist_ok=True)
+   ssh_config_path = transport.write_ssh_config(
+      os.path.join(ssh_dir, "config"),
+      os.path.join(ssh_dir, "control"),
+      config.ssh_connect_timeout_sec)
+
+   # Read once, up front, so N concurrent remote polls across the run
+   # never each re-read the probe source off disk -- mirrors
+   # run_remote_probe's own docstring contract for probe_script_source.
+   with open(_REMOTE_PROBE_SCRIPT_PATH, "rb") as handle:
+      probe_script_source = handle.read()
+
+   def _max_seconds_for(loop):
       if loop == "counter":
-         max_seconds = config.counter_timeout_sec
-      elif loop == "census":
-         max_seconds = config.census_timeout_sec
-      else:
-         # hwinfo: one-shot pre-scheduler collection (Daemon._collect_
-         # hardware) -- reuse the census timeout as a generous-enough
-         # one-shot budget rather than inventing a fourth config knob
-         # this increment's card does not ask for.
-         max_seconds = config.census_timeout_sec
-      return await transport.run_local_probe(
+         return config.counter_timeout_sec
+      if loop == "census":
+         return config.census_timeout_sec
+      # hwinfo: one-shot pre-scheduler collection (Daemon._collect_
+      # hardware) -- reuse the census timeout as a generous-enough
+      # one-shot budget rather than inventing a fourth config knob
+      # this increment's card does not ask for.
+      return config.census_timeout_sec
+
+   async def transport_fn(node, loop):
+      max_seconds = _max_seconds_for(loop)
+      if node.is_local:
+         return await transport.run_local_probe(
+            probe_python=config.probe_python,
+            probe_script_path=_REMOTE_PROBE_SCRIPT_PATH,
+            loop=loop,
+            probe_max_seconds=max_seconds,
+            hard_timeout_sec=hard_timeout_sec,
+            expected_probe_version=probe_version,
+            expected_fqdn=None,
+         )
+      return await transport.run_remote_probe(
+         ssh_binary="ssh",
+         ssh_config_path=ssh_config_path,
+         connect_timeout_sec=config.ssh_connect_timeout_sec,
+         hostname=node.hostname,
          probe_python=config.probe_python,
-         probe_script_path=_REMOTE_PROBE_SCRIPT_PATH,
+         probe_script_source=probe_script_source,
          loop=loop,
          probe_max_seconds=max_seconds,
          hard_timeout_sec=hard_timeout_sec,
-         expected_probe_version=PROBE_VERSION,
-         expected_fqdn=None,
+         expected_probe_version=probe_version,
+         expected_fqdn=node.hostname,
       )
 
    return transport_fn
 
 
-def _run_daemon(config, config_path, run_id):
+def _run_daemon(config, config_path, run_id, probe_version):
    output_root = config.output_root
    os.makedirs(output_root, exist_ok=True)
    sink = Phase0Sink(
@@ -178,7 +246,7 @@ def _run_daemon(config, config_path, run_id):
 
    _print_status(config, config_path, run_dir)
 
-   daemon = Daemon(config, sink, _make_local_transport_fn(config))
+   daemon = Daemon(config, sink, _make_transport_fn(config, probe_version))
    exit_code = asyncio.run(daemon.run())
    if exit_code == EXIT_OK:
       click.echo("run complete: %s" % run_dir)
@@ -219,10 +287,10 @@ def daemon_dry_run(config_path, home, run_id):
    """
    home = home if home is not None else os.path.expanduser("~")
    config = _load_config_or_exit(config_path, home)
-   _require_local_only(config)
+   probe_version = _resolve_probe_version(config.probe_python)
    if run_id is None:
       run_id = _default_run_id()
-   exit_code = _run_daemon(config, config_path, run_id)
+   exit_code = _run_daemon(config, config_path, run_id, probe_version)
    sys.exit(exit_code)
 
 
@@ -251,13 +319,13 @@ def daemon_smoke(config_path, home, run_id, duration_sec):
             err=True)
    home = home if home is not None else os.path.expanduser("~")
    config = _load_config_or_exit(config_path, home)
-   _require_local_only(config)
+   probe_version = _resolve_probe_version(config.probe_python)
    raw_override = _config_to_raw(config)
    raw_override["duration_sec"] = duration_sec
    config = load_config(raw_override, home=home)
    if run_id is None:
       run_id = _default_run_id()
-   exit_code = _run_daemon(config, config_path, run_id)
+   exit_code = _run_daemon(config, config_path, run_id, probe_version)
    sys.exit(exit_code)
 
 
@@ -268,12 +336,16 @@ def validate_run(run_dir):
 
    Checks: the run directory exists, every production/diagnostic JSONL
    file present validates with zero malformed lines (a truncated FINAL
-   line is reported but does not by itself fail validation -- exactly
-   ``node_monitor.output.jsonl.validate_jsonl_artifact``'s own
-   truncated-vs-malformed distinction), and a ``DONE`` flag is present
-   (design: "DONE is written only after summary finalization" -- its
-   absence means the run never cleanly finished, which this command
-   must not silently accept as valid).
+   line is reported and, on its own with no DONE flag present, does
+   not by itself fail validation -- but see below), and a ``DONE``
+   flag is present (design: "DONE is written only after summary
+   finalization" -- its absence means the run never cleanly finished,
+   which this command must not silently accept as valid). A DONE flag
+   present together with ANY truncated final line also fails: DONE
+   implies ``finalize_summary()`` already closed/fsynced every JSONL
+   file, so a legitimately DONE-marked run can never contain a
+   truncated line (design: DONE + truncated is a corrupted-artifact
+   contradiction, not a valid completed run).
    """
    abs_run_dir = os.path.abspath(run_dir)
    if not os.path.isdir(abs_run_dir):
@@ -284,6 +356,7 @@ def validate_run(run_dir):
 
    problems = []
    any_file_checked = False
+   any_truncated = False
    for filename in sorted(os.listdir(abs_run_dir)):
       if not filename.endswith(".jsonl"):
          continue
@@ -298,12 +371,29 @@ def validate_run(run_dir):
          problems.append(
             "%s has %d malformed line(s)"
             % (filename, result["malformed_count"]))
+      if result["truncated_final_line"]:
+         any_truncated = True
 
    done_path = os.path.join(abs_run_dir, "DONE")
    done_present = os.path.exists(done_path)
    click.echo("DONE present: %s" % done_present)
    if not done_present:
       problems.append("DONE flag is missing -- run did not finalize cleanly")
+   elif any_truncated:
+      # Design: PHASE0_DAEMON_DESIGN.md's own DONE contract -- "DONE is
+      # written only after summary finalization", and finalize_summary()
+      # closes/fsyncs every open JSONL handle before that write happens
+      # (node_monitor.output.jsonl.Phase0Sink.finalize_summary). A run
+      # that legitimately reached DONE therefore cannot contain a
+      # truncated final line; one that does is proof of a corrupted
+      # artifact or a DONE flag left over from an unrelated/earlier
+      # run in this same directory, not a clean completion. Reporting
+      # this as valid (review round 1 finding #2, kanban task
+      # t_3d9d7387) is a false-positive validator result.
+      problems.append(
+         "DONE is present but at least one .jsonl artifact has a "
+         "truncated final line -- a DONE-marked run cannot legitimately "
+         "contain a truncated line")
 
    if not any_file_checked:
       problems.append("no .jsonl artifact files found in run directory")
