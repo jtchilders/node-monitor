@@ -101,10 +101,17 @@ touching PostgreSQL/`pbs_monitor`:
     deploy/check_phase0.sh
 
 `run_phase0.sh` refuses to launch a duplicate while a prior invocation's
-daemon is still alive (tracked via a self-authored lock file plus a
-PID + process-identity check -- never a `pgrep` text match, and never a
-signal stronger than the harmless `kill -0` existence probe) and reclaims the
-lock once that prior daemon has genuinely exited. `check_phase0.sh` is
-read-only: it reports whether a daemon is currently running and, once
-finished, runs `node-monitor validate-run` against the most recent run
-directory. See `--help` on either script for the full flag list.
+daemon is still alive (tracked via a self-authored lock file recording the
+exact PID + screen session name, atomically claimed so two concurrent
+launches can never both succeed; a candidate lock is trusted only when its
+PID is alive AND `ps -o command=` shows that exact recorded session name --
+never a `pgrep` text match, a generic node-monitor/screen substring match,
+or a signal stronger than the harmless `kill -0` existence probe) and
+reclaims the lock once that prior daemon has genuinely exited or the lock
+is malformed. `check_phase0.sh` is read-only: it reports whether a daemon
+is currently running and, once finished, runs `node-monitor validate-run`
+against a run directory -- by default the most recent one under
+`$HOME/phase0-runs`, or an explicit `--output-root DIR` (when the config
+used a non-default `output_root`) or `--run-dir DIR` (to validate one exact
+run directory directly). See `--help` on either script for the full flag
+list.
