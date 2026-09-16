@@ -411,12 +411,16 @@ class TestValidateRunDonePlusTruncated:
 # --------------------------------------------------------------------------
 
 class TestMixedTransportDispatch:
-   def _config(self, tmp_path, home_dir):
+   def _config(self, tmp_path, home_dir, remote_ssh_target=None):
+      remote_node = {
+         "hostname": "dispatch-remote.example.org", "role": "remote"}
+      if remote_ssh_target is not None:
+         remote_node["ssh_target"] = remote_ssh_target
       raw = {
          "system": "polaris",
          "nodes": [
             {"hostname": "dispatch-local.example.org", "role": "local"},
-            {"hostname": "dispatch-remote.example.org", "role": "remote"},
+            remote_node,
          ],
          "output_root": "~/phase0-runs",
          "probe_python": _probe_python(),
@@ -492,12 +496,46 @@ class TestMixedTransportDispatch:
       assert calls["remote"] is not None
       assert calls["local"] is None
       assert calls["remote"]["hostname"] == "dispatch-remote.example.org"
-      assert calls["remote"]["expected_fqdn"] == "dispatch-remote.example.org"
+      # kanban t_88d97d8e: the per-call transport.validate_probe_payload
+      # alias-equals-FQDN check was itself the Problem 2 bug (a legitimate
+      # ssh_target/alias never equals the probe's self-reported FQDN) --
+      # _make_transport_fn now always passes expected_fqdn=None; the real
+      # consistency/uniqueness checks live in Daemon itself (see
+      # tests/test_daemon.py TestFqdnConsistencyAndUniqueness).
+      assert calls["remote"]["expected_fqdn"] is None
       assert calls["remote"]["connect_timeout_sec"] == config.ssh_connect_timeout_sec
       # Project-owned SSH config, never the operator's ~/.ssh/config.
       assert calls["remote"]["ssh_config_path"].startswith(config.output_root)
       assert os.path.exists(calls["remote"]["ssh_config_path"])
       assert result.payload["hostname_fqdn"] == "dispatch-remote.example.org"
+
+   def test_remote_node_uses_explicit_ssh_target_but_preserves_reported_fqdn(
+         self, tmp_path, monkeypatch):
+      home_dir = str(tmp_path / "home")
+      os.makedirs(home_dir, exist_ok=True)
+      config = self._config(
+         tmp_path, home_dir, remote_ssh_target="polaris-login-01.head")
+      calls = []
+
+      async def fake_run_remote_probe(**kwargs):
+         calls.append(kwargs)
+         return transport.ProbeResult(
+            payload={"loop": kwargs["loop"], "probe_version": 4,
+                     "hostname_fqdn":
+                        "polaris-login-01.hsn.cm.polaris.alcf.anl.gov"},
+            exit_code=0, stdout_bytes=10, stderr="", stderr_truncated=False,
+            wall_seconds=0.01)
+
+      monkeypatch.setattr(cli_main.transport, "run_remote_probe", fake_run_remote_probe)
+      transport_fn = cli_main._make_transport_fn(config, probe_version=4)
+
+      import asyncio
+      result = asyncio.run(transport_fn(config.remote_nodes[0], "counter"))
+
+      assert calls[0]["hostname"] == "polaris-login-01.head"
+      assert calls[0]["expected_fqdn"] is None
+      assert result.payload["hostname_fqdn"] == \
+         "polaris-login-01.hsn.cm.polaris.alcf.anl.gov"
 
    def test_remote_probe_failure_propagates(self, tmp_path, monkeypatch):
       """A remote transport failure (e.g. SSH auth/timeout) must

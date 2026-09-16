@@ -247,6 +247,71 @@ class TestSchema:
 
 
 # --------------------------------------------------------------------------
+# ssh_target: optional per-node transport-only alias (kanban t_88d97d8e).
+# Design: "SSH aliases are transport identifiers only, never provenance" --
+# hostname stays the bookkeeping identity everywhere; ssh_target, when
+# present, is ONLY the literal host argument handed to ssh(1).
+# --------------------------------------------------------------------------
+
+class TestSshTarget:
+   def test_ssh_target_omitted_defaults_to_hostname(self):
+      cfg = _load(nodes=[
+         {"hostname": "polaris-login-04.example.org", "role": "local"},
+         {"hostname": "polaris-login-01.hsn.cm.polaris.alcf.anl.gov",
+          "role": "remote"},
+      ])
+      remote = cfg.remote_nodes[0]
+      assert remote.ssh_target is None
+      assert remote.effective_ssh_target == remote.hostname
+
+   def test_explicit_ssh_target_on_remote_node_accepted(self):
+      cfg = _load(nodes=[
+         {"hostname": "polaris-login-04.example.org", "role": "local"},
+         {"hostname": "polaris-login-01.hsn.cm.polaris.alcf.anl.gov",
+          "role": "remote", "ssh_target": "polaris-login-01.head"},
+      ])
+      remote = cfg.remote_nodes[0]
+      assert remote.hostname == "polaris-login-01.hsn.cm.polaris.alcf.anl.gov"
+      assert remote.ssh_target == "polaris-login-01.head"
+      assert remote.effective_ssh_target == "polaris-login-01.head"
+
+   def test_ssh_target_on_local_node_rejected(self):
+      with pytest.raises(ConfigError, match="ssh_target"):
+         _load(nodes=[
+            {"hostname": "polaris-login-04.example.org", "role": "local",
+             "ssh_target": "polaris-login-04.head"},
+         ])
+
+   def test_ssh_target_empty_string_rejected(self):
+      with pytest.raises(ConfigError):
+         _load(nodes=[
+            {"hostname": "polaris-login-04.example.org", "role": "local"},
+            {"hostname": "polaris-login-01.example.org", "role": "remote",
+             "ssh_target": ""},
+         ])
+
+   def test_ssh_target_non_string_rejected(self):
+      with pytest.raises(ConfigError):
+         _load(nodes=[
+            {"hostname": "polaris-login-04.example.org", "role": "local"},
+            {"hostname": "polaris-login-01.example.org", "role": "remote",
+             "ssh_target": 12345},
+         ])
+
+   def test_unknown_key_still_rejected_alongside_ssh_target(self):
+      """ssh_target being a newly-allowed key must not accidentally widen
+      the allow-list to anything else -- a genuinely unknown key must
+      still be rejected even on a node entry that also sets ssh_target.
+      """
+      with pytest.raises(ConfigError, match="unknown"):
+         _load(nodes=[
+            {"hostname": "polaris-login-04.example.org", "role": "local"},
+            {"hostname": "polaris-login-01.example.org", "role": "remote",
+             "ssh_target": "polaris-login-01.head", "ip": "1.2.3.4"},
+         ])
+
+
+# --------------------------------------------------------------------------
 # config.example.yaml must actually satisfy the strict schema it ships as
 # a corrected public example for -- catches drift between the loader and
 # the example the moment either one changes.
@@ -261,3 +326,15 @@ class TestExampleConfig:
       assert cfg.system == "polaris"
       assert cfg.local_node is not None
       assert len(cfg.remote_nodes) >= 1
+
+   def test_example_config_polaris_remote_nodes_use_head_ssh_target(self):
+      path = os.path.join(_REPO_ROOT, "config.example.yaml")
+      with open(path, "r") as handle:
+         raw = yaml.safe_load(handle)
+      cfg = load_config(raw, home="/home/example-user")
+      for node in cfg.remote_nodes:
+         assert node.ssh_target is not None
+         assert node.ssh_target.endswith(".head")
+         assert node.effective_ssh_target == node.ssh_target
+         # hostname itself stays the descriptive fqdn, never the alias.
+         assert not node.hostname.endswith(".head")

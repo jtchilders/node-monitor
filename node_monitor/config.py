@@ -20,6 +20,7 @@ it mid-run.
 import dataclasses
 import os
 import re
+import typing
 
 import yaml
 
@@ -58,7 +59,12 @@ _POSITIVE_NUMBER_KEYS = (
 )
 
 _NODE_REQUIRED_KEYS = ("hostname", "role")
-_NODE_ALLOWED_KEYS = frozenset(_NODE_REQUIRED_KEYS)
+# ``ssh_target`` is OPTIONAL and remote-only (see NodeConfig/_validate_node):
+# the exact host argument handed to ssh for a remote node, when it must
+# differ from the node's own provenance-named ``hostname`` (e.g. Polaris's
+# `.head` login-node SSH fan-out alias). Design: "SSH aliases are transport
+# identifiers only, never provenance" -- kanban task t_88d97d8e.
+_NODE_ALLOWED_KEYS = frozenset(_NODE_REQUIRED_KEYS) | frozenset(("ssh_target",))
 _NODE_ROLES = frozenset(("local", "remote"))
 
 # node_monitor/collector/remote_probe.py: MIN_PYTHON = (3, 9). The probe
@@ -82,14 +88,39 @@ class NodeConfig:
    ``polaris-login-04`` is local (the daemon invokes the probe directly);
    every other configured node is remote (the daemon invokes the exact
    same probe over SSH). See PHASE0_DAEMON_DESIGN.md "Architecture".
+
+   ``hostname`` is the stable, per-node bookkeeping/provenance identity
+   used everywhere in this project EXCEPT as the literal ssh(1) host
+   argument -- design: "SSH aliases are transport identifiers only,
+   never provenance". ``ssh_target`` is the OPTIONAL transport-only
+   override: the exact host argument handed to ssh for a REMOTE node,
+   when it must differ from ``hostname`` (e.g. Polaris's `.head`
+   login-node SSH fan-out alias, POLARIS-ONLY -- Aurora does not need
+   it). Defaults to ``hostname`` when absent, which is exactly today's
+   behavior. Always ``None`` for a local node -- the strict loader
+   rejects ``ssh_target`` on a ``role: local`` entry outright (a local
+   node never dials ssh at all, so a transport alias for it is
+   meaningless and, per the unknown-key-rejection discipline this
+   loader already applies everywhere else, fails closed rather than
+   silently ignored).
    """
 
    hostname: str
    role: str
+   ssh_target: typing.Optional[str] = None
 
    @property
    def is_local(self):
       return self.role == "local"
+
+   @property
+   def effective_ssh_target(self):
+      """The exact host argument to hand to ssh for this (remote) node:
+      the explicit ``ssh_target`` override when configured, else
+      ``hostname`` -- full backward compat with configs that never set
+      ``ssh_target`` at all.
+      """
+      return self.ssh_target if self.ssh_target is not None else self.hostname
 
 
 @dataclasses.dataclass(frozen=True)
@@ -214,7 +245,26 @@ def _validate_node(raw, home_hint=None):
    if role not in _NODE_ROLES:
       raise ConfigError(
          "node role must be one of %s, got %r" % (sorted(_NODE_ROLES), role))
-   return NodeConfig(hostname=hostname, role=role)
+   ssh_target = raw.get("ssh_target")
+   if "ssh_target" in raw:
+      if role != "remote":
+         # Fail-closed, same discipline as the unknown-key rejection
+         # above: ssh_target is a transport-only concept that only
+         # means anything for a node the daemon actually dials over
+         # ssh. A local node's probe is invoked in-process by path
+         # (collector.transport.run_local_probe) -- it never touches
+         # ssh at all, so a configured ssh_target on a local node
+         # entry is unreachable/meaningless config, not a harmless
+         # extra. Rejecting it here (rather than silently ignoring it)
+         # is what keeps a config typo -- e.g. ssh_target meant for a
+         # different node entry -- from silently doing nothing.
+         raise ConfigError(
+            "node entry has unknown key(s) for role %r: ssh_target "
+            "(ssh_target is remote-only)" % (role,))
+      if not isinstance(ssh_target, str) or not ssh_target:
+         raise ConfigError(
+            "node ssh_target must be a non-empty string, got %r" % (ssh_target,))
+   return NodeConfig(hostname=hostname, role=role, ssh_target=ssh_target)
 
 
 def _validate_nodes(raw_nodes):

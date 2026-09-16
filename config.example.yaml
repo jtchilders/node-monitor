@@ -18,8 +18,19 @@ nodes:
     role: local
   - hostname: polaris-login-01.hsn.cm.polaris.alcf.anl.gov
     role: remote
+    # Polaris-only: SSH fan-out to another login node REQUIRES the
+    # `.head` alias suffix (verified live 2026-09-16) -- the bare/FQDN
+    # forms are refused (publickey disabled on those interfaces).
+    # Aurora does not need `.head`; omit ssh_target there and the
+    # daemon dials `hostname` directly, exactly as before this option
+    # existed. `hostname` above stays the descriptive FQDN identity
+    # used for provenance everywhere except this literal ssh(1) host
+    # argument (design: "SSH aliases are transport identifiers only,
+    # never provenance").
+    ssh_target: polaris-login-01.head
   - hostname: polaris-login-02.hsn.cm.polaris.alcf.anl.gov
     role: remote
+    ssh_target: polaris-login-02.head
 
 # Root directory for the run's phase0-<run-id>/ artifact directory (see
 # node_monitor.output.jsonl.Phase0Sink). Must resolve under $HOME.

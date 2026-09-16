@@ -169,11 +169,22 @@ def _make_transport_fn(config, probe_version):
    operator's interactive ``~/.ssh/config`` -- design/PLANNING.md 4.3),
    with ``BatchMode=yes``/``ConnectTimeout`` already baked into that
    generated config and passed again explicitly on the ssh command line
-   (``build_remote_argv``'s own belt-and-suspenders contract). Every
-   remote poll validates ``expected_fqdn=node.hostname`` -- the
-   configured SSH alias this daemon dialed -- against the probe's own
-   remote-reported FQDN, catching a fan-out that silently probed the
-   same physical host twice under two different aliases.
+   (``build_remote_argv``'s own belt-and-suspenders contract). The
+   literal ssh(1) host argument for a remote node is
+   ``node.effective_ssh_target`` -- the configured ``ssh_target``
+   override when set (e.g. Polaris's ``.head`` login-node fan-out
+   alias), else ``node.hostname`` -- never ``node.hostname`` alone
+   (kanban task t_88d97d8e: an SSH alias is a transport identifier
+   only, never provenance, so it must never be forced to equal the
+   node's own bookkeeping hostname). ``expected_fqdn`` is passed as
+   ``None`` for BOTH local and remote polls here: the per-call
+   alias-equals-FQDN check this parameter used to drive was itself the
+   bug (a legitimate ``.head``/any-ssh-alias target never equals the
+   probe's self-reported FQDN) -- the correct per-node consistency and
+   cross-node uniqueness checks now live in ``Daemon`` itself
+   (``daemon.py``'s ``_established_fqdn``/``_established_by_fqdn``
+   maps), which sees every node's payload across the whole run,
+   something a single per-call ``transport_fn`` invocation never can.
 
    Returns a ``collector.transport.ProbeResult`` (not a plain payload
    dict) either way, which ``Daemon._poll_fn``'s own
@@ -223,14 +234,14 @@ def _make_transport_fn(config, probe_version):
          ssh_binary="ssh",
          ssh_config_path=ssh_config_path,
          connect_timeout_sec=config.ssh_connect_timeout_sec,
-         hostname=node.hostname,
+         hostname=node.effective_ssh_target,
          probe_python=config.probe_python,
          probe_script_source=probe_script_source,
          loop=loop,
          probe_max_seconds=max_seconds,
          hard_timeout_sec=hard_timeout_sec,
          expected_probe_version=probe_version,
-         expected_fqdn=node.hostname,
+         expected_fqdn=None,
       )
 
    return transport_fn

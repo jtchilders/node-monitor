@@ -308,6 +308,50 @@ _ORDINARY_POLL_FAILURE_TYPES = frozenset((
 _ORDINARY_POLL_FAILURE_FALLBACK = "invariant_violation"
 
 
+class HostnameMismatchError(Exception):
+   """Raised by ``Daemon`` itself (never ``collector.transport`` -- this
+   module still never imports that class, see the module docstring's
+   "never imports collector.transport" invariant) when a successful
+   probe payload violates either half of design's "a remote-reported
+   FQDN unique among configured targets":
+
+   (a) PER-NODE CONSISTENCY -- the SAME configured node (bookkeeping
+       ``node.hostname``) reports a DIFFERENT ``hostname_fqdn`` than
+       the one established by its own first successful poll of the
+       run.
+   (b) CROSS-NODE UNIQUENESS -- two DISTINCT configured nodes report
+       the SAME ``hostname_fqdn`` (the original design intent: two ssh
+       aliases/targets that turn out to dial the same physical host).
+
+   kanban task t_88d97d8e (Problem 2): this replaces the OLD, WRONG
+   per-call ``transport.validate_probe_payload``
+   ``expected_fqdn``-equality check, which compared a caller-supplied
+   SSH ALIAS against the probe's self-reported FQDN -- exact string
+   equality of two things design explicitly says are never the same
+   concept ("SSH aliases are transport identifiers only, never
+   provenance"), and which false-fired on every legitimate case where
+   the ssh target differs from the reported FQDN (the Polaris `.head`
+   fan-out alias, or any ordinary ssh Host alias). ``cli/main.py``'s
+   ``_make_transport_fn`` now always passes ``expected_fqdn=None`` to
+   ``run_local_probe``/``run_remote_probe``, disabling that per-call
+   check entirely; the real cross-poll checks live here instead,
+   because only ``Daemon`` (not a single per-call transport
+   invocation) ever sees every configured node's payload across the
+   whole run.
+
+   ``failure_type`` mirrors ``collector.transport.HostnameMismatchError.
+   failure_type`` exactly (both are members of the same closed
+   ``node_poll_failures.failure_type`` vocabulary -- see
+   ``output/contracts.py``'s own ``_POLL_FAILURE_TYPES`` and this
+   module's ``_ORDINARY_POLL_FAILURE_TYPES`` mirror of it) -- a
+   consumer of a persisted ``node_poll_failures`` record cannot tell,
+   and does not need to, which of the two exception CLASSES originally
+   raised it, only that a hostname mismatch of some kind occurred.
+   """
+
+   failure_type = "hostname_mismatch"
+
+
 def _classify_ordinary_poll_failure(exc):
    """Map ``exc`` to a fixed, bounded ``failure_type`` label.
 
@@ -471,6 +515,21 @@ class Daemon:
       # Absent until a node's first successful poll of any kind.
       self._established_fqdn = {}
 
+      # REVERSE of ``self._established_fqdn`` -- keyed by the reported
+      # ``hostname_fqdn`` string, valued by the configured
+      # ``node.hostname`` that FIRST established it. kanban task
+      # t_88d97d8e (Problem 2): this is what makes cross-node
+      # uniqueness checkable at all -- ``_established_fqdn`` alone can
+      # only ever answer "is THIS node's own fqdn still what it was",
+      # never "has some OTHER configured node already claimed this
+      # exact fqdn". Populated by the exact same call sites that
+      # populate ``self._established_fqdn`` (``_poll_fn``,
+      # ``_collect_hardware``), and ONLY on that node's very first
+      # successful poll of any kind -- see ``_check_fqdn_consistency``,
+      # the single choke point both call sites route every successful
+      # payload through before either dict is ever written.
+      self._established_by_fqdn = {}
+
       # Per-(node.hostname, loop) MIRROR of collector.scheduler.
       # Scheduler's own authoritative per-target consecutive_failures/
       # breaker_state, updated from the scheduler's own "scheduler_
@@ -564,6 +623,62 @@ class Daemon:
    def _emit(self, **fields):
       if self._on_event is not None:
          self._on_event(fields)
+
+   def _check_fqdn_consistency(self, node, fqdn):
+      """Enforce design's "a remote-reported FQDN unique among
+      configured targets" across the WHOLE run, for one just-received
+      successful payload's ``fqdn`` from ``node``. Called from every
+      call site that establishes/re-observes a node's FQDN
+      (``_poll_fn``, ``_collect_hardware``) BEFORE that call site
+      writes ``fqdn`` into ``self._established_fqdn``/
+      ``self._established_by_fqdn`` -- this method itself never
+      mutates either dict; it only ever validates against their
+      CURRENT (pre-this-payload) contents, mirroring
+      ``_record_ordinary_poll_failure``'s own "read state, then let
+      the caller commit it" split.
+
+      Raises ``HostnameMismatchError`` (never
+      ``collector.transport``'s class of the same name -- this module
+      still never imports that module) for either violation:
+
+      (a) PER-NODE CONSISTENCY: ``node.hostname`` already has an
+          established fqdn (from an earlier successful poll THIS run)
+          that differs from ``fqdn``.
+      (b) CROSS-NODE UNIQUENESS: some OTHER configured node (a
+          different ``node.hostname``) already established ``fqdn`` as
+          ITS OWN reported identity.
+
+      A `.head`-style ssh_target (or any ssh alias) legitimately
+      differing from ``fqdn`` is NOT one of these two conditions and
+      must never raise here -- that was the old, wrong per-call
+      ``transport.validate_probe_payload`` check this replaces (see
+      ``HostnameMismatchError``'s own docstring above).
+      """
+      prior_fqdn = self._established_fqdn.get(node.hostname)
+      if prior_fqdn is not None and prior_fqdn != fqdn:
+         raise HostnameMismatchError(
+            "node %r previously reported fqdn %r, now reports %r"
+            % (node.hostname, prior_fqdn, fqdn))
+
+      claimant = self._established_by_fqdn.get(fqdn)
+      if claimant is not None and claimant != node.hostname:
+         raise HostnameMismatchError(
+            "fqdn %r already claimed by configured node %r, "
+            "also reported by configured node %r"
+            % (fqdn, claimant, node.hostname))
+
+   def _record_established_fqdn(self, node, fqdn):
+      """Commit ``fqdn`` into both ``self._established_fqdn`` and its
+      reverse map ``self._established_by_fqdn`` for ``node`` --
+      ONLY ever called immediately after ``_check_fqdn_consistency``
+      has already validated it against every prior payload this run
+      has seen. Idempotent/stable for a node's own repeated stable
+      fqdn: re-committing the same ``(node.hostname, fqdn)`` pair a
+      second, third, ... time is a harmless no-op overwrite of the
+      exact same values already present.
+      """
+      self._established_fqdn[node.hostname] = fqdn
+      self._established_by_fqdn[fqdn] = node.hostname
 
    async def _observe_scheduler_event(self, event):
       """Update ``self._scheduler_state`` -- this module's mirror of
@@ -862,7 +977,28 @@ class Daemon:
             raise
          raise
       payload, wall_seconds, stdout_bytes = _normalize_probe_result(raw_result)
-      self._established_fqdn[node.hostname] = payload.get("hostname_fqdn")
+      fqdn = payload.get("hostname_fqdn")
+      try:
+         self._check_fqdn_consistency(node, fqdn)
+      except HostnameMismatchError as exc:
+         # kanban t_88d97d8e (Problem 2): a payload that otherwise
+         # parsed fine but violates per-node consistency/cross-node
+         # uniqueness is treated exactly like any other ordinary poll
+         # failure -- same node_poll_failures/node_collection_log
+         # fallback routing, same breaker/consecutive-failure
+         # bookkeeping via _record_ordinary_poll_failure -- NEVER
+         # committed into self._established_fqdn/
+         # self._established_by_fqdn (a rejected payload must not
+         # itself become the new "established" identity for either
+         # side of the collision).
+         try:
+            await self._record_ordinary_poll_failure(node, loop, exc)
+         except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as sink_exc:
+            self._fatal_error = sink_exc
+            self._scheduler.request_stop()
+            raise
+         raise
+      self._record_established_fqdn(node, fqdn)
       if loop == "counter":
          self._counter_success_totals[node.hostname] = (
             self._counter_success_totals.get(node.hostname, 0) + 1)
@@ -1060,7 +1196,21 @@ class Daemon:
          return
 
       payload, _wall_seconds, _stdout_bytes = _normalize_probe_result(raw_result)
-      self._established_fqdn[node.hostname] = payload.get("hostname_fqdn")
+      fqdn = payload.get("hostname_fqdn")
+      try:
+         self._check_fqdn_consistency(node, fqdn)
+      except HostnameMismatchError as exc:
+         # Same treatment as _poll_fn's own hostname-mismatch handling:
+         # a one-shot hwinfo collection that violates cross-poll
+         # consistency/uniqueness is not fatal to the run (mirrors
+         # every other hwinfo failure -- see this method's own
+         # docstring), logged via the same
+         # _log_hardware_collection_failure path an ordinary hwinfo
+         # exception already uses, and never committed into
+         # self._established_fqdn/self._established_by_fqdn.
+         await self._log_hardware_collection_failure(node, exc)
+         return
+      self._record_established_fqdn(node, fqdn)
       hardware = payload.get("hardware") or {}
       record = {
          "system": self._config.system,

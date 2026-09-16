@@ -1224,6 +1224,247 @@ class TestOrdinaryPollFailuresPersisted:
 
 
 # --------------------------------------------------------------------------
+# FQDN consistency/uniqueness (kanban task t_88d97d8e, Problem 2): the
+# per-call transport.validate_probe_payload alias-equals-FQDN check was
+# itself the bug -- a legitimate ssh_target/alias (e.g. Polaris's
+# `.head` login-node fan-out suffix) never equals the probe's own
+# self-reported hostname_fqdn. cli/main.py's _make_transport_fn now
+# always passes expected_fqdn=None; the real checks -- design's own
+# "a remote-reported FQDN unique among configured targets" -- move
+# here, at the Daemon, which is the one place that sees every
+# configured node's payload across the whole run:
+#
+#   (a) PER-NODE CONSISTENCY: the first successful poll for a node
+#       (keyed by its configured node.hostname bookkeeping id)
+#       establishes that node's reported hostname_fqdn; every LATER
+#       poll for the SAME node must report the SAME fqdn, else
+#       transport.HostnameMismatchError.
+#   (b) CROSS-NODE UNIQUENESS: no two DISTINCT configured nodes may
+#       ever report the same hostname_fqdn (the original design intent
+#       -- two aliases hitting one physical host); raises
+#       transport.HostnameMismatchError naming both configured
+#       identities.
+#
+# A `.head` ssh_target whose reported fqdn legitimately differs from
+# the ssh_target string itself must NOT raise -- that is the exact bug
+# this card fixes (regression coverage at the bottom of this class).
+# --------------------------------------------------------------------------
+
+class TestFqdnConsistencyAndUniqueness:
+   def test_stable_fqdn_across_polls_does_not_raise(self, tmp_path):
+      config = _config(tmp_path, duration_sec=10)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-fqdn-stable", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload(hostname="canonical.example.org")
+         if loop == "counter":
+            call_counts["counter"] += 1
+            return _counter_payload(
+               uptime_sec=float(call_counts["counter"]),
+               hostname="canonical.example.org")
+         return _census_payload(uptime_sec=1.0, hostname="canonical.example.org")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      # A stable fqdn across every poll of a run must never trip the
+      # consistency check -- exit cleanly with no fatal condition.
+      assert _run(scenario()) == EXIT_OK
+
+   def test_same_node_changed_fqdn_across_polls_raises_hostname_mismatch(
+         self, tmp_path):
+      """Same configured node (bookkeeping hostname), but its reported
+      fqdn changes between two successful polls -- e.g. an ssh alias
+      silently started resolving to a different physical host mid-run.
+      Design: "a remote-reported FQDN unique among configured targets"
+      implies stability per target too; this must raise, not silently
+      accept the new identity.
+      """
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-fqdn-changed", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            # Fails so no FQDN is established via hwinfo -- the
+            # mismatch below must be caught by the SCHEDULED counter
+            # loop instead, which is what actually writes a
+            # node_poll_failures record (a pre-scheduler hwinfo
+            # collision routes to node_collection_log, never
+            # node_poll_failures -- see _log_hardware_collection_
+            # failure's own docstring; not what this test targets).
+            raise RuntimeError("simulated hwinfo failure")
+         if loop == "counter":
+            call_counts["counter"] += 1
+            # First poll establishes "first.example.org"; every
+            # subsequent counter poll reports a DIFFERENT fqdn for the
+            # exact same configured node.
+            hostname = ("first.example.org" if call_counts["counter"] == 1
+                        else "second.example.org")
+            return _counter_payload(
+               uptime_sec=float(call_counts["counter"]), hostname=hostname)
+         return _census_payload(uptime_sec=1.0, hostname="first.example.org")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
+      assert os.path.exists(poll_failures_path)
+      with open(poll_failures_path) as handle:
+         records = [json.loads(line) for line in handle]
+      mismatch_records = [
+         r for r in records if r["failure_type"] == "hostname_mismatch"]
+      assert mismatch_records, (
+         "expected at least one hostname_mismatch node_poll_failures "
+         "record for a node whose reported fqdn changed mid-run")
+
+   def test_two_distinct_nodes_reporting_same_fqdn_raises_hostname_mismatch(
+         self, tmp_path):
+      """Cross-node uniqueness: two DISTINCT configured nodes (the
+      original design intent -- two ssh aliases hitting the same
+      physical host) must never both establish the same reported
+      hostname_fqdn.
+      """
+      config = _config(tmp_path, nodes=[
+         {"hostname": "polaris-login-04.example.org", "role": "local"},
+         {"hostname": "polaris-login-05.example.org", "role": "remote"},
+      ], duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-fqdn-collide", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {}
+
+      async def transport_fn(node, loop):
+         # hwinfo fails so neither node's fqdn is established via the
+         # pre-scheduler hwinfo step (that path routes a collision to
+         # node_collection_log, never node_poll_failures -- see
+         # _log_hardware_collection_failure's own docstring); the
+         # SCHEDULED loops are what this test targets. node1
+         # (polaris-login-04) reports "shared.example.org" from its
+         # very first successful poll onward. node2
+         # (polaris-login-05) FIRST establishes its OWN distinct fqdn
+         # (so it has an established identity of its own, routing any
+         # later collision to the real node_poll_failures path rather
+         # than the pre-fqdn node_collection_log honest-gap fallback),
+         # THEN, from its second poll onward, reports the exact same
+         # fqdn node1 already claimed -- the real cross-node collision
+         # this test targets.
+         if loop == "hwinfo":
+            raise RuntimeError("simulated hwinfo failure")
+         key = (node.hostname, loop)
+         call_counts[key] = call_counts.get(key, 0) + 1
+         n = call_counts[key]
+         if node.hostname == "polaris-login-04.example.org":
+            fqdn = "shared.example.org"
+         else:
+            fqdn = "node2-own.example.org" if n == 1 else "shared.example.org"
+         if loop == "census":
+            return _census_payload(uptime_sec=float(n), hostname=fqdn)
+         return _counter_payload(uptime_sec=float(n), hostname=fqdn)
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
+      assert os.path.exists(poll_failures_path)
+      with open(poll_failures_path) as handle:
+         records = [json.loads(line) for line in handle]
+      mismatch_records = [
+         r for r in records if r["failure_type"] == "hostname_mismatch"]
+      assert mismatch_records, (
+         "expected at least one hostname_mismatch node_poll_failures "
+         "record for two distinct nodes reporting the same fqdn")
+
+   def test_head_ssh_target_differing_from_reported_fqdn_does_not_raise(
+         self, tmp_path):
+      """REGRESSION for the exact Problem 2 bug: a `.head` ssh_target
+      (or any ssh alias) legitimately differs from the probe's own
+      self-reported FQDN -- that must NEVER raise HostnameMismatchError.
+      Only an actual per-node inconsistency or cross-node collision
+      (covered above) may raise.
+      """
+      config = _config(tmp_path, nodes=[
+         {"hostname": "polaris-login-04.example.org", "role": "local"},
+         {"hostname": "polaris-login-01.hsn.cm.polaris.alcf.anl.gov",
+          "role": "remote", "ssh_target": "polaris-login-01.head"},
+      ], duration_sec=10)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-fqdn-head-alias", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {}
+
+      async def transport_fn(node, loop):
+         # The reported fqdn is the node's OWN hostname (never the
+         # ssh_target alias, and never equal to it) -- exactly the
+         # live-verified Polaris `.head` scenario this card fixes.
+         reported = ("canonical-local.example.org" if node.is_local
+                     else "polaris-login-01.hsn.cm.polaris.alcf.anl.gov")
+         if loop == "hwinfo":
+            return _hwinfo_payload(hostname=reported)
+         key = (node.hostname, loop)
+         call_counts[key] = call_counts.get(key, 0) + 1
+         if loop == "counter":
+            return _counter_payload(
+               uptime_sec=float(call_counts[key]), hostname=reported)
+         return _census_payload(
+            uptime_sec=float(call_counts[key]), hostname=reported)
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      # The whole point of this fix: this must exit cleanly, with no
+      # hostname_mismatch records at all, even though every remote
+      # poll's ssh_target ("polaris-login-01.head") never equals the
+      # reported fqdn.
+      assert _run(scenario()) == EXIT_OK
+      poll_failures_path = os.path.join(sink.run_dir, "node_poll_failures.jsonl")
+      if os.path.exists(poll_failures_path):
+         with open(poll_failures_path) as handle:
+            records = [json.loads(line) for line in handle]
+         assert not any(r["failure_type"] == "hostname_mismatch" for r in records)
+
+
+# --------------------------------------------------------------------------
 # scheduler_miss persistence at the daemon boundary (kanban task
 # t_d18ac4ae, closing the exclusion the prior increment carried): a
 # same-node/same-loop overlap now writes exactly one schema-valid
