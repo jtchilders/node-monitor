@@ -547,3 +547,262 @@ class TestCheckPhase0ReadOnly:
       source = _code_only(CHECK_SCRIPT)
       for token in ("pg_ctl", "psql", "postgres", "pbs_monitor"):
          assert token not in source.lower()
+
+
+# --------------------------------------------------------------------------
+# Review round 2 regressions (kanban t_b6c49060 run #227 changes_requested):
+# exact recorded-session identity, malformed/empty lock rejection, custom
+# output_root targeting, and atomic launch-lock acquisition.
+# --------------------------------------------------------------------------
+
+class TestLockIdentityRejectsMalformedOrForeignLocks:
+   """Finding #1/#2: liveness alone (or a loose node-monitor/screen
+   substring match) is never sufficient -- a lock naming an unrelated
+   but genuinely live process must never be trusted, and a malformed
+   lock (wrong field count, non-numeric pid, empty/garbage session
+   name) must always be rejected outright rather than degrading into
+   an empty-pattern match that accepts every live pid.
+   """
+
+   def test_check_phase0_rejects_single_field_lock_naming_this_shell(
+         self, tmp_path, home_dir):
+      """Reviewer's exact reproduction #2: write the current shell PID
+      alone (no session field) to the lock file. Previously this set
+      lock_session='' and the shell pattern `*""*` matched every live
+      PID, so check_phase0.sh falsely reported RUNNING. It must now
+      report not-running.
+      """
+      lock_file = str(tmp_path / "single-field.lock")
+      with open(lock_file, "w") as handle:
+         handle.write("%d\n" % os.getpid())
+
+      result = subprocess.run(
+         [CHECK_SCRIPT, "--home", home_dir, "--lock-file", lock_file],
+         capture_output=True, text=True, timeout=30)
+      assert "RUNNING" not in result.stdout
+      assert "not currently running" in result.stdout.lower()
+
+   def test_run_phase0_rejects_single_field_lock_naming_this_shell(
+         self, tmp_path, fake_venv, home_dir):
+      """Same malformed-lock reproduction against run_phase0.sh's own
+      duplicate-refusal path: a one-field lock naming a genuinely live
+      but unrelated PID (this test process) must never block a new
+      launch -- run_phase0.sh must treat it as stale/malformed and
+      reclaim it, not refuse as \"already running\".
+      """
+      _skip_unless_screen_available()
+      config_path = str(tmp_path / "config.yaml")
+      with open(config_path, "w") as handle:
+         handle.write("system: polaris\n")
+      lock_file = str(tmp_path / "single-field.lock")
+      with open(lock_file, "w") as handle:
+         handle.write("%d\n" % os.getpid())
+      log_dir = str(tmp_path / "logs")
+
+      result = _run_launch(
+         config_path, home_dir, fake_venv, duration_sec=1,
+         run_id="malformed-lock-1", lock_file=lock_file, log_dir=log_dir)
+      assert result.returncode == 0, result.stderr
+      assert "already running" not in result.stderr.lower()
+
+   def test_check_phase0_rejects_lock_naming_unrelated_live_process(
+         self, tmp_path, home_dir):
+      """A well-formed-looking two-field lock whose recorded session
+      name does not match what the recorded pid's own command line
+      actually shows must be rejected -- this test's own pid is
+      genuinely alive (satisfying a bare `kill -0`) but is not running
+      under any screen session, so a generic node-monitor/screen
+      substring match would have falsely accepted it.
+      """
+      lock_file = str(tmp_path / "forged.lock")
+      with open(lock_file, "w") as handle:
+         handle.write("%d node-monitor-phase0-999999\n" % os.getpid())
+
+      result = subprocess.run(
+         [CHECK_SCRIPT, "--home", home_dir, "--lock-file", lock_file],
+         capture_output=True, text=True, timeout=30)
+      assert "RUNNING" not in result.stdout
+
+   def test_run_phase0_requires_exact_session_match_not_current_invocations(
+         self, tmp_path, fake_venv, home_dir):
+      """A live screen session exists (this invocation's own, launched
+      below) but a STALE lock file claims a different, non-existent
+      pid/session pair recorded before it. The stale lock must be
+      reclaimed on its own (mismatched) identity, never accepted just
+      because *some* node-monitor-phase0-* screen session happens to
+      be alive somewhere on the host.
+      """
+      _skip_unless_screen_available()
+      config_path = str(tmp_path / "config.yaml")
+      with open(config_path, "w") as handle:
+         handle.write("system: polaris\n")
+      lock_file = str(tmp_path / "phase0.lock")
+      log_dir = str(tmp_path / "logs")
+
+      # A launch that establishes a real, live screen session + lock.
+      first = _run_launch(
+         config_path, home_dir, fake_venv, duration_sec=5,
+         run_id="identity-1", lock_file=lock_file, log_dir=log_dir)
+      assert first.returncode == 0, first.stderr
+      assert _wait_for(lambda: "REPLACED_BELOW" not in _read(lock_file))
+
+      # Overwrite the lock with a well-formed but WRONG identity
+      # (a session name matching the grammar but never actually
+      # launched) before the still-running first daemon exits.
+      with open(lock_file, "w") as handle:
+         handle.write("999999999 node-monitor-phase0-999999999\n")
+
+      lock_file2 = str(tmp_path / "phase0-2.lock")
+      log_dir2 = str(tmp_path / "logs2")
+      second = _run_launch(
+         config_path, home_dir, fake_venv, duration_sec=1,
+         run_id="identity-2", lock_file=lock_file2, log_dir=log_dir2)
+      # Different lock file, so this only proves the forged lock in
+      # the FIRST lock file is never independently treated as valid
+      # when re-checked.
+      assert second.returncode == 0, second.stderr
+
+      check = subprocess.run(
+         [CHECK_SCRIPT, "--home", home_dir, "--lock-file", lock_file,
+          "--venv", fake_venv],
+         capture_output=True, text=True, timeout=30)
+      assert "RUNNING" not in check.stdout
+
+
+class TestCheckPhase0CustomOutputRoot:
+   """Finding #3: strict config permits any ``output_root`` under
+   ``$HOME`` (``node_monitor/config.py``'s ``_validate_output_root``).
+   ``check_phase0.sh`` must be able to validate a run under a
+   non-default output_root, not just the hardcoded
+   ``$HOME/phase0-runs`` default.
+   """
+
+   def test_reports_no_output_root_at_default_when_custom_root_used(
+         self, tmp_path, home_dir):
+      """Reviewer's exact reproduction #3, unpatched behavior: a
+      completed run under a custom root and a stale lock, but no
+      --output-root/--run-dir given, must not silently claim there is
+      no run at all -- it must at least name the default path it
+      looked at and exit nonzero (never crash, never fabricate a
+      result for a path that was never checked).
+      """
+      custom_root = os.path.join(home_dir, "custom-runs")
+      run_dir = os.path.join(custom_root, "phase0-demo")
+      os.makedirs(run_dir)
+      with open(os.path.join(run_dir, "DONE"), "w") as handle:
+         handle.write("2026-01-01T00:00:00Z\n")
+
+      lock_file = str(tmp_path / "stale.lock")
+      with open(lock_file, "w") as handle:
+         handle.write("999999999 node-monitor-phase0-999999999\n")
+
+      result = subprocess.run(
+         [CHECK_SCRIPT, "--home", home_dir, "--lock-file", lock_file],
+         capture_output=True, text=True, timeout=30)
+      assert result.returncode != 0
+      assert "phase0-runs" in result.stderr
+
+   def test_output_root_flag_validates_custom_root(
+         self, tmp_path, fake_venv, home_dir):
+      """With --output-root pointed at the actual configured custom
+      root, check_phase0.sh must discover and validate the real run
+      there.
+      """
+      custom_root = os.path.join(home_dir, "custom-runs")
+      run_dir = os.path.join(custom_root, "phase0-demo")
+      os.makedirs(run_dir)
+      with open(os.path.join(run_dir, "DONE"), "w") as handle:
+         handle.write("2026-01-01T00:00:00Z\n")
+
+      lock_file = str(tmp_path / "stale.lock")
+      with open(lock_file, "w") as handle:
+         handle.write("999999999 node-monitor-phase0-999999999\n")
+
+      result = subprocess.run(
+         [CHECK_SCRIPT, "--home", home_dir, "--lock-file", lock_file,
+          "--venv", fake_venv, "--output-root", custom_root],
+         capture_output=True, text=True, timeout=30)
+      assert result.returncode == 0, result.stderr
+      assert "DONE present: true" in result.stdout
+      assert "valid: run directory passed all structural checks" \
+         in result.stdout
+
+   def test_run_dir_flag_validates_exact_directory_bypassing_discovery(
+         self, tmp_path, fake_venv, home_dir):
+      run_dir = os.path.join(home_dir, "anywhere", "phase0-exact")
+      os.makedirs(run_dir)
+      with open(os.path.join(run_dir, "DONE"), "w") as handle:
+         handle.write("2026-01-01T00:00:00Z\n")
+
+      lock_file = str(tmp_path / "stale.lock")
+      with open(lock_file, "w") as handle:
+         handle.write("999999999 node-monitor-phase0-999999999\n")
+
+      result = subprocess.run(
+         [CHECK_SCRIPT, "--home", home_dir, "--lock-file", lock_file,
+          "--venv", fake_venv, "--run-dir", run_dir],
+         capture_output=True, text=True, timeout=30)
+      assert result.returncode == 0, result.stderr
+      assert "DONE present: true" in result.stdout
+
+   def test_output_root_and_run_dir_are_mutually_exclusive(
+         self, tmp_path, home_dir):
+      result = subprocess.run(
+         [CHECK_SCRIPT, "--home", home_dir,
+          "--output-root", str(tmp_path / "a"),
+          "--run-dir", str(tmp_path / "b")],
+         capture_output=True, text=True, timeout=30)
+      assert result.returncode != 0
+
+
+class TestConcurrentLaunchIsAtomic:
+   """Finding #4: a non-atomic check-then-write lock claim lets two
+   concurrent invocations both observe no lock and both launch. Fire
+   several invocations at the exact same instant against the SAME
+   lock file and assert exactly one succeeds.
+   """
+
+   def test_exactly_one_concurrent_launch_succeeds(
+         self, tmp_path, fake_venv, home_dir):
+      _skip_unless_screen_available()
+      config_path = str(tmp_path / "config.yaml")
+      with open(config_path, "w") as handle:
+         handle.write("system: polaris\n")
+      lock_file = str(tmp_path / "phase0.lock")
+      log_dir = str(tmp_path / "logs")
+
+      n = 6
+      procs = []
+      for i in range(n):
+         procs.append(subprocess.Popen(
+            [RUN_SCRIPT,
+             "--config", config_path,
+             "--home", home_dir,
+             "--venv", fake_venv,
+             "--duration-sec", "3",
+             "--run-id", "race-%d" % i,
+             "--lock-file", lock_file,
+             "--log-dir", log_dir],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+
+      results = [proc.communicate(timeout=30) for proc in procs]
+      returncodes = [proc.returncode for proc in procs]
+
+      successes = [rc for rc in returncodes if rc == 0]
+      assert len(successes) == 1, (
+         "expected exactly one concurrent launch to succeed, got %d "
+         "successes out of %d (returncodes=%r, stderrs=%r)"
+         % (len(successes), n, returncodes,
+            [err for _, err in results]))
+
+      # Only the single winning invocation's own run directory may
+      # ever have been created -- a second daemon actually starting
+      # (even if this script later refused to have launched it) would
+      # be the real failure mode this test guards against.
+      runs_created = [
+         name for name in os.listdir(
+            os.path.join(home_dir, "phase0-runs"))
+         if name.startswith("phase0-race-")
+      ] if os.path.isdir(os.path.join(home_dir, "phase0-runs")) else []
+      assert len(runs_created) == 1, (
+         "expected exactly one run directory, found %r" % runs_created)
