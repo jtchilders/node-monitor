@@ -212,8 +212,17 @@ class TestScreenDetachedLaunch:
       assert re.search(r"\$\{?SCREEN_BIN\}?[\"\']?\s+-dmS\b", source)
 
    def test_check_phase0_never_launches_screen(self):
-      source = _read(CHECK_SCRIPT)
-      assert "-dmS" not in source
+      source = _code_only(CHECK_SCRIPT)
+      # check_phase0.sh is read-only: it may reference screen's `-dmS`
+      # flag as a STRING to compare a recorded session's process
+      # identity against (per the exact-identity requirement in
+      # TestLockIdentityRejectsMalformedOrForeignLocks), but it must
+      # never itself invoke screen -- no SCREEN_BIN assignment/launch
+      # variable and no direct "screen"/"$SCREEN_BIN" command
+      # invocation anywhere in the code.
+      assert "SCREEN_BIN" not in source
+      assert not re.search(r"(^|[^\w./-])screen\s+-dmS\b", source)
+      assert not re.search(r"/usr/bin/screen\s", source)
 
 
 class TestLogRedirectionInsideHostScript:
@@ -667,6 +676,39 @@ class TestLockIdentityRejectsMalformedOrForeignLocks:
           "--venv", fake_venv],
          capture_output=True, text=True, timeout=30)
       assert "RUNNING" not in check.stdout
+
+
+   def test_check_phase0_rejects_live_process_carrying_token_outside_dmS(
+         self, tmp_path, home_dir):
+      """Review round 3 finding: `_pid_matches_session` in
+      check_phase0.sh previously accepted the recorded session as ANY
+      whitespace-delimited token in the command line, unlike
+      run_phase0.sh's own `_pid_matches_session`, which requires the
+      session to be specifically the argument of screen's `-dmS` flag.
+
+      Reproduces the reviewer's exact scenario: a genuinely live,
+      unrelated process (not screen at all) whose final argv token is
+      the exact recorded session name. This must never be accepted as
+      a match -- only a real `-dmS <session>` invocation counts.
+      """
+      session = "node-monitor-phase0-999999"
+      lock_file = str(tmp_path / "argv-forged.lock")
+
+      proc = subprocess.Popen(
+         [sys.executable, "-c", "import time; time.sleep(20)", session])
+      try:
+         assert _wait_for(lambda: proc.poll() is None)
+         with open(lock_file, "w") as handle:
+            handle.write("%d %s\n" % (proc.pid, session))
+
+         result = subprocess.run(
+            [CHECK_SCRIPT, "--home", home_dir, "--lock-file", lock_file],
+            capture_output=True, text=True, timeout=30)
+         assert "RUNNING" not in result.stdout, result.stdout
+         assert "not currently running" in result.stdout.lower()
+      finally:
+         proc.terminate()
+         proc.wait(timeout=10)
 
 
 class TestCheckPhase0CustomOutputRoot:

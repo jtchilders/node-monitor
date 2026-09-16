@@ -144,14 +144,19 @@ _pid_matches_session() {
    fi
    local cmd
    cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
-   # Screen's own listed command line always carries the session name
-   # as its own distinct, space-delimited argument (immediately after
-   # the detached-launch flag) -- matching it as a WHOLE token here
-   # (never a bare substring of a longer argument) is what makes this
-   # an exact-identity check rather than the generic node-monitor/
-   # screen substring match this replaces.
-   case " $cmd " in
-      *" $session "*)
+   # Matching the session name as ANY whitespace-delimited token in the
+   # command line is not sufficient -- an unrelated live process can
+   # carry the exact session string as a trailing argv token (e.g. a
+   # Python script invoked with the session name as its own argument)
+   # without that process being the screen session it names at all.
+   # The only thing that actually identifies "this PID is the screen
+   # process that launched OUR session" is the session name appearing
+   # specifically as the argument to screen's own `-dmS` flag -- the
+   # same identity condition run_phase0.sh uses for its own duplicate
+   # detection. Never accept a bare substring/whole-token match
+   # anywhere else in the command line.
+   case "$cmd" in
+      *"-dmS $session "*|*"-dmS $session")
          return 0
          ;;
       *)
