@@ -274,7 +274,7 @@ class _SelectiveWriteFailsSink:
             "simulated fsync failure for %s" % record_type)
       await self._real_sink.write_record(record_type, record)
 
-   async def finalize_summary(self):
+   async def finalize_summary(self, acceptance_fn=None):
       raise AssertionError(
          "finalize_summary() must never be called after a fatal "
          "write_record() OSError")
@@ -2114,7 +2114,7 @@ class TestFatalSinkError:
          async def write_record(self, record_type, record):
             raise OSError("simulated fsync failure")
 
-         async def finalize_summary(self):
+         async def finalize_summary(self, acceptance_fn=None):
             raise AssertionError(
                "finalize_summary() must never be called after a fatal "
                "write_record() OSError")
@@ -2160,7 +2160,7 @@ class TestFatalSinkError:
          async def write_record(self, record_type, record):
             return None
 
-         async def finalize_summary(self):
+         async def finalize_summary(self, acceptance_fn=None):
             raise OSError("simulated fsync failure during finalize")
 
          def write_done(self):
@@ -2227,6 +2227,539 @@ class TestFatalSinkError:
 # --------------------------------------------------------------------------
 # No database import/connection reachable from daemon.py
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Phase 0 acceptance telemetry wiring (kanban task t_d1b228fa): real run
+# telemetry threaded into evaluate_acceptance() and persisted atomically
+# under summary.json's own "acceptance" key before DONE.
+# --------------------------------------------------------------------------
+
+def _probe_result(payload, wall_seconds=0.05, stdout_bytes=256):
+   return transport.ProbeResult(
+      payload=payload, exit_code=0, stdout_bytes=stdout_bytes,
+      stderr="", stderr_truncated=False, wall_seconds=wall_seconds)
+
+
+class TestAcceptanceTelemetryWiring:
+   def test_real_probe_result_wall_seconds_feeds_probe_p95_threshold(
+         self, tmp_path):
+      """Requirement 1: the production transport returns ProbeResult
+      (payload, stdout_bytes, wall_seconds, ...). Daemon must accept it
+      (not just a plain payload dict) and thread its wall_seconds into
+      the counter/census probe-wall-time p95 thresholds.
+      """
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-accept-proberesult",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0, "census": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _probe_result(_hwinfo_payload(), wall_seconds=0.01)
+         call_counts[loop] += 1
+         n = call_counts[loop]
+         if loop == "census":
+            return _probe_result(
+               _census_payload(uptime_sec=float(n)), wall_seconds=0.4)
+         return _probe_result(
+            _counter_payload(uptime_sec=float(n)), wall_seconds=0.05)
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      summary_path = os.path.join(sink.run_dir, "summary.json")
+      with open(summary_path) as handle:
+         summary = json.load(handle)
+
+      acceptance = summary["acceptance"]
+      counter_p95 = acceptance["thresholds"]["counter_probe_p95_sec"]
+      census_p95 = acceptance["thresholds"]["census_probe_p95_sec"]
+      assert counter_p95["value"] == pytest.approx(0.05)
+      assert counter_p95["met"] is True
+      assert census_p95["value"] == pytest.approx(0.4)
+      assert census_p95["met"] is True
+
+      # Rollup/rollout of the record types this real probe still
+      # produces must remain intact -- normalization must not break
+      # the existing counter/census pipeline.
+      rollup_path = os.path.join(sink.run_dir, "node_counter_samples.jsonl")
+      assert os.path.exists(rollup_path)
+
+   def test_real_probe_result_stdout_bytes_feed_bounded_payload_bytes_totals(
+         self, tmp_path):
+      """Requirement 1's final clause: "Payload bytes should be retained
+      in a bounded aggregate suitable for later observer-cost/artifact-
+      growth reporting; do not persist raw stdout or argv." A real
+      ProbeResult's own stdout_bytes must accumulate into a per-loop
+      running total under the acceptance artifact's telemetry section
+      -- never the raw stdout content itself.
+      """
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-accept-payload-bytes",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0, "census": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _probe_result(_hwinfo_payload(), wall_seconds=0.01)
+         call_counts[loop] += 1
+         n = call_counts[loop]
+         if loop == "census":
+            return _probe_result(
+               _census_payload(uptime_sec=float(n)), wall_seconds=0.4,
+               stdout_bytes=1000)
+         return _probe_result(
+            _counter_payload(uptime_sec=float(n)), wall_seconds=0.05,
+            stdout_bytes=100)
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      summary_path = os.path.join(sink.run_dir, "summary.json")
+      with open(summary_path) as handle:
+         summary = json.load(handle)
+
+      telemetry = summary["acceptance"]["telemetry"]
+      assert telemetry["counter_payload_bytes_total"] == \
+         100 * call_counts["counter"]
+      assert telemetry["census_payload_bytes_total"] == \
+         1000 * call_counts["census"]
+      # Never raw stdout content itself -- only the small integer totals.
+      assert "stdout" not in json.dumps(telemetry)
+
+   def test_legacy_dict_payload_transport_fn_never_fabricates_payload_bytes(
+         self, tmp_path):
+      """Backward-compat half of the same clause: a legacy dict-payload
+      test double never supplies stdout_bytes at all -- the bounded
+      aggregate must stay at zero, never fabricated.
+      """
+      config = _config(tmp_path, rollup_interval_sec=5, duration_sec=10)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-accept-payload-bytes-legacy",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      summary_path = os.path.join(sink.run_dir, "summary.json")
+      with open(summary_path) as handle:
+         summary = json.load(handle)
+
+      telemetry = summary["acceptance"]["telemetry"]
+      assert telemetry["counter_payload_bytes_total"] == 0
+      assert telemetry["census_payload_bytes_total"] == 0
+
+   def test_legacy_dict_payload_transport_fn_still_produces_acceptance(
+         self, tmp_path):
+      """Requirement 1 backward-compat half: existing injectable test
+      doubles return a plain payload dict (no ProbeResult wrapper) --
+      the daemon must still run to completion, and probe-wall-time
+      telemetry that was never available must be reported unavailable
+      (met is None), never fabricated as zero/passing.
+      """
+      config = _config(tmp_path, rollup_interval_sec=5, duration_sec=10)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-accept-legacy-dict",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      summary_path = os.path.join(sink.run_dir, "summary.json")
+      with open(summary_path) as handle:
+         summary = json.load(handle)
+
+      acceptance = summary["acceptance"]
+      assert acceptance["thresholds"]["counter_probe_p95_sec"]["value"] is None
+      assert acceptance["thresholds"]["counter_probe_p95_sec"]["met"] is None
+      assert acceptance["thresholds"]["census_probe_p95_sec"]["value"] is None
+      assert acceptance["thresholds"]["census_probe_p95_sec"]["met"] is None
+      # An unavailable probe-wall-time threshold must never by itself
+      # degrade an otherwise-clean run.
+      assert acceptance["status"] == "clean"
+
+   def test_scheduling_delay_recorded_when_polls_queue_on_the_semaphore(
+         self, tmp_path):
+      """Requirement 2: scheduling delay is measured honestly at
+      actual poll start, including time waiting for the shared
+      semaphore -- proved here at the Daemon level (not just inside
+      Scheduler in isolation) by forcing two nodes' counter polls to
+      contend for a single concurrency slot.
+      """
+      config = _config(tmp_path, nodes=[
+         {"hostname": "node-a.example.org", "role": "local"},
+         {"hostname": "node-b.example.org", "role": "remote"},
+      ], counter_interval_sec=100, census_interval_sec=100,
+         rollup_interval_sec=100, usage_interval_sec=100,
+         duration_sec=5, max_parallel_polls=1)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-accept-semaphore-delay",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      hold_a = None
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload(hostname=node.hostname)
+         if loop == "counter" and node.hostname == "node-a.example.org":
+            await hold_a.wait()
+         return (_census_payload(uptime_sec=1.0, hostname=node.hostname)
+                 if loop == "census" else
+                 _counter_payload(uptime_sec=1.0, hostname=node.hostname))
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         nonlocal hold_a
+         hold_a = asyncio.Event()
+         run_task = asyncio.ensure_future(daemon.run())
+         await asyncio.sleep(0)
+         await clock.advance(2)
+         hold_a.set()
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      summary_path = os.path.join(sink.run_dir, "summary.json")
+      with open(summary_path) as handle:
+         summary = json.load(handle)
+
+      telemetry = summary["acceptance"]["telemetry"]
+      assert telemetry["scheduling_delay_sample_count"] >= 2
+      delay_entry = summary["acceptance"]["thresholds"]["scheduling_delay_p95_sec"]
+      # Node b's counter poll queued behind node a's held poll for
+      # (at least) 2 virtual seconds -- the recorded p95 must reflect
+      # a real, nonzero queueing delay, never a fabricated zero.
+      assert delay_entry["value"] >= 2.0
+
+   def test_configured_node_with_zero_successful_polls_is_included(
+         self, tmp_path):
+      """Requirement 6: evaluate_acceptance is called with every
+      configured node -- including one whose counter/census polls
+      never once succeed -- so it can never be silently absent from
+      the acceptance artifact.
+      """
+      config = _config(tmp_path, nodes=[
+         {"hostname": "polaris-login-04.example.org", "role": "local"},
+         {"hostname": "polaris-login-05.example.org", "role": "remote"},
+      ], duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-accept-zero-success-node",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"counter": 0, "census": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload(hostname=node.hostname)
+         if node.hostname == "polaris-login-05.example.org":
+            raise RuntimeError("node b never succeeds")
+         call_counts[loop] += 1
+         n = call_counts[loop]
+         if loop == "census":
+            return _census_payload(uptime_sec=float(n), hostname=node.hostname)
+         return _counter_payload(uptime_sec=float(n), hostname=node.hostname)
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      summary_path = os.path.join(sink.run_dir, "summary.json")
+      with open(summary_path) as handle:
+         summary = json.load(handle)
+
+      acceptance = summary["acceptance"]
+      counter_coverage = acceptance["thresholds"]["counter_coverage_per_node"]
+      assert set(counter_coverage) == {
+         "polaris-login-04.example.org", "polaris-login-05.example.org"}
+      assert counter_coverage["polaris-login-05.example.org"]["actual_count"] == 0
+      assert counter_coverage["polaris-login-05.example.org"]["met"] is False
+      assert acceptance["status"] == "degraded"
+
+   def test_clean_natural_completion_reports_clean_in_acceptance(
+         self, tmp_path):
+      """Requirement 4 (clean vs partial): a run that stops because its
+      own finite duration_sec elapsed -- no request_stop() involved --
+      must report completion == 'clean'."""
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-accept-clean-completion",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      summary_path = os.path.join(sink.run_dir, "summary.json")
+      with open(summary_path) as handle:
+         summary = json.load(handle)
+      assert summary["acceptance"]["completion"] == "clean"
+
+   def test_direct_request_stop_reports_partial_in_acceptance(self, tmp_path):
+      """Requirement 4: any orderly request_stop() (direct external
+      stop here, real OS signal covered separately below) must report
+      completion == 'partial', never inferred from elapsed wall time.
+      """
+      config = _config(
+         tmp_path, rollup_interval_sec=100, usage_interval_sec=100,
+         duration_sec=100000)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-accept-partial-stop",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(3)
+         daemon._scheduler.request_stop()
+         await clock.advance(10)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      summary_path = os.path.join(sink.run_dir, "summary.json")
+      with open(summary_path) as handle:
+         summary = json.load(handle)
+      assert summary["acceptance"]["completion"] == "partial"
+
+   def test_real_sigterm_reports_partial_in_acceptance(self, tmp_path):
+      """Requirement 4: an actual OS signal (not just a direct
+      request_stop() call) must also be classified 'partial', proved
+      through the existing real-subprocess signal harness.
+      """
+      outcome = _run_signal_scenario(
+         tmp_path, "daemon-run-accept-sigterm", "SIGTERM")
+      assert outcome["ok"] is True
+      summary_path = os.path.join(outcome["run_dir"], "summary.json")
+      with open(summary_path) as handle:
+         summary = json.load(handle)
+      assert summary["acceptance"]["completion"] == "partial"
+
+   def test_complete_counter_windows_exclude_trailing_partial_window(
+         self, tmp_path):
+      """Requirement 3: complete counter rollups (reached their own
+      expected_count via the ordinary at-capacity flush) are tracked
+      separately from a trailing partial flush at run end -- the
+      trailing flush must never be counted as complete.
+      """
+      config = _config(
+         tmp_path, rollup_interval_sec=5, usage_interval_sec=100,
+         duration_sec=8)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-accept-complete-vs-trailing",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      rollup_path = os.path.join(sink.run_dir, "node_counter_samples.jsonl")
+      with open(rollup_path) as handle:
+         records = [json.loads(line) for line in handle]
+      sample_counts = sorted(r["sample_count"] for r in records)
+      # One complete 5-sample window (meets the >=5 minimum) plus one
+      # trailing 3-sample residual.
+      assert sample_counts == [3, 5]
+
+      assert daemon._complete_counter_windows == 1
+      assert daemon._complete_counter_windows_meeting_minimum == 1
+
+      summary_path = os.path.join(sink.run_dir, "summary.json")
+      with open(summary_path) as handle:
+         summary = json.load(handle)
+      acceptance = summary["acceptance"]
+      assert acceptance["telemetry"]["counter_window_stats"] == {
+         "complete_windows": 1, "complete_windows_meeting_minimum": 1}
+      window_threshold = acceptance["thresholds"]["counter_window_minimum_samples"]
+      assert window_threshold["complete_windows"] == 1
+      assert window_threshold["met"] is True
+
+   def test_acceptance_present_atomically_in_the_single_summary_write(
+         self, tmp_path):
+      """Requirement 5: acceptance is computed from the sink's own
+      finalized file-validation metadata and included in the SAME
+      summary.json write as "files" -- never a second write/patch --
+      and DONE must still only ever appear once that single write has
+      landed.
+      """
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-accept-atomic",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      summary_path = os.path.join(sink.run_dir, "summary.json")
+      assert os.path.exists(summary_path)
+      leftovers = [n for n in os.listdir(sink.run_dir) if n.endswith(".tmp")]
+      assert leftovers == []
+      with open(summary_path) as handle:
+         summary = json.load(handle)
+      assert "files" in summary
+      assert "acceptance" in summary
+      assert os.path.exists(os.path.join(sink.run_dir, "DONE"))
+
+   def test_threshold_failure_produces_degraded_status_but_still_writes_done(
+         self, tmp_path):
+      """Requirement 6: a threshold failure produces a degraded
+      acceptance artifact but never suppresses DONE or retroactively
+      deletes already-collected data -- only a sink failure is fatal.
+      """
+      config = _config(tmp_path, duration_sec=5)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-accept-degraded",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      clock = FakeClock()
+      call_counts = {"census": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         if loop == "counter":
+            # Every counter poll fails -- coverage drops to 0%, well
+            # under the 99% minimum, degrading the run.
+            raise RuntimeError("simulated counter probe failure")
+         call_counts["census"] += 1
+         return _census_payload(uptime_sec=float(call_counts["census"]))
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+      assert exit_code == EXIT_OK
+
+      summary_path = os.path.join(sink.run_dir, "summary.json")
+      with open(summary_path) as handle:
+         summary = json.load(handle)
+      acceptance = summary["acceptance"]
+      assert acceptance["status"] == "degraded"
+      node_coverage = acceptance["thresholds"]["counter_coverage_per_node"]
+      assert all(entry["met"] is False for entry in node_coverage.values())
+      assert os.path.exists(os.path.join(sink.run_dir, "DONE"))
+
+   def test_fatal_sink_write_failure_still_never_finalizes_or_computes_acceptance(
+         self, tmp_path):
+      """Requirement 6/8: sink failures remain fatal and suppress DONE
+      exactly as before -- the new acceptance wiring must not change
+      that contract. finalize_summary() (and therefore any acceptance
+      computation) must never even be attempted.
+      """
+      config = _config(tmp_path, duration_sec=20)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      real_sink = Phase0Sink(
+         output_root, "daemon-run-accept-fatal-unchanged",
+         metadata={"system": config.system}, disk_usage_fn=_full_disk_usage)
+      sink = _SelectiveWriteFailsSink(real_sink, "node_hardware")
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
 
 class TestNoDatabaseImports:
    def test_daemon_module_source_has_no_database_imports(self):

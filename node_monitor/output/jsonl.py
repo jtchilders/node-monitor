@@ -281,10 +281,27 @@ class Phase0Sink:
 
          self._record_counts[record_type] += 1
 
-   async def finalize_summary(self):
+   async def finalize_summary(self, acceptance_fn=None):
       """Close every open JSONL file, validate each artifact, and write
       an atomic summary.json with per-file record counts, byte sizes,
       malformed-line counts, and SHA-256 checksums.
+
+      ``acceptance_fn``: optional callable ``acceptance_fn(files_summary)
+      -> dict`` invoked AFTER every file has been validated/summarized
+      but BEFORE the single atomic ``summary.json`` write -- its return
+      value is included verbatim under the summary's own ``acceptance``
+      key. This is the one hook a caller (``node_monitor.daemon``) uses
+      to compute the Phase 0 canary acceptance verdict from exactly the
+      same finalized per-file metadata this method already produces,
+      without this sink ever needing to know what "acceptance" means or
+      importing ``node_monitor.output.acceptance`` itself. Backward
+      compatible: omitted (or ``None``), the summary is written with no
+      ``acceptance`` key at all, exactly as before this hook existed --
+      no caller of the pre-existing zero-argument signature is broken.
+      There is still exactly one ``summary.json`` write either way: the
+      hook's result is folded into the same ``summary`` dict this
+      method was already about to write, never a second write/patch
+      (design: \"Do not write/patch summary twice\").
 
       Safe to call with zero records written to any given file -- that
       file simply never got a handle and reports zero counts/size, so a
@@ -340,6 +357,8 @@ class Phase0Sink:
             "finalized_utc": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
             "files": files_summary,
          }
+         if acceptance_fn is not None:
+            summary["acceptance"] = acceptance_fn(files_summary)
          _atomic_write_json(os.path.join(self.run_dir, "summary.json"), summary)
          self._summary_finalized = True
          return summary

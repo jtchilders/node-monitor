@@ -186,6 +186,7 @@ from node_monitor.collector.usage import (
    build_diagnostic_census,
    build_usage_observations,
 )
+from node_monitor.output.acceptance import evaluate_acceptance
 from node_monitor.output.jsonl import Phase0SinkDiskFullError, Phase0SinkError
 
 # Exit codes for Daemon.run(). Design: "Output write/flush failure or
@@ -214,6 +215,35 @@ _HARDWARE_PROBE_FIELDS = (
 
 def _default_wall_clock():
    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
+
+
+def _normalize_probe_result(result):
+   """Normalize one raw ``transport_fn(node, loop)`` return value into
+   ``(payload, wall_seconds, stdout_bytes)``.
+
+   Design/kanban task t_d1b228fa requirement 1: the production
+   transport (``collector.transport.run_local_probe``/
+   ``run_remote_probe``) returns ``ProbeResult(payload, stdout_bytes,
+   wall_seconds, ...)``, while every existing injectable test double in
+   this project's own test suite returns a plain payload dict directly
+   (the shape ``ProbeResult.payload`` itself holds). This is the one
+   explicit normalization boundary between the two: a ``ProbeResult``
+   (or anything duck-typed like one -- checked by the presence of a
+   dict-valued ``payload`` attribute, never an ``isinstance`` check
+   against ``collector.transport.ProbeResult`` itself, since this
+   module still never imports that class -- see the module docstring's
+   "never imports collector.transport" invariant) is unwrapped into its
+   three fields; a plain dict is passed through unchanged with
+   ``wall_seconds``/``stdout_bytes`` both ``None`` (never fabricated as
+   zero), which is exactly what lets probe-wall-time acceptance
+   thresholds correctly report "unavailable" for a caller that never
+   supplied real telemetry.
+   """
+   payload = getattr(result, "payload", None)
+   if isinstance(payload, dict):
+      return payload, getattr(result, "wall_seconds", None), \
+         getattr(result, "stdout_bytes", None)
+   return result, None, None
 
 
 # Fixed, daemon-owned vocabulary for ``_classify_hardware_failure`` below.
@@ -312,6 +342,41 @@ def _classify_ordinary_poll_failure(exc):
 # there is no live Scheduler/target-state object to consult yet at
 # that point, only this mirror of what the Scheduler will compute.
 _POLL_FAILURE_BREAKER_THRESHOLD = 3
+
+# Design/kanban task t_d1b228fa: "retain bounded wall-time samples and
+# successful per-node totals" / "accumulate bounded scheduling-delay
+# samples" -- every raw per-poll sample list this module keeps for
+# later acceptance evaluation is capped at this many most-recent
+# entries (a plain Python list sliced back down to this bound rather
+# than growing unbounded across a 24-hour run's tens of thousands of
+# polls). Comfortably larger than any single node's expected poll
+# count at the design's own fastest cadence (10s counter interval over
+# 24h is 8640 polls) while still bounding memory -- exact percentile
+# accuracy at this scale is not the goal (the design only requires a
+# p95 threshold check), keeping recent behavior visible is.
+_MAX_TELEMETRY_SAMPLES = 4096
+
+
+def _append_bounded(sample_list, value):
+   """Append ``value`` to ``sample_list`` in place, dropping the
+   OLDEST entries once ``_MAX_TELEMETRY_SAMPLES`` is exceeded -- a
+   plain list (not a fixed-size ring buffer class) is sufficient here
+   because every call site already amortizes the occasional O(n) trim
+   across many cheap appends between trims.
+   """
+   sample_list.append(value)
+   if len(sample_list) > _MAX_TELEMETRY_SAMPLES:
+      del sample_list[: len(sample_list) - _MAX_TELEMETRY_SAMPLES]
+
+
+# Design: "Each complete minute rollup has at least five valid counter
+# samples" -- matches collector.metrics._MINIMUM_VALID_SAMPLES exactly;
+# kept local here (rather than imported) for the same reason
+# output.acceptance keeps its own copy: this module tracks the
+# complete-vs-trailing rollup COUNT itself (see _flush_counter_window),
+# it does not re-derive completeness from the metrics module's own
+# per-window internal state.
+_MINIMUM_VALID_SAMPLES_PER_COUNTER_WINDOW = 5
 
 
 class Daemon:
@@ -432,6 +497,70 @@ class Daemon:
       # reported clean.
       self._fatal_error = None
 
+      # -----------------------------------------------------------------
+      # Acceptance telemetry (kanban task t_d1b228fa): every input
+      # ``node_monitor.output.acceptance.evaluate_acceptance`` needs,
+      # accumulated from real run events rather than fabricated. All of
+      # it is bounded -- per-node integer totals are O(nodes), and every
+      # raw sample list is capped by _append_bounded/_MAX_TELEMETRY_
+      # SAMPLES.
+      # -----------------------------------------------------------------
+
+      # Total SUCCESSFUL polls per node for each loop, across the whole
+      # run -- keyed by node.hostname (bookkeeping identity, matching
+      # every other per-node dict in this class), not the reported
+      # FQDN. Every configured node gets an entry via _config.nodes at
+      # evaluation time even if it stays at zero here (see run()'s own
+      # acceptance_fn), so a node that never once succeeds is never
+      # silently absent from the acceptance artifact.
+      self._counter_success_totals = {}
+      self._census_success_totals = {}
+
+      # Complete-vs-trailing counter-window rollup: a "complete" window
+      # is one that reached its own expected_count sample cadence via
+      # the ORDINARY at-capacity flush in _flush_counter_window (called
+      # from _handle_counter_poll once count >= expected_count) --
+      # never a trailing/degraded flush at run end
+      # (_flush_trailing_counter_windows), which by definition never
+      # reached that cadence on its own. "Meeting minimum" additionally
+      # requires the finalized record's own sample_count >= 5 (design:
+      # "Each complete minute rollup has at least five valid counter
+      # samples"). Tracked via one extra boolean flag per in-flight
+      # accumulator (see _handle_counter_poll/_flush_counter_window)
+      # rather than re-deriving "was this an ordinary flush" from the
+      # record after the fact.
+      self._complete_counter_windows = 0
+      self._complete_counter_windows_meeting_minimum = 0
+
+      # Bounded per-poll scheduling-delay samples, in seconds, collected
+      # from every Scheduler "poll_start" event across every (node,
+      # loop) target for the whole run -- design: "Measure scheduling
+      # delay honestly at actual poll start, including time waiting for
+      # the shared semaphore."
+      self._scheduling_delay_samples = []
+
+      # Bounded per-completed-poll wall-time samples, in seconds, for
+      # each loop -- populated from collector.transport.ProbeResult.
+      # wall_seconds via _normalize_probe_result when the real
+      # transport supplies it; stays empty (never fabricated) for a
+      # test double that returns a plain payload dict with no wall-time
+      # telemetry of its own.
+      self._counter_probe_wall_seconds = []
+      self._census_probe_wall_seconds = []
+
+      # Bounded aggregate byte counts (kanban task t_d1b228fa
+      # requirement 1: "Payload bytes should be retained in a bounded
+      # aggregate suitable for later observer-cost/artifact-growth
+      # reporting; do not persist raw stdout or argv.") -- a single
+      # running integer total per loop, from collector.transport.
+      # ProbeResult.stdout_bytes via _normalize_probe_result. Never the
+      # raw stdout content itself, only its size; stays at zero (never
+      # fabricated) for a test double that returns a plain payload
+      # dict with no stdout_bytes telemetry of its own. Already bounded
+      # by construction -- one integer per loop, not a growing list.
+      self._counter_payload_bytes_total = 0
+      self._census_payload_bytes_total = 0
+
    def _emit(self, **fields):
       if self._on_event is not None:
          self._on_event(fields)
@@ -485,7 +614,10 @@ class Daemon:
       handling, so the run still stops, nonzero, without a false DONE.
       """
       event_type = event.get("type")
-      if event_type in ("scheduler_miss", "failure"):
+      if event_type == "poll_start":
+         _append_bounded(
+            self._scheduling_delay_samples, event["scheduling_delay_sec"])
+      elif event_type in ("scheduler_miss", "failure"):
          node = event["node"]
          key = (node.hostname, event["loop"])
          self._scheduler_state[key] = (
@@ -610,7 +742,7 @@ class Daemon:
          expected_count=self._counter_expected_count,
       )
 
-   async def _flush_counter_window(self, hostname, payload):
+   async def _flush_counter_window(self, hostname, payload, complete=True):
       accumulator = self._counter_accumulators.pop(hostname)
       self._counter_sample_counts[hostname] = 0
       record = accumulator.finalize()
@@ -622,6 +754,16 @@ class Daemon:
       record["probe_version"] = payload.get("probe_version")
       record["daemon_version"] = record["daemon_version"] or "0.0.0"
       record["window_end_utc"] = self._wall_clock_fn()
+      if complete:
+         # "Complete" means this window reached its own expected_count
+         # sample cadence via the ORDINARY at-capacity path below --
+         # never a trailing/degraded flush at run end (kanban task
+         # t_d1b228fa requirement 3: "Track complete counter rollups
+         # separately from trailing partial rollups ... Do not count a
+         # trailing shutdown flush as complete").
+         self._complete_counter_windows += 1
+         if record["sample_count"] >= _MINIMUM_VALID_SAMPLES_PER_COUNTER_WINDOW:
+            self._complete_counter_windows_meeting_minimum += 1
       await self._sink.write_record("node_counter_samples", record)
 
    async def _handle_counter_poll(self, node, payload):
@@ -638,7 +780,7 @@ class Daemon:
       count = self._counter_sample_counts.get(node.hostname, 0) + 1
       self._counter_sample_counts[node.hostname] = count
       if count >= self._counter_expected_count:
-         await self._flush_counter_window(node.hostname, payload)
+         await self._flush_counter_window(node.hostname, payload, complete=True)
 
    def _new_usage_accumulator(self, node, payload):
       now = self._wall_clock_fn()
@@ -705,7 +847,7 @@ class Daemon:
 
    async def _poll_fn(self, node, loop):
       try:
-         payload = await self._transport_fn(node, loop)
+         raw_result = await self._transport_fn(node, loop)
       except Exception as exc:
          try:
             await self._record_ordinary_poll_failure(node, loop, exc)
@@ -719,7 +861,22 @@ class Daemon:
             self._scheduler.request_stop()
             raise
          raise
+      payload, wall_seconds, stdout_bytes = _normalize_probe_result(raw_result)
       self._established_fqdn[node.hostname] = payload.get("hostname_fqdn")
+      if loop == "counter":
+         self._counter_success_totals[node.hostname] = (
+            self._counter_success_totals.get(node.hostname, 0) + 1)
+         if wall_seconds is not None:
+            _append_bounded(self._counter_probe_wall_seconds, wall_seconds)
+         if stdout_bytes is not None:
+            self._counter_payload_bytes_total += stdout_bytes
+      elif loop == "census":
+         self._census_success_totals[node.hostname] = (
+            self._census_success_totals.get(node.hostname, 0) + 1)
+         if wall_seconds is not None:
+            _append_bounded(self._census_probe_wall_seconds, wall_seconds)
+         if stdout_bytes is not None:
+            self._census_payload_bytes_total += stdout_bytes
       try:
          if loop == "counter":
             await self._handle_counter_poll(node, payload)
@@ -897,11 +1054,12 @@ class Daemon:
       is the one place that maps that into ``EXIT_SINK_FATAL``.
       """
       try:
-         payload = await self._transport_fn(node, "hwinfo")
+         raw_result = await self._transport_fn(node, "hwinfo")
       except Exception as exc:
          await self._log_hardware_collection_failure(node, exc)
          return
 
+      payload, _wall_seconds, _stdout_bytes = _normalize_probe_result(raw_result)
       self._established_fqdn[node.hostname] = payload.get("hostname_fqdn")
       hardware = payload.get("hardware") or {}
       record = {
@@ -939,7 +1097,7 @@ class Daemon:
       """
       for hostname in list(self._counter_accumulators):
          payload = self._last_counter_payload.get(hostname, {})
-         await self._flush_counter_window(hostname, payload)
+         await self._flush_counter_window(hostname, payload, complete=False)
 
    async def _flush_trailing_usage_windows(self):
       """Finalize and write ``node_usage_intervals`` record(s) for
@@ -1085,6 +1243,66 @@ class Daemon:
          loop.remove_signal_handler(sig)
          signal.signal(sig, prior)
 
+   def _build_acceptance(self, files_summary):
+      """Build the ``evaluate_acceptance()`` call from this run's own
+      accumulated telemetry plus ``files_summary`` -- the sink's own
+      finalized per-file validation metadata -- and return its result
+      together with a bounded audit snapshot of the telemetry inputs
+      themselves (kanban task t_d1b228fa requirement 5: "include
+      bounded observer telemetry/aggregate counts needed to audit its
+      inputs").
+
+      Called from inside ``Phase0Sink.finalize_summary()`` itself (as
+      its ``acceptance_fn`` hook), strictly AFTER every file has been
+      closed/validated/summarized but BEFORE that same method's one
+      atomic ``summary.json`` write -- this is what keeps ``files`` and
+      ``acceptance`` landing in the exact same write (design: "Do not
+      write/patch summary twice").
+      """
+      nodes = [node.hostname for node in self._config.nodes]
+      completion = self._scheduler.completion_reason
+      result = evaluate_acceptance(
+         completion=completion,
+         duration_sec=self._config.duration_sec,
+         counter_interval_sec=self._config.counter_interval_sec,
+         census_interval_sec=self._config.census_interval_sec,
+         nodes=nodes,
+         counter_totals=dict(self._counter_success_totals),
+         census_totals=dict(self._census_success_totals),
+         counter_window_stats={
+            "complete_windows": self._complete_counter_windows,
+            "complete_windows_meeting_minimum":
+               self._complete_counter_windows_meeting_minimum,
+         },
+         scheduling_delay_samples=list(self._scheduling_delay_samples),
+         counter_probe_wall_seconds=list(self._counter_probe_wall_seconds),
+         census_probe_wall_seconds=list(self._census_probe_wall_seconds),
+         files_summary=files_summary,
+      )
+      # Bounded audit counts/aggregates over the SAME telemetry inputs
+      # just fed to evaluate_acceptance() above -- never raw argv,
+      # stdout, environment, or exception text (those never enter
+      # these particular fields to begin with; every value here is
+      # either a small integer count or an already-scrubbed sample
+      # list already bounded by _MAX_TELEMETRY_SAMPLES).
+      result["telemetry"] = {
+         "counter_success_totals": dict(self._counter_success_totals),
+         "census_success_totals": dict(self._census_success_totals),
+         "counter_window_stats": {
+            "complete_windows": self._complete_counter_windows,
+            "complete_windows_meeting_minimum":
+               self._complete_counter_windows_meeting_minimum,
+         },
+         "scheduling_delay_sample_count": len(self._scheduling_delay_samples),
+         "counter_probe_wall_seconds_sample_count":
+            len(self._counter_probe_wall_seconds),
+         "census_probe_wall_seconds_sample_count":
+            len(self._census_probe_wall_seconds),
+         "counter_payload_bytes_total": self._counter_payload_bytes_total,
+         "census_payload_bytes_total": self._census_payload_bytes_total,
+      }
+      return result
+
    async def run(self):
       """Run every configured target to completion (or until a fatal
       sink error stops the scheduler early), then finalize the sink
@@ -1168,7 +1386,7 @@ class Daemon:
          return EXIT_SINK_FATAL
 
       try:
-         await self._sink.finalize_summary()
+         await self._sink.finalize_summary(acceptance_fn=self._build_acceptance)
          self._sink.write_done()
       except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as exc:
          # Same fatal contract as the counter-poll boundary above:

@@ -162,6 +162,14 @@ class Scheduler:
       self._grace_sec = float(grace_sec)
       self._on_event = on_event if on_event is not None else (lambda event: None)
       self._stop_requested = False
+      # Set once, at the end of run(), from self._stop_requested's own
+      # final value -- an explicit, read-only classification of WHY
+      # run() returned (design/kanban task t_d1b228fa: "distinguish
+      # natural finite-duration completion ('clean') from any orderly
+      # request_stop(), including OS signal and direct external stop
+      # ('partial')"), never inferred from elapsed wall time by a
+      # caller. None until run() has actually returned.
+      self._completion_reason = None
       # asyncio.Semaphore/Event bind to the running loop at construction
       # time on this project's Python (3.9): building them here, in
       # __init__, would bind them to whatever loop happens to be current
@@ -187,6 +195,21 @@ class Scheduler:
       self._stop_requested = True
       if self._stop_event is not None:
          self._stop_event.set()
+
+   @property
+   def completion_reason(self):
+      """``None`` before ``run()`` returns; ``\"clean\"`` if every
+      target's own fixed dispatch grid reached the run's end time with
+      no ``request_stop()`` ever observed; ``\"partial\"`` if
+      ``request_stop()`` was called at any point during (or before)
+      the run -- including via an OS signal handler wired to it, or a
+      caller's direct call -- regardless of how much virtual/wall time
+      had elapsed when it fired. This is a first-class, explicitly
+      tracked classification (from ``self._stop_requested``'s own
+      final value once ``run()`` has finished), never inferred from
+      elapsed duration after the fact.
+      """
+      return self._completion_reason
 
    async def _emit(self, **fields):
       """Call ``self._on_event(fields)`` and, if it returns an awaitable
@@ -240,6 +263,7 @@ class Scheduler:
          for target in self._targets
       ]
       await asyncio.gather(*tasks)
+      self._completion_reason = "partial" if self._stop_requested else "clean"
 
    async def _interruptible_sleep(self, seconds):
       """Sleep ``seconds`` (via the injected ``sleep``) unless
@@ -472,6 +496,11 @@ class Scheduler:
 
    async def _execute(self, target, state, deadline):
       async with self._semaphore:
+         actual_start = self._clock()
+         await self._emit(
+            type="poll_start", node=target.node, loop=target.loop,
+            deadline=deadline, actual_start=actual_start,
+            scheduling_delay_sec=actual_start - deadline)
          try:
             result = await self._poll_fn(target.node, target.loop)
          except asyncio.CancelledError:

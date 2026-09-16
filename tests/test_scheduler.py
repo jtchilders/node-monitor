@@ -662,3 +662,181 @@ class TestGracefulDrain:
       _run(scenario())
 
       assert finished_cleanly == [1.0]
+
+
+# --------------------------------------------------------------------------
+# poll_start telemetry: an event/observation at the _execute start
+# boundary, with a nonnegative actual_start - deadline scheduling delay
+# that honestly includes time spent waiting for the shared semaphore
+# (kanban task t_d1b228fa).
+# --------------------------------------------------------------------------
+
+class TestPollStartTelemetry:
+   def test_poll_start_event_has_nonnegative_scheduling_delay(self):
+      clock = FakeClock()
+      events = []
+
+      async def poll_fn(node, loop):
+         return "ok"
+
+      target = Target(node="n1", loop="counter", interval_sec=10)
+      scheduler = Scheduler(
+         targets=[target], poll_fn=poll_fn, clock=clock.time,
+         sleep=clock.sleep, duration_sec=25, on_event=events.append)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(scheduler.run())
+         await clock.advance(25)
+         await run_task
+
+      _run(scenario())
+
+      starts = [e for e in events if e["type"] == "poll_start"]
+      assert len(starts) == 3
+      for event in starts:
+         assert event["scheduling_delay_sec"] >= 0.0
+         assert event["actual_start"] - event["deadline"] == \
+            event["scheduling_delay_sec"]
+      # With no contention (single target, ample concurrency budget),
+      # dispatch happens exactly on the fixed grid deadline -- zero
+      # scheduling delay.
+      assert [e["deadline"] for e in starts] == [0.0, 10.0, 20.0]
+      assert [e["scheduling_delay_sec"] for e in starts] == [0.0, 0.0, 0.0]
+
+   def test_poll_start_occurs_before_the_poll_itself_runs(self):
+      """The observation must land at the _execute start boundary --
+      before poll_fn is actually invoked -- so a caller mirroring
+      per-target state from poll_start sees it strictly before any
+      success/failure event for the same dispatch.
+      """
+      clock = FakeClock()
+      order = []
+
+      async def poll_fn(node, loop):
+         order.append("poll_fn")
+         return "ok"
+
+      def on_event(event):
+         if event["type"] in ("poll_start", "success"):
+            order.append(event["type"])
+
+      target = Target(node="n1", loop="counter", interval_sec=10)
+      scheduler = Scheduler(
+         targets=[target], poll_fn=poll_fn, clock=clock.time,
+         sleep=clock.sleep, duration_sec=5, on_event=on_event)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(scheduler.run())
+         await clock.advance(5)
+         await run_task
+
+      _run(scenario())
+
+      assert order == ["poll_start", "poll_fn", "success"]
+
+   def test_scheduling_delay_includes_time_spent_queued_on_the_semaphore(self):
+      """Design: 'Measure scheduling delay honestly at actual poll
+      start, including time waiting for the shared semaphore.' Two
+      targets dispatch at the identical deadline (t=0) but
+      max_parallel_polls=1 forces the second to queue behind the
+      first -- its poll_start must be measured AFTER it actually
+      acquires the semaphore, not at the shared deadline, so its
+      scheduling_delay_sec reflects the real queueing wait.
+      """
+      clock = FakeClock()
+      events = []
+
+      async def poll_fn(node, loop):
+         if node == "a":
+            await release_first.wait()
+         return "ok"
+
+      targets = [
+         Target(node="a", loop="counter", interval_sec=100),
+         Target(node="b", loop="counter", interval_sec=100),
+      ]
+      scheduler = Scheduler(
+         targets=targets, poll_fn=poll_fn, clock=clock.time,
+         sleep=clock.sleep, duration_sec=5, max_parallel_polls=1,
+         on_event=events.append)
+
+      async def scenario():
+         nonlocal release_first
+         release_first = asyncio.Event()
+         run_task = asyncio.ensure_future(scheduler.run())
+         # Let both targets attempt to dispatch at t=0; "a" grabs the
+         # single semaphore permit and blocks on release_first, "b"
+         # queues behind it. Advance virtual time while "b" is still
+         # queued, then release "a" so both eventually complete.
+         await asyncio.sleep(0)
+         await clock.advance(3)
+         release_first.set()
+         await clock.advance(5)
+         await run_task
+
+      release_first = None
+
+      _run(scenario())
+
+      starts = {e["node"]: e for e in events if e["type"] == "poll_start"}
+      assert starts["a"]["scheduling_delay_sec"] == 0.0
+      # "b" was queued behind "a" for 3 virtual seconds before it
+      # could actually start -- its scheduling delay must reflect
+      # that wait, not report zero just because both shared the same
+      # nominal deadline.
+      assert starts["b"]["scheduling_delay_sec"] >= 3.0
+
+
+# --------------------------------------------------------------------------
+# Explicit, read-only completion reason: natural finite-duration
+# completion ("clean") vs any orderly request_stop() ("partial") --
+# never inferred from elapsed wall time.
+# --------------------------------------------------------------------------
+
+class TestCompletionReason:
+   def test_completion_reason_is_none_before_run_starts(self):
+      target = Target(node="n1", loop="counter", interval_sec=10)
+      scheduler = Scheduler(
+         targets=[target], poll_fn=lambda node, loop: None,
+         duration_sec=10)
+      assert scheduler.completion_reason is None
+
+   def test_completion_reason_is_clean_after_natural_duration_elapses(self):
+      clock = FakeClock()
+
+      async def poll_fn(node, loop):
+         return "ok"
+
+      target = Target(node="n1", loop="counter", interval_sec=10)
+      scheduler = Scheduler(
+         targets=[target], poll_fn=poll_fn, clock=clock.time,
+         sleep=clock.sleep, duration_sec=25)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(scheduler.run())
+         await clock.advance(25)
+         await run_task
+
+      _run(scenario())
+      assert scheduler.completion_reason == "clean"
+
+   def test_completion_reason_is_partial_after_direct_request_stop(self):
+      clock = FakeClock()
+
+      async def poll_fn(node, loop):
+         return "ok"
+
+      target = Target(node="n1", loop="counter", interval_sec=10)
+      scheduler = Scheduler(
+         targets=[target], poll_fn=poll_fn, clock=clock.time,
+         sleep=clock.sleep, duration_sec=1000)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(scheduler.run())
+         await clock.advance(5)
+         scheduler.request_stop()
+         await clock.advance(10)
+         await run_task
+
+      _run(scenario())
+      assert scheduler.completion_reason == "partial"
