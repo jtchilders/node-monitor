@@ -27,7 +27,11 @@ configured remote node (``role: remote``) is polled via the existing
 config/control directory (``collector.transport.write_ssh_config`` --
 never the operator's interactive ``~/.ssh/config``), with
 ``BatchMode=yes``/``ConnectTimeout`` already baked into that generated
-config and ``expected_fqdn=node.hostname`` enforced per poll (design:
+config and ``expected_fqdn=None`` passed for every poll (kanban task
+t_88d97d8e: the per-call alias-equals-FQDN check this used to drive
+was itself a bug -- a legitimate ssh_target/alias never equals the
+probe's self-reported FQDN; the real per-node consistency and
+cross-node uniqueness checks now live in ``Daemon`` itself, design:
 "SSH aliases are transport identifiers only, never provenance").
 Which transport a given ``(node, loop)`` poll uses is decided purely
 by ``node.is_local`` inside ``_make_transport_fn`` -- no separate
@@ -426,12 +430,24 @@ def _config_to_raw(config):
    strict loader every other config value already went through,
    rather than constructing a second, parallel ``Phase0Config`` by
    hand that could drift from what ``load_config`` itself considers
-   valid.
+   valid. Each node's ``ssh_target`` is preserved exactly (present iff
+   it was configured, i.e. non-None) -- reconstructing only
+   ``hostname``/``role`` here would silently discard an explicit
+   remote ``ssh_target`` override on every ``daemon smoke`` invocation
+   (Polaris canary integration defect found after t_88d97d8e merged at
+   41e7c64), causing the daemon to dial the node's bookkeeping
+   ``hostname`` instead of the configured transport alias.
    """
    return {
       "system": config.system,
       "nodes": [
          {"hostname": node.hostname, "role": node.role}
+         if node.ssh_target is None
+         else {
+            "hostname": node.hostname,
+            "role": node.role,
+            "ssh_target": node.ssh_target,
+         }
          for node in config.nodes
       ],
       "output_root": config.output_root,
