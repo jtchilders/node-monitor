@@ -14,12 +14,17 @@ map.
 """
 
 import asyncio
+import codecs
 import hashlib
 import json
 import os
 import shutil
 import time
 
+from node_monitor.output._incremental_json import (
+   IncrementalJsonValidator,
+   JsonSyntaxError,
+)
 from node_monitor.output.contracts import validate_record
 
 
@@ -134,6 +139,295 @@ def validate_jsonl_artifact(path):
             malformed_count += 1
 
    return {
+      "valid_count": valid_count,
+      "malformed_count": malformed_count,
+      "truncated_final_line": truncated_final_line,
+   }
+
+
+# Review round 2 finding on the first version of this fix: plain binary-mode
+# line iteration (``for raw_line in handle``) asks the file object itself to
+# find the next ``b"\n"``, and when a "line" has none -- e.g. a pathological
+# or corrupted artifact with megabytes of unbroken content -- the file
+# object has no choice but to grow its own return buffer to hold that whole
+# span before it can even give it back to this function. A 128 MiB
+# newline-free artifact measurably raised RSS by ~213 MB under that
+# approach. Fixed-size ``handle.read(_SCAN_CHUNK_BYTES)`` calls are the only
+# way to put a real ceiling on what any single I/O call can hand back,
+# independent of where (or whether) a newline appears in the file.
+_SCAN_CHUNK_BYTES = 1 << 20  # 1 MiB per read() call, never more.
+
+# Review round 2 -> round 3 -> round 4 history on the in-progress-line
+# buffer (see scan_jsonl_artifact's docstring for the full story): a
+# per-line byte cap that rejects anything past it as malformed/truncated
+# breaks legitimate large JSON records (round 3's finding); no cap at all
+# reintroduces round 2's unbounded-memory defect for a pathological
+# no-newline line. Both constraints are satisfiable together ONLY by
+# switching, once a line's buffered bytes cross this threshold, from
+# "accumulate bytes then call json.loads() once" to an incremental
+# grammar validator that consumes bytes as they arrive and never
+# retains them (node_monitor.output._incremental_json). Below the
+# threshold the fast bytearray+json.loads path is used unchanged (it is
+# far faster for realistic Phase 0 record sizes -- see the module
+# docstring's benchmark note); at or above it, memory for that one line
+# is bounded by roughly this threshold plus one chunk_bytes, regardless
+# of how much larger the actual line turns out to be.
+_FAST_PATH_LINE_LIMIT_BYTES = 1 << 20  # 1 MiB
+
+
+def scan_jsonl_artifact(path, chunk_bytes=_SCAN_CHUNK_BYTES):
+   """Stream one JSONL artifact in bounded I/O and bounded per-line
+   memory, computing everything ``finalize_summary`` needs (byte size,
+   SHA-256, valid/malformed line counts, truncated-final-line status)
+   in a single pass.
+
+   Design/incident context: the 24h canary run phase0-canary-
+   20260916T172446Z died during finalization with no summary.json/DONE.
+   Its diagnostic_censuses.jsonl artifact was 1,764,399,017 bytes --
+   ``finalize_summary`` used to ``handle.read()`` that whole file once
+   for byte_size/sha256, then ``validate_jsonl_artifact`` read it a
+   SECOND time in full to split it into a Python list of lines, so
+   finalization transiently needed multiple GiB of RAM at exactly the
+   moment a run needed to finish cleanly. This function replaces both
+   of those whole-file reads with one pass of fixed-size
+   ``handle.read(chunk_bytes)`` calls (never a bare/whole-file ``.read()``,
+   never ``.split()`` on the whole content, never plain line iteration --
+   see ``_SCAN_CHUNK_BYTES``'s comment for why iteration alone is not
+   bounded). A running ``hashlib.sha256`` digests each fixed-size chunk as
+   it arrives; each chunk is searched for ``b"\\n"`` boundaries with
+   ``bytes.find`` to split it (at most ``chunk_bytes`` of data, so this
+   split is itself bounded) into completed lines plus at most one
+   still-open line carried into the next chunk.
+
+   Per-line validation is a two-tier strategy (see
+   ``_FAST_PATH_LINE_LIMIT_BYTES``'s comment for the review history
+   that led here): while a line's accumulated bytes stay under
+   ``_FAST_PATH_LINE_LIMIT_BYTES``, they are held in a plain
+   ``bytearray`` and validated with one ordinary ``json.loads`` call
+   once the line completes -- fast, and by construction identical to
+   ``validate_jsonl_artifact``'s per-line verdict, for every realistic
+   Phase 0 record. If a line's accumulated bytes ever cross that
+   threshold, the bytes already buffered plus everything still to come
+   for that same line are instead fed incrementally into an
+   ``IncrementalJsonValidator`` (node_monitor.output._incremental_json),
+   which tracks only JSON grammar STATE -- a stack of tiny frames
+   bounded by nesting depth -- and never retains the line's content.
+   This keeps memory bounded (roughly ``_FAST_PATH_LINE_LIMIT_BYTES``
+   plus one ``chunk_bytes``, regardless of how much larger the line
+   actually is) while still agreeing exactly with
+   ``validate_jsonl_artifact`` on whether any line -- of any length --
+   is valid JSON, since ``IncrementalJsonValidator`` independently
+   implements the identical grammar ``json.loads`` accepts (verified by
+   randomized/mutation fuzz testing against ``json.loads`` during
+   development; see ``tests.test_jsonl_output.TestIncrementalJsonValidator``).
+
+   Truncation semantics are preserved exactly from
+   ``validate_jsonl_artifact``: a crash mid-write can only ever damage
+   the LAST line (writes are appended whole, one at a time, under the
+   sink's lock), so only the final line, and only when the file does
+   not end in a newline, is eligible to be reported as
+   ``truncated_final_line`` instead of an ordinary malformed line.
+
+   Returns ``{\"byte_size\", \"sha256\", \"valid_count\", \"malformed_count\",
+   \"truncated_final_line\"}`` -- the same fields ``finalize_summary``
+   already assembled from ``validate_jsonl_artifact`` plus the two
+   separately-read ``byte_size``/``sha256`` fields, now computed
+   together in the one pass.
+   """
+   if not os.path.exists(path):
+      return {
+         "byte_size": 0,
+         "sha256": None,
+         "valid_count": 0,
+         "malformed_count": 0,
+         "truncated_final_line": False,
+      }
+
+   digest = hashlib.sha256()
+   byte_size = 0
+   valid_count = 0
+   malformed_count = 0
+   truncated_final_line = False
+
+   # The only per-line state carried across chunk-read iterations while
+   # under the fast-path threshold: the bytes of whichever line is
+   # currently in progress. Freed (a fresh bytearray) the instant that
+   # line is parsed/counted, so at any given moment this holds exactly
+   # one line's worth of content -- up to the threshold -- never the
+   # whole file, never a list of all lines.
+   line_buf = bytearray()
+
+   # Set instead of line_buf once a line crosses
+   # _FAST_PATH_LINE_LIMIT_BYTES: an IncrementalJsonValidator consuming
+   # that same line's remaining bytes without retaining them, plus the
+   # incremental UTF-8 decoder feeding it (mirrors
+   # ``content.decode("utf-8", "replace")`` exactly, just incrementally
+   # -- see decode_incremental's own note).
+   fallback_validator = None
+   fallback_decoder = None
+   # Review round 5 finding: JsonSyntaxError raised mid-feed does not by
+   # itself leave the validator's grammar state such that finish() will
+   # also raise -- e.g. an unexpected character between a completed
+   # value and its container's closing brace/bracket is a syntax error,
+   # but the container's stack frame is untouched, so a subsequent
+   # matching close character can still walk the stack back to empty
+   # and finish() reports success. Swallowing the error without
+   # recording it therefore let a line that IS malformed report as
+   # valid. This flag makes any syntax error sticky for the rest of the
+   # current line, independent of what the validator's internal state
+   # happens to look like afterward.
+   fallback_failed = False
+
+   def _decode_incremental(raw_bytes, final):
+      # decode() with errors="replace" one chunk at a time is exactly
+      # equivalent to decoding the whole line's bytes at once with
+      # errors="replace", for any way the bytes are chopped up --
+      # verified during development with randomized chunking including
+      # splits that land inside multi-byte sequences. ``final=True``
+      # must be passed at the true end of the line's bytes (a real
+      # newline terminator, or EOF) -- see review round 5 finding #2:
+      # omitting it silently drops a dangling incomplete multi-byte
+      # sequence instead of turning it into U+FFFD the way a one-shot
+      # ``bytes.decode("utf-8", "replace")`` on the whole line does.
+      return fallback_decoder.decode(raw_bytes, final)
+
+   def _start_fallback():
+      nonlocal fallback_validator, fallback_decoder, fallback_failed, line_buf
+      fallback_validator = IncrementalJsonValidator()
+      fallback_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+      fallback_failed = False
+      if line_buf:
+         text = _decode_incremental(bytes(line_buf), False)
+         try:
+            fallback_validator.feed_str(text)
+         except JsonSyntaxError:
+            fallback_failed = True  # sticky -- see fallback_failed's comment
+      line_buf = bytearray()
+
+   def _feed_fallback(raw_bytes):
+      nonlocal fallback_failed
+      text = _decode_incremental(raw_bytes, False)
+      if fallback_failed:
+         return  # already known-invalid; keep consuming bytes, don't re-feed
+      try:
+         fallback_validator.feed_str(text)
+      except JsonSyntaxError:
+         fallback_failed = True  # sticky -- see fallback_failed's comment
+
+   def _finalize_fallback_line():
+      nonlocal fallback_validator, fallback_decoder, fallback_failed
+      nonlocal valid_count, malformed_count
+      # Flush the incremental UTF-8 decoder with final=True so a
+      # dangling incomplete multi-byte sequence at the line's true end
+      # becomes U+FFFD (matching validate_jsonl_artifact's one-shot
+      # decode) instead of being silently dropped -- review round 5
+      # finding #2.
+      tail_text = _decode_incremental(b"", True)
+      if tail_text and not fallback_failed:
+         try:
+            fallback_validator.feed_str(tail_text)
+         except JsonSyntaxError:
+            fallback_failed = True
+      if fallback_failed:
+         malformed_count += 1
+      else:
+         try:
+            fallback_validator.finish()
+            valid_count += 1
+         except JsonSyntaxError:
+            malformed_count += 1
+      fallback_validator = None
+      fallback_decoder = None
+
+   def _append_to_current_line(segment):
+      # Route segment either into the fast bytearray path or the
+      # bounded-memory fallback, switching the moment the fast path
+      # would exceed its threshold.
+      nonlocal line_buf
+      if fallback_validator is not None:
+         if segment:
+            _feed_fallback(segment)
+         return
+      if segment:
+         line_buf.extend(segment)
+      if len(line_buf) > _FAST_PATH_LINE_LIMIT_BYTES:
+         _start_fallback()
+
+   def _finalize_complete_line():
+      # Called exactly when a real b"\n" terminator has been found for the
+      # accumulated line -- i.e. this line can never be the truncated
+      # final line, only valid or ordinarily malformed.
+      nonlocal malformed_count, valid_count, line_buf
+      if fallback_validator is not None:
+         _finalize_fallback_line()
+         return
+      if line_buf:
+         try:
+            json.loads(bytes(line_buf).decode("utf-8", "replace"))
+            valid_count += 1
+         except ValueError:
+            malformed_count += 1
+      # else: an empty line (consecutive newlines) -- matches
+      # validate_jsonl_artifact's `if not line: continue`, counted as
+      # neither valid nor malformed.
+
+   with open(path, "rb") as handle:
+      while True:
+         chunk = handle.read(chunk_bytes)
+         if not chunk:
+            break
+         digest.update(chunk)
+         byte_size += len(chunk)
+
+         start = 0
+         chunk_len = len(chunk)
+         while True:
+            newline_index = chunk.find(b"\n", start)
+            if newline_index == -1:
+               remainder = chunk[start:chunk_len]
+               _append_to_current_line(remainder)
+               break
+
+            segment = chunk[start:newline_index]
+            _append_to_current_line(segment)
+
+            _finalize_complete_line()
+            line_buf = bytearray()
+            start = newline_index + 1
+
+   # A non-empty (or in-fallback) line buffer at EOF means the file's
+   # last bytes were never terminated by b"\n" -- exactly the
+   # truncated-final-line case (or a well-formed final line missing
+   # only its trailing newline, which is valid, not truncated).
+   if fallback_validator is not None:
+      # Same final-flush-then-sticky-failure logic as
+      # _finalize_fallback_line, but a failure at true EOF (no
+      # newline) is "truncated", not "malformed" -- matching every
+      # other truncated-final-line branch in this function.
+      tail_text = _decode_incremental(b"", True)
+      if tail_text and not fallback_failed:
+         try:
+            fallback_validator.feed_str(tail_text)
+         except JsonSyntaxError:
+            fallback_failed = True
+      if fallback_failed:
+         truncated_final_line = True
+      else:
+         try:
+            fallback_validator.finish()
+            valid_count += 1
+         except JsonSyntaxError:
+            truncated_final_line = True
+   elif line_buf:
+      try:
+         json.loads(bytes(line_buf).decode("utf-8", "replace"))
+         valid_count += 1
+      except ValueError:
+         truncated_final_line = True
+
+   return {
+      "byte_size": byte_size,
+      "sha256": digest.hexdigest(),
       "valid_count": valid_count,
       "malformed_count": malformed_count,
       "truncated_final_line": truncated_final_line,
@@ -327,30 +621,26 @@ class Phase0Sink:
             handle.close()
          self._file_handles = {}
 
+         # One streaming pass per artifact (scan_jsonl_artifact), not the
+         # old two whole-file reads (a raw read() here for byte_size/
+         # sha256, then a second full read() inside
+         # validate_jsonl_artifact for line validation). See
+         # scan_jsonl_artifact's docstring for the canary incident this
+         # fixes: a multi-GiB artifact made that double whole-file-read
+         # pattern transiently need multiple GiB of RAM right at
+         # finalization.
          files_summary = {}
          for record_type, filename in _FILENAMES.items():
             path = os.path.join(self.run_dir, filename)
-            if os.path.exists(path):
-               with open(path, "rb") as handle:
-                  content = handle.read()
-               validation = validate_jsonl_artifact(path)
-               files_summary[record_type] = {
-                  "filename": filename,
-                  "record_count": self._record_counts[record_type],
-                  "byte_size": len(content),
-                  "malformed_count": validation["malformed_count"],
-                  "truncated_final_line": validation["truncated_final_line"],
-                  "sha256": hashlib.sha256(content).hexdigest(),
-               }
-            else:
-               files_summary[record_type] = {
-                  "filename": filename,
-                  "record_count": 0,
-                  "byte_size": 0,
-                  "malformed_count": 0,
-                  "truncated_final_line": False,
-                  "sha256": None,
-               }
+            scan = scan_jsonl_artifact(path)
+            files_summary[record_type] = {
+               "filename": filename,
+               "record_count": self._record_counts[record_type],
+               "byte_size": scan["byte_size"],
+               "malformed_count": scan["malformed_count"],
+               "truncated_final_line": scan["truncated_final_line"],
+               "sha256": scan["sha256"],
+            }
 
          summary = {
             "run_id": self.run_id,
