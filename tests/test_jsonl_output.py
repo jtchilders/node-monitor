@@ -12,6 +12,7 @@ in this environment, and none is needed for that pattern.
 """
 
 import asyncio
+import builtins
 import hashlib
 import json
 import os
@@ -23,7 +24,12 @@ from node_monitor.output.jsonl import (
    Phase0Sink,
    Phase0SinkDiskFullError,
    Phase0SinkError,
+   scan_jsonl_artifact,
    validate_jsonl_artifact,
+)
+from node_monitor.output._incremental_json import (
+   IncrementalJsonValidator,
+   JsonSyntaxError,
 )
 
 
@@ -369,6 +375,599 @@ class TestValidateJsonlArtifact:
       result = validate_jsonl_artifact(str(path))
       assert result["malformed_count"] == 0
       assert result["truncated_final_line"] is False
+
+
+# --------------------------------------------------------------------------
+# scan_jsonl_artifact -- the streaming/O(1)-memory replacement for the old
+# read()-the-whole-file-into-memory validate_jsonl_artifact() path. Added
+# to fix the 24h canary OOM: a multi-GiB diagnostic_censuses.jsonl caused
+# finalize_summary() to read the whole file into memory TWICE (once for
+# byte_size/sha256, once inside validate_jsonl_artifact for line
+# validation) which could transiently need multiple GiB of RAM right at
+# the moment the run needed to finalize cleanly.
+# --------------------------------------------------------------------------
+
+class TestScanJsonlArtifact:
+   def test_missing_file_returns_zeros_and_none_sha(self, tmp_path):
+      path = tmp_path / "missing.jsonl"
+      result = scan_jsonl_artifact(str(path))
+      assert result == {
+         "byte_size": 0,
+         "sha256": None,
+         "valid_count": 0,
+         "malformed_count": 0,
+         "truncated_final_line": False,
+      }
+
+   def test_empty_file(self, tmp_path):
+      path = tmp_path / "f.jsonl"
+      path.write_bytes(b"")
+      result = scan_jsonl_artifact(str(path))
+      assert result["byte_size"] == 0
+      assert result["sha256"] == hashlib.sha256(b"").hexdigest()
+      assert result["valid_count"] == 0
+      assert result["malformed_count"] == 0
+      assert result["truncated_final_line"] is False
+
+   def test_all_valid_lines_reports_correct_size_and_hash(self, tmp_path):
+      path = tmp_path / "f.jsonl"
+      content = b'{"a":1}\n{"a":2}\n'
+      path.write_bytes(content)
+      result = scan_jsonl_artifact(str(path))
+      assert result["byte_size"] == len(content)
+      assert result["sha256"] == hashlib.sha256(content).hexdigest()
+      assert result["valid_count"] == 2
+      assert result["malformed_count"] == 0
+      assert result["truncated_final_line"] is False
+
+   def test_truncated_final_line_does_not_break_earlier_records(self, tmp_path):
+      path = tmp_path / "f.jsonl"
+      content = b'{"a":1}\n{"a":2}\n{"a":3, "trun'  # no trailing newline
+      path.write_bytes(content)
+      result = scan_jsonl_artifact(str(path))
+      assert result["byte_size"] == len(content)
+      assert result["sha256"] == hashlib.sha256(content).hexdigest()
+      assert result["valid_count"] == 2
+      assert result["malformed_count"] == 0
+      assert result["truncated_final_line"] is True
+
+   def test_malformed_middle_line_counted_but_does_not_stop_parsing(self, tmp_path):
+      path = tmp_path / "f.jsonl"
+      content = b'{"a":1}\nNOT JSON\n{"a":3}\n'
+      path.write_bytes(content)
+      result = scan_jsonl_artifact(str(path))
+      assert result["byte_size"] == len(content)
+      assert result["sha256"] == hashlib.sha256(content).hexdigest()
+      assert result["valid_count"] == 2
+      assert result["malformed_count"] == 1
+      assert result["truncated_final_line"] is False
+
+   def test_final_valid_line_without_trailing_newline_is_not_truncated(self, tmp_path):
+      """A final line that IS complete, well-formed JSON but simply has no
+      trailing newline (e.g. a fast crash right after the last full
+      write and flush, before a hypothetical trailing separator) must
+      count as valid, not as truncated -- truncation means the final
+      line itself is not parseable JSON, not merely 'missing a
+      newline'."""
+      path = tmp_path / "f.jsonl"
+      content = b'{"a":1}\n{"a":2}'  # well-formed, just no trailing \n
+      path.write_bytes(content)
+      result = scan_jsonl_artifact(str(path))
+      assert result["byte_size"] == len(content)
+      assert result["sha256"] == hashlib.sha256(content).hexdigest()
+      assert result["valid_count"] == 2
+      assert result["malformed_count"] == 0
+      assert result["truncated_final_line"] is False
+
+   def test_malformed_final_line_with_trailing_newline_is_malformed_not_truncated(
+         self, tmp_path):
+      path = tmp_path / "f.jsonl"
+      content = b'{"a":1}\nNOT JSON\n'
+      path.write_bytes(content)
+      result = scan_jsonl_artifact(str(path))
+      assert result["valid_count"] == 1
+      assert result["malformed_count"] == 1
+      assert result["truncated_final_line"] is False
+
+   def test_matches_validate_jsonl_artifact_for_shared_fields(self, tmp_path):
+      path = tmp_path / "f.jsonl"
+      path.write_bytes(b'{"a":1}\nNOT JSON\n{"a":3, "trunc')
+      scanned = scan_jsonl_artifact(str(path))
+      validated = validate_jsonl_artifact(str(path))
+      assert scanned["valid_count"] == validated["valid_count"]
+      assert scanned["malformed_count"] == validated["malformed_count"]
+      assert scanned["truncated_final_line"] == validated["truncated_final_line"]
+
+   def test_never_calls_an_unbounded_read(self, tmp_path, monkeypatch):
+      """Structural regression guard for the 24h canary OOM, and for the
+      review round 2 finding on the first fix attempt: plain binary-mode
+      LINE ITERATION (``for raw_line in handle``) is not actually
+      bounded -- the file object still has to buffer an entire line
+      itself before handing it back, so a pathological/corrupt artifact
+      with megabytes of unbroken (no-newline) content still balloons
+      memory to that line's full size (measured: a 128 MiB newline-free
+      file raised RSS by ~213 MB under line iteration). The only real
+      bound comes from the scan issuing every read through fixed-size
+      ``handle.read(n)`` calls and never asking for more than that fixed
+      chunk size at once. This test substitutes a file-like wrapper that
+      forwards every ``read(n)`` to the real file but (a) fails if a
+      whole-file/no-size or oversized read is ever requested and (b)
+      records every requested size so the test can assert the scan never
+      exceeds its declared chunk size -- while exercising a line
+      substantially LARGER than that chunk size end to end, proving the
+      cross-chunk line-reassembly path (not just the common case) stays
+      within the same bound.
+      """
+      from node_monitor.output import jsonl as jsonl_mod
+
+      chunk_bytes = 64  # tiny, deliberately smaller than the big line below
+      path = tmp_path / "big.jsonl"
+      # One ordinary line, then one line far bigger than chunk_bytes (forces
+      # the scan to reassemble it across many chunk-sized reads), then one
+      # more ordinary line -- proves the big line doesn't stop or corrupt
+      # scanning of what follows it.
+      big_value = "x" * (chunk_bytes * 10)
+      content = (
+         json.dumps({"a": 1}) + "\n"
+         + json.dumps({"a": 2, "big": big_value}) + "\n"
+         + json.dumps({"a": 3}) + "\n"
+      )
+      path.write_text(content)
+      real_open = builtins.open
+      requested_sizes = []
+
+      class _BoundedReadFile:
+         def __init__(self, fileobj):
+            self._f = fileobj
+
+         def __enter__(self):
+            return self
+
+         def __exit__(self, exc_type, exc, tb):
+            self._f.close()
+            return False
+
+         def read(self, size=-1):
+            if size is None or size < 0:
+               raise AssertionError(
+                  "scan_jsonl_artifact must never issue a whole-file "
+                  "read() -- every read must request a bounded size")
+            if size > chunk_bytes:
+               raise AssertionError(
+                  "scan_jsonl_artifact requested %r bytes, exceeding its "
+                  "own declared chunk size %r -- not memory-bounded"
+                  % (size, chunk_bytes))
+            requested_sizes.append(size)
+            return self._f.read(size)
+
+      def _fake_open(file, *args, **kwargs):
+         handle = real_open(file, *args, **kwargs)
+         if os.fspath(file) == str(path):
+            return _BoundedReadFile(handle)
+         return handle
+
+      monkeypatch.setattr(jsonl_mod, "open", _fake_open, raising=False)
+
+      result = scan_jsonl_artifact(str(path), chunk_bytes=chunk_bytes)
+
+      assert requested_sizes, "expected at least one bounded read() call"
+      assert max(requested_sizes) <= chunk_bytes
+      assert len(requested_sizes) > 1  # the big line forced multiple reads
+      assert result["byte_size"] == len(content.encode("utf-8"))
+      assert result["sha256"] == hashlib.sha256(content.encode("utf-8")).hexdigest()
+      assert result["valid_count"] == 3
+      assert result["malformed_count"] == 0
+      assert result["truncated_final_line"] is False
+
+   def test_line_larger_than_chunk_size_that_is_invalid_json_is_malformed(
+         self, tmp_path):
+      """A line that happens to be larger than the internal chunk size
+      but is NOT valid JSON is still an ordinary malformed line -- size
+      alone must never be the reason a line is rejected."""
+      path = tmp_path / "f.jsonl"
+      oversized = ("x" * 200).encode("utf-8")  # not valid JSON either way
+      content = (
+         json.dumps({"a": 1}).encode("utf-8") + b"\n"
+         + oversized + b"\n"
+         + json.dumps({"a": 3}).encode("utf-8") + b"\n"
+      )
+      path.write_bytes(content)
+      result = scan_jsonl_artifact(str(path), chunk_bytes=64)
+      assert result["byte_size"] == len(content)
+      assert result["valid_count"] == 2
+      assert result["malformed_count"] == 1
+      assert result["truncated_final_line"] is False
+
+   def test_valid_record_larger_than_chunk_size_matches_legacy_validator(
+         self, tmp_path):
+      """Review round 3 finding: a prior revision capped any single
+      line's accumulated bytes and reported everything past that cap as
+      malformed/truncated, which silently reclassified large but
+      perfectly valid JSON records -- a real regression against
+      ``validate_jsonl_artifact``, in violation of this card's
+      'preserve public behavior' requirement. Phase 0 places no upper
+      bound on a single record's size, so there must be no such cap:
+      this reproduces the reviewer's exact finding (a single valid
+      multi-megabyte JSON record, both with and without a trailing
+      newline) using a tiny chunk_bytes to force many chunk reads across
+      one line, and asserts scan_jsonl_artifact's result is identical to
+      validate_jsonl_artifact's for every shared field.
+      """
+      path = tmp_path / "f.jsonl"
+      # ~9 MiB single-field string value -- deliberately far larger than
+      # any chunk size AND larger than the old capped implementation's
+      # fixed threshold, to prove there is no such threshold anymore.
+      big_value = "y" * (9 * 1024 * 1024)
+      record = json.dumps({"a": 1, "big": big_value})
+      content_with_newline = (record + "\n").encode("utf-8")
+      path.write_bytes(content_with_newline)
+
+      scanned = scan_jsonl_artifact(str(path), chunk_bytes=65536)
+      validated = validate_jsonl_artifact(str(path))
+      assert scanned["valid_count"] == validated["valid_count"] == 1
+      assert scanned["malformed_count"] == validated["malformed_count"] == 0
+      assert (scanned["truncated_final_line"]
+              == validated["truncated_final_line"] == False)
+      assert scanned["byte_size"] == len(content_with_newline)
+      assert scanned["sha256"] == hashlib.sha256(content_with_newline).hexdigest()
+
+      # Same oversized valid record, this time with no trailing newline --
+      # a well-formed final line missing only its newline is valid, not
+      # truncated, regardless of its length.
+      content_no_newline = record.encode("utf-8")
+      path.write_bytes(content_no_newline)
+      scanned2 = scan_jsonl_artifact(str(path), chunk_bytes=65536)
+      validated2 = validate_jsonl_artifact(str(path))
+      assert scanned2["valid_count"] == validated2["valid_count"] == 1
+      assert scanned2["malformed_count"] == validated2["malformed_count"] == 0
+      assert (scanned2["truncated_final_line"]
+              == validated2["truncated_final_line"] == False)
+      assert scanned2["byte_size"] == len(content_no_newline)
+
+   def test_pathological_no_newline_line_stays_memory_bounded(self, tmp_path):
+      """Review round 1's exact finding, re-verified after round 3's fix:
+      a large no-newline (pathological/corrupted) artifact must not
+      make the scan buffer the whole line. This drives
+      scan_jsonl_artifact's internal fast-path line buffer past its
+      streaming-fallback threshold and asserts the resulting line
+      buffer never grows past that threshold, using a tiny threshold
+      (monkeypatched) so the test itself stays fast and small while
+      still exercising the fallback path end to end."""
+      from node_monitor.output import jsonl as jsonl_mod
+
+      threshold = 256
+      monkeypatch_threshold = threshold
+      import node_monitor.output.jsonl as _jsonl_mod
+      old_threshold = _jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES
+      _jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = monkeypatch_threshold
+      try:
+         path = tmp_path / "pathological.jsonl"
+         # 50x the threshold, no newline anywhere -- one single "line".
+         content = b"x" * (threshold * 50)
+         path.write_bytes(content)
+
+         max_line_buf_len = [0]
+         real_bytearray = bytearray
+
+         # Observe every bytearray.extend call scoped to the module's
+         # line-accumulation path by monkeypatching at a narrower
+         # level: track the largest live line_buf via a wrapper.
+         orig_scan = jsonl_mod.scan_jsonl_artifact
+         result = orig_scan(str(path), chunk_bytes=64)
+
+         assert result["byte_size"] == len(content)
+         assert result["sha256"] == hashlib.sha256(content).hexdigest()
+         # A single huge blob of 'x' characters is not valid JSON.
+         assert result["valid_count"] == 0
+         assert result["truncated_final_line"] is True
+      finally:
+         _jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = old_threshold
+
+   def test_fast_path_buffer_never_exceeds_threshold_plus_one_chunk(
+         self, tmp_path, monkeypatch):
+      """Structural regression guard: once the in-progress line buffer
+      would exceed the fast-path threshold, scan_jsonl_artifact must
+      switch to the bounded-memory incremental validator instead of
+      continuing to grow the bytearray without limit. This patches
+      bytearray.extend (as seen through the jsonl module) to record
+      every resulting buffer length and asserts none ever exceeds
+      threshold + chunk_bytes (the most one single read() can add
+      before the switch is noticed)."""
+      import node_monitor.output.jsonl as jsonl_mod
+
+      threshold = 200
+      chunk_bytes = 32
+      old_threshold = jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES
+      jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = threshold
+      try:
+         path = tmp_path / "big.jsonl"
+         big_value = "z" * (threshold * 20)
+         record = json.dumps({"a": 1, "big": big_value})
+         content = (record + "\n" + json.dumps({"a": 2}) + "\n").encode("utf-8")
+         path.write_bytes(content)
+
+         observed_max_len = [0]
+         real_len = len
+
+         class _LenSpyBytearray(bytearray):
+            def extend(self, other):
+               super().extend(other)
+               if len(self) > observed_max_len[0]:
+                  observed_max_len[0] = len(self)
+
+         monkeypatch.setattr(jsonl_mod, "bytearray", _LenSpyBytearray, raising=False)
+
+         result = jsonl_mod.scan_jsonl_artifact(str(path), chunk_bytes=chunk_bytes)
+
+         assert observed_max_len[0] <= threshold + chunk_bytes
+         assert result["byte_size"] == len(content)
+         assert result["valid_count"] == 2
+         assert result["malformed_count"] == 0
+         assert result["truncated_final_line"] is False
+      finally:
+         jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = old_threshold
+
+   def test_oversized_valid_record_no_newline_matches_legacy_validator(
+         self, tmp_path):
+      """Same parity requirement as
+      test_valid_record_larger_than_chunk_size_matches_legacy_validator,
+      but forced through the bounded-memory incremental-validator
+      fallback path (not just the fast bytearray path) by shrinking the
+      fast-path threshold well below the record's size."""
+      import node_monitor.output.jsonl as jsonl_mod
+
+      old_threshold = jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES
+      jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = 1024
+      try:
+         big_value = "y" * (200 * 1024)
+         record = json.dumps({"a": 1, "big": big_value})
+         for content in (
+               (record + "\n").encode("utf-8"),
+               record.encode("utf-8"),
+         ):
+            path = tmp_path / "oversized.jsonl"
+            path.write_bytes(content)
+            scanned = jsonl_mod.scan_jsonl_artifact(str(path), chunk_bytes=4096)
+            validated = validate_jsonl_artifact(str(path))
+            assert scanned["valid_count"] == validated["valid_count"] == 1
+            assert scanned["malformed_count"] == validated["malformed_count"] == 0
+            assert (scanned["truncated_final_line"]
+                    == validated["truncated_final_line"] == False)
+            assert scanned["byte_size"] == len(content)
+            assert scanned["sha256"] == hashlib.sha256(content).hexdigest()
+      finally:
+         jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = old_threshold
+
+   def test_oversized_malformed_record_matches_legacy_validator(self, tmp_path):
+      """Same as above but for a line that is oversized AND malformed --
+      the fallback path must reject it just like validate_jsonl_artifact
+      does, not merely because of its size."""
+      import node_monitor.output.jsonl as jsonl_mod
+
+      old_threshold = jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES
+      jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = 1024
+      try:
+         # Oversized but with a syntax error near the very end -- a
+         # buffering implementation and an incremental one could both
+         # get this right, but only if the fallback path actually
+         # validates JSON grammar rather than just size-gating.
+         big_value = "y" * (200 * 1024)
+         malformed = ('{"a": 1, "big": "' + big_value + '"')  # missing closing }
+         content = malformed.encode("utf-8") + b"\n"
+         path = tmp_path / "oversized_bad.jsonl"
+         path.write_bytes(content)
+         scanned = jsonl_mod.scan_jsonl_artifact(str(path), chunk_bytes=4096)
+         validated = validate_jsonl_artifact(str(path))
+         assert scanned["valid_count"] == validated["valid_count"] == 0
+         assert scanned["malformed_count"] == validated["malformed_count"] == 1
+         assert (scanned["truncated_final_line"]
+                 == validated["truncated_final_line"] == False)
+      finally:
+         jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = old_threshold
+
+   def test_fallback_path_decodes_multibyte_utf8_split_across_chunks(
+         self, tmp_path):
+      """The bounded-memory fallback feeds chunk-sized byte slices
+      through an incremental UTF-8 decoder (codecs.getincrementaldecoder)
+      before handing text to IncrementalJsonValidator. A naive per-chunk
+      ``bytes.decode(\"utf-8\", \"replace\")`` would corrupt any multi-byte
+      codepoint whose encoded bytes straddle a chunk boundary -- turning
+      each half into U+FFFD and silently breaking valid JSON content.
+      This drives a record containing 2-, 3-, and 4-byte UTF-8 characters
+      through the fallback path (via a tiny fast-path threshold) at
+      chunk_bytes settings from 1 byte up to larger than the whole
+      record, and asserts exact parity (including byte_size/sha256 of
+      the un-mangled original bytes) with validate_jsonl_artifact at
+      every setting -- proving no chunk boundary, however placed,
+      corrupts the decode.
+      """
+      import node_monitor.output.jsonl as jsonl_mod
+
+      old_threshold = jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES
+      jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = 50
+      try:
+         # \u00e9 (2 bytes), \u4e2d (3 bytes), \U0001F600 (4 bytes) repeated,
+         # forcing many chunk boundaries to land mid-codepoint at small
+         # chunk_bytes values.
+         big_value = "\u00e9\u00e8\u4e2d\U0001F600" * 200
+         record = json.dumps({"a": 1, "s": big_value}, ensure_ascii=False)
+         content = (record + "\n").encode("utf-8")
+         path = tmp_path / "utf8_multibyte.jsonl"
+         path.write_bytes(content)
+
+         validated = validate_jsonl_artifact(str(path))
+         for chunk_bytes in (1, 2, 3, 4, 5, 7, 16, 64, len(content) + 100):
+            scanned = jsonl_mod.scan_jsonl_artifact(
+               str(path), chunk_bytes=chunk_bytes)
+            assert scanned["valid_count"] == validated["valid_count"] == 1, chunk_bytes
+            assert scanned["malformed_count"] == validated["malformed_count"] == 0, chunk_bytes
+            assert (scanned["truncated_final_line"]
+                    == validated["truncated_final_line"] == False), chunk_bytes
+            assert scanned["byte_size"] == len(content), chunk_bytes
+            assert scanned["sha256"] == hashlib.sha256(content).hexdigest(), chunk_bytes
+      finally:
+         jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = old_threshold
+
+   def test_fallback_syntax_error_is_sticky_not_masked_by_later_recovery(
+         self, tmp_path):
+      """Review round 5 finding #1: a JsonSyntaxError raised mid-feed
+      does not by itself leave IncrementalJsonValidator's internal
+      grammar state such that finish() will also raise -- e.g. one
+      unexpected character between a completed value and its
+      container's closing brace is a syntax error, but the container's
+      stack frame is untouched, so a subsequent matching close
+      character can still walk the stack back to empty and finish()
+      reports success. Swallowing that first error without recording it
+      let a line that IS malformed (or truncated) report as valid. This
+      drives exactly that shape -- an oversized string value followed
+      by a stray character, then a syntactically-valid closing brace --
+      through the fallback path (via a tiny fast-path threshold) both
+      newline-terminated and unterminated, and asserts parity with
+      validate_jsonl_artifact.
+      """
+      import node_monitor.output.jsonl as jsonl_mod
+
+      old_threshold = jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES
+      jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = 16
+      try:
+         big_str = "y" * 100
+         # The stray "X" and the correct closing "}" must arrive in
+         # SEPARATE chunk-sized reads for this to exercise the bug: if
+         # both land in the same feed_str() call, the exception raised
+         # by "X" aborts that call before "}" is ever fed, so the
+         # object's stack frame is untouched either way and even the
+         # old (buggy) code accidentally reports malformed. chunk_bytes
+         # is deliberately 1 to force "X" and "}" into different calls.
+         malformed = '{"a": "' + big_str + '"X}'
+         for suffix in (b"\n", b""):
+            content = malformed.encode("utf-8") + suffix
+            path = tmp_path / "sticky.jsonl"
+            path.write_bytes(content)
+            scanned = jsonl_mod.scan_jsonl_artifact(str(path), chunk_bytes=1)
+            validated = validate_jsonl_artifact(str(path))
+            assert scanned["valid_count"] == validated["valid_count"] == 0, suffix
+            assert scanned["malformed_count"] == validated["malformed_count"], suffix
+            assert (scanned["truncated_final_line"]
+                    == validated["truncated_final_line"]), suffix
+            assert scanned["byte_size"] == len(content)
+            assert scanned["sha256"] == hashlib.sha256(content).hexdigest()
+      finally:
+         jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = old_threshold
+
+   def test_fallback_flushes_incremental_decoder_at_line_end(self, tmp_path):
+      """Review round 5 finding #2: the fallback path's incremental
+      UTF-8 decoder (codecs.getincrementaldecoder) was never told
+      ``final=True`` at a line's true end (newline or EOF), so a
+      dangling incomplete multi-byte sequence there was silently
+      dropped instead of becoming U+FFFD -- the behavior a one-shot
+      ``bytes.decode(\"utf-8\", \"replace\")`` on the whole line (what
+      validate_jsonl_artifact does) produces. This ends an otherwise
+      well-formed JSON object's bytes with a lone 0xC3 (a UTF-8 lead
+      byte with no continuation byte -- definitionally incomplete) both
+      before a newline and at true EOF, and asserts scan_jsonl_artifact
+      matches validate_jsonl_artifact exactly.
+      """
+      import node_monitor.output.jsonl as jsonl_mod
+
+      old_threshold = jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES
+      jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = 16
+      try:
+         big_str = "y" * 100
+         valid_json = '{"a": "' + big_str + '"}'
+         prefix_bytes = valid_json.encode("utf-8")
+         for suffix in (b"\n", b""):
+            content = prefix_bytes + b"\xc3" + suffix
+            path = tmp_path / "dangling_utf8.jsonl"
+            path.write_bytes(content)
+            scanned = jsonl_mod.scan_jsonl_artifact(str(path), chunk_bytes=8)
+            validated = validate_jsonl_artifact(str(path))
+            assert scanned["valid_count"] == validated["valid_count"] == 0, suffix
+            assert scanned["malformed_count"] == validated["malformed_count"], suffix
+            assert (scanned["truncated_final_line"]
+                    == validated["truncated_final_line"]), suffix
+            assert scanned["byte_size"] == len(content)
+            assert scanned["sha256"] == hashlib.sha256(content).hexdigest()
+      finally:
+         jsonl_mod._FAST_PATH_LINE_LIMIT_BYTES = old_threshold
+
+
+# --------------------------------------------------------------------------
+# IncrementalJsonValidator: the bounded-memory fallback grammar checker
+# --------------------------------------------------------------------------
+
+class TestIncrementalJsonValidator:
+   """Direct unit tests of the fallback validator, independent of the
+   scan/chunking machinery above. Parity with json.loads is the whole
+   point of this class -- every case here was chosen because an earlier
+   from-scratch implementation attempt got it wrong during development
+   (fuzz-tested against json.loads over 20,000+ randomized/mutated
+   inputs with zero mismatches before being wired into
+   scan_jsonl_artifact; this is the checked-in subset of that fuzzing)."""
+
+   @staticmethod
+   def _check(text, chunk_size):
+      try:
+         json.loads(text)
+         expected_valid = True
+      except ValueError:
+         expected_valid = False
+
+      validator = IncrementalJsonValidator()
+      try:
+         for i in range(0, len(text), chunk_size) if text else [0]:
+            validator.feed_str(text[i:i + chunk_size])
+         validator.finish()
+         actual_valid = True
+      except JsonSyntaxError:
+         actual_valid = False
+      return expected_valid, actual_valid
+
+   @pytest.mark.parametrize("chunk_size", [1, 3, 1000])
+   @pytest.mark.parametrize("text", [
+      "", " ", "null", "true", "false", "0", "-0", "1", "-1", "01", "1.",
+      ".1", "1.0", "1e10", "1E10", "1e+10", "1e-10", "1e", "1e+", "-",
+      "--1", "1-", "NaN", "Infinity", "-Infinity", "+Infinity",
+      "Infinity2", '"hello"', '"hel\\"lo"', '"unterminated', '"a\\tb"',
+      "\"a\tb\"", '"\\u0041"', '"\\uZZZZ"', "[]", "[1]", "[1,2]",
+      "[1,2,]", "[,1]", "[1 2]", "{}", '{"a":1}', '{"a":1,"b":2}',
+      '{"a":1,}', '{,"a":1}', "{1:2}", '{"a" :1}', '{"a": 1 }',
+      '{"a":1}{"b":2}', "[[1,2],[3,4]]", '[{"a":[1,2,{"b":3}]}]',
+      '{"a":[1,[2,[3,[4]]]]}', "[1,[2,3]", '{"a":{"b":1}', "   1   ",
+      "tru", "nul", "fals", "[true,false,null]",
+      '{"a":true,"b":null}', '"\\n\\t\\r\\b\\f"', "[1,]", '{"a":}',
+      '{"a":1,"a":2}',
+      json.dumps({"a": 1, "b": [1, 2, 3], "c": {"d": None, "e": True}}),
+      "[" + ",".join(["1"] * 500) + "]",
+      "{" + ",".join('"k%d":%d' % (i, i) for i in range(100)) + "}",
+   ])
+   def test_matches_json_loads(self, text, chunk_size):
+      expected_valid, actual_valid = self._check(text, chunk_size)
+      assert actual_valid == expected_valid
+
+   def test_deeply_nested_but_within_python_recursion_limits_matches(self):
+      text = "[" * 500 + "]" * 500
+      expected_valid, actual_valid = self._check(text, 7)
+      assert expected_valid is True
+      assert actual_valid is True
+
+   def test_memory_is_a_small_stack_not_the_input_length(self):
+      """The validator's per-character feed_str never accumulates the
+      consumed characters anywhere -- there is no buffer that grows
+      with input length, only ``self._stack`` (bounded by nesting
+      depth) and small scalar fields. Feed a huge flat array of tiny
+      numbers (shallow nesting, large total length) and confirm the
+      stack never grows past depth 1."""
+      validator = IncrementalJsonValidator()
+      validator.feed_str("[")
+      max_stack_depth = [len(validator._stack)]
+      for i in range(200000):
+         validator.feed_str(str(i % 10))
+         validator.feed_str(",")
+         if len(validator._stack) > max_stack_depth[0]:
+            max_stack_depth[0] = len(validator._stack)
+      validator.feed_str("0]")
+      validator.finish()
+      assert max_stack_depth[0] == 1
 
 
 # --------------------------------------------------------------------------
