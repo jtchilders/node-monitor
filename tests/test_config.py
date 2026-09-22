@@ -218,6 +218,34 @@ class TestMaxParallelPolls:
 
 
 # --------------------------------------------------------------------------
+# keep_raw_args: optional, defaults to True (ALCF is a monitored federal
+# system with no in-facility privacy expectation -- full argv is captured
+# verbatim by default; kanban task B1).
+# --------------------------------------------------------------------------
+
+class TestKeepRawArgs:
+   def test_absent_defaults_to_true(self):
+      cfg = _load()
+      assert cfg.keep_raw_args is True
+
+   def test_explicit_true_accepted(self):
+      cfg = _load(keep_raw_args=True)
+      assert cfg.keep_raw_args is True
+
+   def test_explicit_false_accepted(self):
+      cfg = _load(keep_raw_args=False)
+      assert cfg.keep_raw_args is False
+
+   def test_non_bool_rejected(self):
+      with pytest.raises(ConfigError):
+         _load(keep_raw_args="yes")
+
+   def test_int_rejected(self):
+      with pytest.raises(ConfigError):
+         _load(keep_raw_args=1)
+
+
+# --------------------------------------------------------------------------
 # Unknown-key rejection / required fields
 # --------------------------------------------------------------------------
 

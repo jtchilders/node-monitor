@@ -179,10 +179,16 @@ def _format_seconds(value):
    return str(value)
 
 
-def build_local_argv(probe_python, probe_script_path, loop, max_seconds):
+def build_local_argv(probe_python, probe_script_path, loop, max_seconds,
+                      keep_raw_args=True):
    """Exact argv for a local invocation: the configured interpreter runs
    the probe script by path -- no shell, no stdin delivery, because
    there is no network hop for the local node to avoid.
+
+   ``keep_raw_args`` is always passed explicitly on the command line
+   (``--keep-raw-args`` or ``--drop-raw-args``) so the daemon's intent is
+   visible in the child argv and never silently depends on the probe's
+   own default.
    """
    if not probe_python:
       raise ValueError("probe_python is required")
@@ -192,11 +198,13 @@ def build_local_argv(probe_python, probe_script_path, loop, max_seconds):
       probe_python, probe_script_path,
       "--loop", loop,
       "--max-seconds", _format_seconds(max_seconds),
+      "--keep-raw-args" if keep_raw_args else "--drop-raw-args",
    ]
 
 
 def build_remote_argv(ssh_binary, ssh_config_path, connect_timeout_sec,
-                       hostname, probe_python, loop, max_seconds):
+                       hostname, probe_python, loop, max_seconds,
+                       keep_raw_args=True):
    """Exact argv for a remote invocation.
 
    ``-F ssh_config_path`` pins the project-owned config (never the
@@ -206,7 +214,9 @@ def build_remote_argv(ssh_binary, ssh_config_path, connect_timeout_sec,
    missing. The remote command is ``env -u LD_PRELOAD <probe_python> -
    ...``: ``-`` tells the remote interpreter to read the script from
    stdin, which is how the probe source is delivered without ever being
-   staged to the target's filesystem.
+   staged to the target's filesystem. ``keep_raw_args`` is always passed
+   explicitly (``--keep-raw-args``/``--drop-raw-args``), same rationale
+   as ``build_local_argv``.
    """
    if not ssh_config_path:
       raise ValueError(
@@ -226,6 +236,7 @@ def build_remote_argv(ssh_binary, ssh_config_path, connect_timeout_sec,
       probe_python, "-",
       "--loop", loop,
       "--max-seconds", _format_seconds(max_seconds),
+      "--keep-raw-args" if keep_raw_args else "--drop-raw-args",
    ]
 
 
@@ -727,6 +738,7 @@ def _finish(raw, expected_loop, expected_probe_version, expected_fqdn,
 async def run_local_probe(probe_python, probe_script_path, loop,
                            probe_max_seconds, hard_timeout_sec,
                            expected_probe_version, expected_fqdn=None,
+                           keep_raw_args=True,
                            base_env=None,
                            stderr_limit_bytes=_DEFAULT_STDERR_LIMIT_BYTES,
                            grace_sec=_DEFAULT_GRACE_SEC,
@@ -742,7 +754,7 @@ async def run_local_probe(probe_python, probe_script_path, loop,
    clean self-abort (exit 4) is what normally fires, not a hard kill.
    """
    argv = build_local_argv(probe_python, probe_script_path, loop,
-                            probe_max_seconds)
+                            probe_max_seconds, keep_raw_args=keep_raw_args)
    env = _strip_ld_preload(base_env)
    raw = await _run_subprocess(
       argv, env, stdin_data=None, timeout_sec=hard_timeout_sec,
@@ -757,6 +769,7 @@ async def run_remote_probe(ssh_binary, ssh_config_path, connect_timeout_sec,
                             hostname, probe_python, probe_script_source,
                             loop, probe_max_seconds, hard_timeout_sec,
                             expected_probe_version, expected_fqdn=None,
+                            keep_raw_args=True,
                             base_env=None,
                             stderr_limit_bytes=_DEFAULT_STDERR_LIMIT_BYTES,
                             grace_sec=_DEFAULT_GRACE_SEC,
@@ -779,7 +792,8 @@ async def run_remote_probe(ssh_binary, ssh_config_path, connect_timeout_sec,
          "hard_timeout_sec (%r) -- PLANNING.md 4.3"
          % (connect_timeout_sec, hard_timeout_sec))
    argv = build_remote_argv(ssh_binary, ssh_config_path, connect_timeout_sec,
-                             hostname, probe_python, loop, probe_max_seconds)
+                             hostname, probe_python, loop, probe_max_seconds,
+                             keep_raw_args=keep_raw_args)
    env = _strip_ld_preload(base_env)
    raw = await _run_subprocess(
       argv, env, stdin_data=probe_script_source, timeout_sec=hard_timeout_sec,

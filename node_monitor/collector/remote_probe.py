@@ -30,11 +30,12 @@ command line, and a flag risks being set by accident in production, whereas
 an env var reads as obviously test-only.
 
 Privacy: the node is a shared ALCF login node with no expectation of user
-privacy (PLANNING.md 5.6), and real usernames are retained deliberately. Raw
-argv is nonetheless dropped by default (`--drop-raw-args`, PLANNING.md
-decision 7) because full command lines carry incidental secrets -- tokens
-passed as flags, private paths -- that the project has no use for. What
-leaves the node is the classification, not the command line.
+privacy (PLANNING.md 5.6), and real usernames are retained deliberately.
+ALCF is a monitored federal system with no in-facility privacy
+expectation, so full command-line arguments (argv) are captured verbatim
+by default (`--keep-raw-args`, the implicit default). An operator who
+still wants the old redacted behavior can pass `--drop-raw-args`
+explicitly; that flag is the opt-out, not the default.
 """
 
 import errno
@@ -1133,7 +1134,7 @@ def _parse_args(argv):
    opts = {
       "loop": "census",
       "max_seconds": 15.0,
-      "drop_raw_args": True,
+      "drop_raw_args": False,
    }
    index = 1
    while index < len(argv):
@@ -1151,6 +1152,8 @@ def _parse_args(argv):
          opts["max_seconds"] = float(argv[index])
       elif arg == "--keep-raw-args":
          opts["drop_raw_args"] = False
+      elif arg == "--drop-raw-args":
+         opts["drop_raw_args"] = True
       elif arg == "--version":
          sys.stdout.write("%d\n" % PROBE_VERSION)
          raise SystemExit(0)

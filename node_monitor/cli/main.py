@@ -235,6 +235,7 @@ def _make_transport_fn(config, probe_version):
             hard_timeout_sec=hard_timeout_sec,
             expected_probe_version=probe_version,
             expected_fqdn=None,
+            keep_raw_args=config.keep_raw_args,
          )
       return await transport.run_remote_probe(
          ssh_binary="ssh",
@@ -248,6 +249,7 @@ def _make_transport_fn(config, probe_version):
          hard_timeout_sec=hard_timeout_sec,
          expected_probe_version=probe_version,
          expected_fqdn=None,
+         keep_raw_args=config.keep_raw_args,
       )
 
    return transport_fn

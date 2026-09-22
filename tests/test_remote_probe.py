@@ -677,7 +677,7 @@ class TestToolAggregatesSubprocess:
       env = dict(os.environ)
       env["NODE_MONITOR_PROC_ROOT"] = root
       result = subprocess.run(
-         [sys.executable, PROBE_PATH, "--loop", "census"],
+         [sys.executable, PROBE_PATH, "--loop", "census", "--drop-raw-args"],
          capture_output=True, text=True, timeout=60, env=env)
       assert result.returncode == 0, result.stderr
       payload = json.loads(result.stdout)
@@ -732,7 +732,7 @@ class TestArgs:
    def test_defaults(self):
       opts = probe._parse_args(["probe"])
       assert opts["loop"] == "census"
-      assert opts["drop_raw_args"] is True
+      assert opts["drop_raw_args"] is False
 
    def test_counter_loop(self):
       assert probe._parse_args(["probe", "--loop", "counter"])["loop"] == "counter"
@@ -744,6 +744,14 @@ class TestArgs:
    def test_unknown_arg_rejected(self):
       with pytest.raises(ValueError):
          probe._parse_args(["probe", "--wat"])
+
+   def test_drop_raw_args_flag_sets_true(self):
+      opts = probe._parse_args(["probe", "--drop-raw-args"])
+      assert opts["drop_raw_args"] is True
+
+   def test_keep_raw_args_flag_sets_false(self):
+      opts = probe._parse_args(["probe", "--keep-raw-args"])
+      assert opts["drop_raw_args"] is False
 
 
 class TestExitCodes:
@@ -786,9 +794,9 @@ class TestExitCodes:
 # --------------------------------------------------------------------------
 
 class TestPayloadContract:
-   def _payload(self, loop, env):
+   def _payload(self, loop, env, extra_args=()):
       result = subprocess.run(
-         [sys.executable, PROBE_PATH, "--loop", loop],
+         [sys.executable, PROBE_PATH, "--loop", loop, *extra_args],
          capture_output=True, text=True, timeout=60, env=env)
       assert result.returncode == 0, result.stderr
       return json.loads(result.stdout)
@@ -842,11 +850,25 @@ class TestPayloadContract:
          assert isinstance(row["pid"], int)
          assert isinstance(row["start_time_ticks"], int)
 
-   def test_no_raw_cmdline_by_default(self, fake_proc_env):
+   def test_raw_cmdline_captured_by_default(self, fake_proc_env):
       payload = self._payload("census", fake_proc_env)
+      assert payload["drop_raw_args"] is False
+      for row in payload["processes"]:
+         assert "cmdline" in row
+
+   def test_raw_cmdline_omitted_with_drop_raw_args_flag(self, fake_proc_env):
+      payload = self._payload(
+         "census", fake_proc_env, extra_args=["--drop-raw-args"])
       assert payload["drop_raw_args"] is True
       for row in payload["processes"]:
          assert "cmdline" not in row
+
+   def test_raw_cmdline_captured_with_keep_raw_args_flag(self, fake_proc_env):
+      payload = self._payload(
+         "census", fake_proc_env, extra_args=["--keep-raw-args"])
+      assert payload["drop_raw_args"] is False
+      for row in payload["processes"]:
+         assert "cmdline" in row
 
    def test_stdout_is_pure_json(self, fake_proc_env):
       """Anything else on stdout makes the daemon's parse fail.
