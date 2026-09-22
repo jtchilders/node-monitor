@@ -471,6 +471,96 @@ class TestValidateRunDonePlusTruncated:
 
 
 # --------------------------------------------------------------------------
+# finalize-recovered-run: recovery finalizer CLI for an orphaned run
+# directory whose daemon died before writing summary.json/DONE.
+# --------------------------------------------------------------------------
+
+class TestFinalizeRecoveredRun:
+   def _orphaned_run_dir(self, tmp_path, fake_proc_env, run_id="orphan-1"):
+      """Produce a real orphaned run directory the same way the daemon
+      would leave one behind mid-crash: run a real dry-run to completion
+      (so the JSONL artifacts are genuine, production-shaped content),
+      then delete summary.json/DONE to simulate the daemon dying just
+      before finalization -- exactly the phase0-canary-20260916T172446Z
+      incident shape (complete JSONL data, no terminal summary/DONE).
+      """
+      home_dir = str(tmp_path / "home")
+      os.makedirs(home_dir, exist_ok=True)
+      config_path = str(tmp_path / "config.yaml")
+      _write_config(config_path, home_dir)
+      result = _invoke([
+         "daemon", "dry-run",
+         "--config", config_path,
+         "--home", home_dir,
+         "--run-id", run_id,
+      ])
+      assert result.exit_code == 0, result.output
+      run_dir = os.path.join(home_dir, "phase0-runs", "phase0-%s" % run_id)
+      os.unlink(os.path.join(run_dir, "summary.json"))
+      os.unlink(os.path.join(run_dir, "DONE"))
+      return run_dir
+
+   def test_finalizes_orphaned_run_successfully(self, tmp_path, fake_proc_env):
+      run_dir = self._orphaned_run_dir(tmp_path, fake_proc_env)
+
+      result = _invoke(["finalize-recovered-run", run_dir])
+
+      assert result.exit_code == 0, result.output
+      assert os.path.exists(os.path.join(run_dir, "summary.json"))
+      assert os.path.exists(os.path.join(run_dir, "DONE"))
+      with open(os.path.join(run_dir, "summary.json")) as handle:
+         summary = json.load(handle)
+      assert summary["recovery"]["recovered"] is True
+      assert "acceptance" not in summary
+
+   def test_refuses_run_with_existing_summary_and_done(
+         self, tmp_path, fake_proc_env):
+      home_dir = str(tmp_path / "home")
+      os.makedirs(home_dir, exist_ok=True)
+      config_path = str(tmp_path / "config.yaml")
+      _write_config(config_path, home_dir)
+      result = _invoke([
+         "daemon", "dry-run",
+         "--config", config_path,
+         "--home", home_dir,
+         "--run-id", "clean-1",
+      ])
+      assert result.exit_code == 0, result.output
+      run_dir = os.path.join(home_dir, "phase0-runs", "phase0-clean-1")
+
+      result = _invoke(["finalize-recovered-run", run_dir])
+
+      assert result.exit_code != 0
+      assert "already exists" in result.output.lower()
+
+   def test_nonexistent_run_dir_exits_nonzero(self, tmp_path):
+      result = _invoke(
+         ["finalize-recovered-run", str(tmp_path / "does-not-exist")])
+      assert result.exit_code != 0
+
+   def test_symlinked_run_dir_refused(self, tmp_path):
+      real_dir = tmp_path / "real"
+      real_dir.mkdir(mode=0o700)
+      link = tmp_path / "phase0-linked"
+      os.symlink(str(real_dir), str(link))
+
+      result = _invoke(["finalize-recovered-run", str(link)])
+
+      assert result.exit_code != 0
+
+   def test_explicit_run_id_override(self, tmp_path, fake_proc_env):
+      run_dir = self._orphaned_run_dir(tmp_path, fake_proc_env, run_id="orphan-2")
+
+      result = _invoke(
+         ["finalize-recovered-run", run_dir, "--run-id", "override-name"])
+
+      assert result.exit_code == 0, result.output
+      with open(os.path.join(run_dir, "summary.json")) as handle:
+         summary = json.load(handle)
+      assert summary["run_id"] == "override-name"
+
+
+# --------------------------------------------------------------------------
 # Mixed local/remote transport dispatch (review round 1 finding #1,
 # kanban task t_3d9d7387): the CLI must wire local nodes to
 # collector.transport.run_local_probe and remote nodes to

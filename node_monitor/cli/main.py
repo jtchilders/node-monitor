@@ -63,6 +63,8 @@ from node_monitor.output.jsonl import (
    Phase0Sink,
    Phase0SinkDiskFullError,
    Phase0SinkError,
+   RecoveryFinalizeError,
+   finalize_orphaned_run,
    validate_jsonl_artifact,
 )
 
@@ -419,6 +421,70 @@ def validate_run(run_dir):
       sys.exit(1)
 
    click.echo("valid: run directory passed all structural checks")
+   sys.exit(0)
+
+
+@cli.command("finalize-recovered-run")
+@click.argument("run_dir", type=click.Path(exists=False))
+@click.option("--run-id", "run_id", default=None,
+              help="Explicit run id to record in the recovered summary. "
+                   "Defaults to the '<id>' parsed out of the run "
+                   "directory's own 'phase0-<id>' basename; only needed "
+                   "when the directory was renamed away from that "
+                   "convention.")
+def finalize_recovered_run(run_dir, run_id):
+   """Finalize an ORPHANED Phase 0 run directory: one whose daemon
+   process died before writing summary.json/DONE (e.g. the old
+   whole-file finalization path OOM-killed mid-finalize), leaving a
+   complete set of .jsonl artifacts with no terminal summary/DONE.
+
+   This is explicitly a RECOVERY tool, not a substitute for the
+   daemon's own clean completion path (``daemon dry-run``/``daemon
+   smoke``, whose ``Phase0Sink.finalize_summary``/``write_done`` this
+   reuses the exact same streaming scanner from). It:
+
+   \b
+   * Never overwrites an existing summary.json or DONE -- a run that
+     already reached either state is refused outright, not silently
+     re-finalized.
+   * Never fabricates the crashed daemon's own in-memory acceptance
+     telemetry (scheduling-delay samples, per-node success totals,
+     etc.) -- that state is gone with the dead process. The produced
+     summary carries NO "acceptance" key, only a "recovery" section
+     marking it explicitly as a recovered artifact, never
+     indistinguishable from an ordinary clean daemon completion.
+   * Refuses a run directory (or any artifact inside it) that is not a
+     real, owned-by-the-invoking-user file/directory -- rejects a
+     symlink or a foreign-owned path rather than following it.
+   * Never touches PostgreSQL or any remote system.
+
+   Exits nonzero with a diagnostic on every refusal case above, or on
+   any I/O failure while finalizing; exits 0 only once summary.json and
+   DONE have both actually been written.
+   """
+   try:
+      summary = finalize_orphaned_run(run_dir, run_id=run_id)
+   except RecoveryFinalizeError as exc:
+      _exit(1, "finalize-recovered-run: %s" % (exc,), err=True)
+      return  # pragma: no cover -- _exit always raises SystemExit
+   except OSError as exc:
+      _exit(1, "finalize-recovered-run: I/O failure: %s" % (exc,), err=True)
+      return  # pragma: no cover
+
+   abs_run_dir = os.path.abspath(run_dir)
+   click.echo("run_dir: %s" % abs_run_dir)
+   click.echo("run_id: %s" % summary["run_id"])
+   click.echo("recovered: %s" % summary["recovery"]["recovered"])
+   for record_type in sorted(summary["files"]):
+      entry = summary["files"][record_type]
+      click.echo(
+         "  %s: record_count=%d byte_size=%d malformed_count=%d "
+         "truncated_final_line=%s"
+         % (record_type, entry["record_count"], entry["byte_size"],
+            entry["malformed_count"], entry["truncated_final_line"]))
+   click.echo(
+      "finalized (recovered, not a clean daemon completion): %s"
+      % abs_run_dir)
    sys.exit(0)
 
 

@@ -18,7 +18,9 @@ import codecs
 import hashlib
 import json
 import os
+import re
 import shutil
+import stat
 import time
 
 from node_monitor.output._incremental_json import (
@@ -228,8 +230,8 @@ def scan_jsonl_artifact(path, chunk_bytes=_SCAN_CHUNK_BYTES):
    not end in a newline, is eligible to be reported as
    ``truncated_final_line`` instead of an ordinary malformed line.
 
-   Returns ``{\"byte_size\", \"sha256\", \"valid_count\", \"malformed_count\",
-   \"truncated_final_line\"}`` -- the same fields ``finalize_summary``
+   Returns ``{"byte_size", "sha256", "valid_count", "malformed_count",
+   "truncated_final_line"}`` -- the same fields ``finalize_summary``
    already assembled from ``validate_jsonl_artifact`` plus the two
    separately-read ``byte_size``/``sha256`` fields, now computed
    together in the one pass.
@@ -243,6 +245,23 @@ def scan_jsonl_artifact(path, chunk_bytes=_SCAN_CHUNK_BYTES):
          "truncated_final_line": False,
       }
 
+   with open(path, "rb") as handle:
+      return _scan_jsonl_fileobj(handle, chunk_bytes=chunk_bytes)
+
+
+def _scan_jsonl_fileobj(handle, chunk_bytes=_SCAN_CHUNK_BYTES):
+   """The actual streaming scan behind ``scan_jsonl_artifact``, operating
+   on an ALREADY-OPEN binary file object rather than a path string.
+
+   Factored out so a caller holding its own already-verified, already-open
+   file object (e.g. ``finalize_orphaned_run``, which opens each artifact
+   through a verified directory file descriptor to close a symlink/TOCTOU
+   window) can reuse the exact same scanning logic ``scan_jsonl_artifact``
+   uses, without a second path-based ``open()`` that would throw away that
+   verification and reintroduce the very race the caller opened the file
+   to avoid. ``handle`` is consumed but never closed here -- the caller
+   owns its lifecycle.
+   """
    digest = hashlib.sha256()
    byte_size = 0
    valid_count = 0
@@ -371,29 +390,28 @@ def scan_jsonl_artifact(path, chunk_bytes=_SCAN_CHUNK_BYTES):
       # validate_jsonl_artifact's `if not line: continue`, counted as
       # neither valid nor malformed.
 
-   with open(path, "rb") as handle:
+   while True:
+      chunk = handle.read(chunk_bytes)
+      if not chunk:
+         break
+      digest.update(chunk)
+      byte_size += len(chunk)
+
+      start = 0
+      chunk_len = len(chunk)
       while True:
-         chunk = handle.read(chunk_bytes)
-         if not chunk:
+         newline_index = chunk.find(b"\n", start)
+         if newline_index == -1:
+            remainder = chunk[start:chunk_len]
+            _append_to_current_line(remainder)
             break
-         digest.update(chunk)
-         byte_size += len(chunk)
 
-         start = 0
-         chunk_len = len(chunk)
-         while True:
-            newline_index = chunk.find(b"\n", start)
-            if newline_index == -1:
-               remainder = chunk[start:chunk_len]
-               _append_to_current_line(remainder)
-               break
+         segment = chunk[start:newline_index]
+         _append_to_current_line(segment)
 
-            segment = chunk[start:newline_index]
-            _append_to_current_line(segment)
-
-            _finalize_complete_line()
-            line_buf = bytearray()
-            start = newline_index + 1
+         _finalize_complete_line()
+         line_buf = bytearray()
+         start = newline_index + 1
 
    # A non-empty (or in-fallback) line buffer at EOF means the file's
    # last bytes were never terminated by b"\n" -- exactly the
@@ -663,11 +681,420 @@ class Phase0Sink:
          raise Phase0SinkError(
             "write_done() called before finalize_summary(); "
             "DONE must never appear before the summary is complete")
-      path = os.path.join(self.run_dir, "DONE")
-      fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
+      _write_done_file(self.run_dir)
+
+
+def _write_done_file(run_dir):
+   """Write the DONE flag file into ``run_dir``.
+
+   Shared by ``Phase0Sink.write_done`` (the clean daemon-completion path)
+   and ``finalize_orphaned_run`` (the recovery path) so there is exactly
+   one place that decides DONE's on-disk format/mode -- never two
+   independently maintained writers that could drift.
+   """
+   path = os.path.join(run_dir, "DONE")
+   fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
+   with os.fdopen(fd, "w") as handle:
+      handle.write(
+         time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z\n")
+      handle.flush()
+      os.fsync(handle.fileno())
+   os.chmod(path, _FILE_MODE)
+
+
+# --------------------------------------------------------------------------
+# Recovery finalization for an orphaned run directory.
+#
+# Incident: phase0-canary-20260916T172446Z collected a complete ~24h
+# dataset but the daemon process died inside the OLD whole-file
+# finalization path (see scan_jsonl_artifact's own docstring) before it
+# ever wrote summary.json/DONE. The daemon's in-process acceptance
+# telemetry (bounded scheduling-delay/probe-wall-time samples, per-node
+# success totals, complete-window counts -- see daemon.Daemon.
+# _build_acceptance) lived only in that dead process's memory and is
+# gone; it cannot be reconstructed from the JSONL artifacts alone
+# without silently fabricating numbers the daemon never actually
+# measured. finalize_orphaned_run therefore produces a DIFFERENT kind
+# of summary from a normal completion: it runs the exact same
+# production streaming scanner (scan_jsonl_artifact) this module's own
+# finalize_summary() uses, so byte sizes/checksums/malformed-line
+# counts/record counts are computed by the identical, already-reviewed
+# code path -- never a second, hand-rolled checksum/scan implementation
+# -- but it never invents an "acceptance" verdict, and it marks the
+# summary with an explicit "recovery" section so nothing downstream can
+# mistake this for an ordinary clean daemon completion.
+# --------------------------------------------------------------------------
+
+class RecoveryFinalizeError(Phase0SinkError):
+   """Raised when an orphaned run directory cannot be safely finalized.
+
+   Distinct from ``Phase0SinkError`` only in name (it IS one, so
+   existing callers that catch ``Phase0SinkError`` still catch this) --
+   kept as its own class purely so a recovery CLI/tool can report a
+   recognizable, recovery-specific error type without string-matching
+   a message.
+   """
+
+
+def _open_verified_run_dir(run_dir):
+   """Open ``run_dir`` by path, then verify -- via ``os.fstat`` on the
+   ALREADY-OPEN file descriptor, never a second, separate ``os.stat``
+   or ``os.path`` call on the path string -- that what got opened is a
+   real directory, not a symlink (or a symlink swapped in between any
+   check and this open).
+
+   ``O_NOFOLLOW`` refuses to open the path at all if its last component
+   is itself a symlink (closing the classic "attacker replaces the
+   run directory with a symlink to something the caller does not own,
+   racing between a stat() and a later open()" TOCTOU window). Rejecting
+   any run directory whose OWNER is not the current effective user
+   closes an adjacent hazard: a world-writable/attacker-owned directory
+   that merely happens to be named like a run dir, sitting somewhere an
+   operator might be fooled into pointing this tool at.
+
+   Returns the open directory file descriptor. Every subsequent
+   operation on this run directory's contents in this module uses this
+   SAME fd via ``dir_fd=``/``*at()`` semantics, never a fresh path
+   re-open -- so a symlink swapped in after this check can never be
+   substituted for any file this function's caller goes on to touch.
+   """
+   try:
+      fd = os.open(
+         run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+   except OSError as exc:
+      raise RecoveryFinalizeError(
+         "cannot open run directory %r: %s" % (run_dir, exc)) from exc
+
+   try:
+      info = os.fstat(fd)
+   except OSError:
+      os.close(fd)
+      raise
+
+   if not stat.S_ISDIR(info.st_mode):
+      os.close(fd)
+      raise RecoveryFinalizeError(
+         "refusing to finalize %r: not a real directory (symlink or "
+         "other non-directory substituted for the run directory)"
+         % (run_dir,))
+   if info.st_uid != os.geteuid():
+      os.close(fd)
+      raise RecoveryFinalizeError(
+         "refusing to finalize %r: owned by uid %d, not the current "
+         "effective uid %d" % (run_dir, info.st_uid, os.geteuid()))
+   return fd
+
+
+def _open_child_verified(dir_fd, name):
+   """Open a single named child of an already-verified directory fd,
+   with the same ``O_NOFOLLOW`` + owner-verification discipline as
+   ``_open_verified_run_dir``, resolved relative to ``dir_fd`` (never a
+   freshly joined path string) so a symlink or a swapped file cannot be
+   substituted for that one child between this check and any later use
+   of the SAME already-open descriptor. Returns ``None`` (opening
+   nothing) if the child does not exist at all -- a genuinely absent
+   optional artifact (e.g. a record type the run never wrote a single
+   record for) is not itself suspicious.
+   """
+   try:
+      fd = os.open(
+         name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+   except FileNotFoundError:
+      return None
+   except OSError as exc:
+      raise RecoveryFinalizeError(
+         "cannot open %r inside run directory: %s" % (name, exc)) from exc
+
+   try:
+      info = os.fstat(fd)
+   except OSError:
+      os.close(fd)
+      raise
+   if not stat.S_ISREG(info.st_mode):
+      os.close(fd)
+      raise RecoveryFinalizeError(
+         "refusing to finalize: %r is not a regular file (symlink or "
+         "other non-regular object substituted for a run artifact)"
+         % (name,))
+   if info.st_uid != os.geteuid():
+      os.close(fd)
+      raise RecoveryFinalizeError(
+         "refusing to finalize: %r is owned by uid %d, not the current "
+         "effective uid %d" % (name, info.st_uid, os.geteuid()))
+   return fd
+
+
+_RUN_ID_RE = re.compile(r"^phase0-(?P<run_id>.+)$")
+
+
+def finalize_orphaned_run(run_dir, run_id=None):
+   """Finalize an orphaned Phase 0 run directory whose daemon process
+   died before writing ``summary.json``/``DONE``, WITHOUT reimplementing
+   any checksum/validation logic of its own -- every artifact is scanned
+   through the exact same production ``scan_jsonl_artifact`` this
+   module's own ``Phase0Sink.finalize_summary`` uses, so an orphaned run
+   is validated by the identical, already-reviewed streaming code path a
+   clean run goes through, never a second hand-rolled implementation.
+
+   Strictly fail-closed:
+
+   * Refuses a run directory that is not a real, owned-by-us directory,
+     or is a symlink (see ``_open_verified_run_dir``) -- guards against
+     both a plain path-substitution attack and a symlink swapped in
+     between any earlier check (e.g. an operator's ``ls``) and this
+     call.
+   * Refuses any per-artifact child (a ``.jsonl`` file, ``manifest.json``,
+     an existing ``summary.json``) that is not a real, owned-by-us,
+     regular file once opened by this SAME already-verified directory
+     descriptor (``_open_child_verified``) -- a symlink or a swapped
+     file for any one artifact is refused, not silently followed.
+   * NEVER overwrites an existing ``summary.json`` or ``DONE`` -- either
+     one already present is an unconditional refusal (``FileExistsError``
+     is not close enough: this function never even attempts the write
+     when either is already there), because a run that already reached
+     one of those states was not actually orphaned, and overwriting
+     either would risk destroying real historical data with an
+     inferior, reconstructed one.
+   * NEVER fabricates the daemon's own in-memory acceptance telemetry
+     (bounded scheduling-delay/probe-wall-time samples, per-node
+     success totals, complete-window counts) -- that state lived only
+     in the crashed process and is gone. The produced summary has no
+     ``acceptance`` key at all (exactly ``Phase0Sink.finalize_summary``'s
+     own documented behavior when its optional ``acceptance_fn`` hook is
+     omitted), and instead carries an explicit ``recovery`` section
+     (see below) so nothing downstream can mistake this artifact for an
+     ordinary clean daemon completion.
+   * Never runs with elevated privileges of its own, never touches
+     PostgreSQL or any remote system, and never removes/modifies any
+     ``.jsonl`` artifact -- it only ever reads them (through the shared
+     directory fd) and writes two new files, ``summary.json`` and
+     ``DONE``.
+
+   ``run_dir``: the exact orphaned run directory to finalize (e.g.
+      ``/home/parton/phase0-runs/phase0-canary-20260916T172446Z``). No
+      "most recent run" discovery happens here -- a recovery operation
+      must always name its target explicitly, never guess.
+   ``run_id``: the run id to record in the summary. Defaults to the
+      ``<id>`` parsed out of ``phase0-<id>`` in ``os.path.basename(run_dir)``;
+      pass this explicitly only when the directory was renamed away from
+      that naming convention (raises ``RecoveryFinalizeError`` if omitted
+      and the basename does not match).
+
+   Returns the summary dict that was written (identical shape to
+   ``Phase0Sink.finalize_summary``'s return value, plus the added
+   ``recovery`` key).
+
+   Raises ``RecoveryFinalizeError`` (a ``Phase0SinkError`` subclass) for
+   every refusal case above. Raises ``OSError`` for a genuine I/O
+   failure (e.g. disk full while writing the recovered summary) --
+   deliberately NOT swallowed, so a recovery run that cannot actually
+   write its output fails loudly rather than silently reporting success.
+   """
+   abs_run_dir = os.path.abspath(run_dir)
+   dir_fd = _open_verified_run_dir(abs_run_dir)
+   try:
+      return _finalize_orphaned_run_locked(abs_run_dir, dir_fd, run_id)
+   finally:
+      os.close(dir_fd)
+
+
+def _atomic_write_json_dir_fd(dir_fd, name, payload):
+   """Write ``payload`` as JSON to a NEW file named ``name`` inside the
+   directory referenced by ``dir_fd``, atomically and WITHOUT ever
+   clobbering an existing file of that name.
+
+   Every step (temp-file create, publish, temp-file removal) happens
+   relative to ``dir_fd`` (never a freshly re-resolved path string), so
+   nothing between this function's own steps can be swapped out from
+   under it. Publishing the temp file under the real name uses
+   ``os.link()`` rather than ``os.rename()``/``os.replace()`` --
+   ``rename``/``replace`` succeed by DESIGN even when the destination
+   already exists (silently clobbering it), which is exactly the
+   behavior this function must never have; ``os.link()`` instead raises
+   ``FileExistsError`` when the destination name is already taken,
+   giving "publish without ever clobbering" as a single atomic
+   filesystem operation with no separate existence probe beforehand
+   (a probe-then-act pair would itself be the exact TOCTOU gap this
+   whole module works to avoid). This is the same "write-temp, publish,
+   remove temp" shape ``_atomic_write_json`` already uses for a
+   path-based destination, adapted to dir_fd-relative operations for a
+   caller (``finalize_orphaned_run``) that must never re-resolve the run
+   directory by path after its initial verified open.
+
+   Raises ``FileExistsError`` if ``name`` already exists -- the caller
+   must not have already probed for existence and treated an ABSENT
+   file as a green light before calling this (that gap is exactly what
+   this function's ``os.link`` atomicity closes).
+   """
+   tmp_name = name + ".tmp-%d" % os.getpid()
+   fd = os.open(
+      tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+      _FILE_MODE, dir_fd=dir_fd)
+   try:
       with os.fdopen(fd, "w") as handle:
-         handle.write(
-            time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z\n")
+         json.dump(payload, handle, indent=2, sort_keys=True)
+         handle.write("\n")
          handle.flush()
          os.fsync(handle.fileno())
-      os.chmod(path, _FILE_MODE)
+      os.chmod(tmp_name, _FILE_MODE, dir_fd=dir_fd)
+      os.link(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+   finally:
+      try:
+         os.unlink(tmp_name, dir_fd=dir_fd)
+      except FileNotFoundError:
+         pass
+   os.fsync(dir_fd)
+
+
+def _write_done_file_dir_fd(dir_fd):
+   """DONE-flag equivalent of ``_atomic_write_json_dir_fd``: creates the
+   file with ``O_EXCL`` (atomically refusing to clobber an existing
+   DONE) directly under the real name -- DONE's content is a single
+   timestamp line, not something that needs a rename-into-place for
+   atomicity of PARTIAL content the way JSON does, but ``O_EXCL`` still
+   gives the same "never overwrite" guarantee as ``_atomic_write_json_dir_fd``'s
+   link step.
+   """
+   fd = os.open(
+      "DONE", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+      _FILE_MODE, dir_fd=dir_fd)
+   with os.fdopen(fd, "w") as handle:
+      handle.write(
+         time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z\n")
+      handle.flush()
+      os.fsync(handle.fileno())
+   os.chmod("DONE", _FILE_MODE, dir_fd=dir_fd)
+   os.fsync(dir_fd)
+
+
+def _finalize_orphaned_run_locked(abs_run_dir, dir_fd, run_id):
+   # Fail fast, before touching anything else, whenever EITHER
+   # summary.json or DONE already exists -- checked via the SAME
+   # verified directory fd (never a fresh path-based os.path.exists,
+   # which would re-resolve the name and reopen exactly the TOCTOU
+   # window every other lookup in this function goes out of its way to
+   # close). This is a pre-flight convenience check only: the actual
+   # writes below are ALSO independently atomic/no-clobber (O_EXCL /
+   # os.link) as the real safety net, so a file created between this
+   # check and that write is still refused, never silently overwritten.
+   # Checking both names up front (rather than only checking summary.json
+   # right before writing it) matters for a run in the unusual state of
+   # DONE present without summary.json: writing a brand-new summary.json
+   # in that case would still not be "overwriting" summary.json, but it
+   # would leave a stale, unrelated DONE sitting next to a freshly
+   # reconstructed summary -- an inconsistent pairing this function must
+   # never produce.
+   for existing_name in ("summary.json", "DONE"):
+      existing_fd = _open_child_verified(dir_fd, existing_name)
+      if existing_fd is not None:
+         os.close(existing_fd)
+         raise RecoveryFinalizeError(
+            "refusing to finalize %r: %r already exists -- this run "
+            "was not actually orphaned, or a prior finalize attempt "
+            "already completed; recovery never overwrites an existing "
+            "summary/DONE" % (abs_run_dir, existing_name))
+
+   if run_id is None:
+      match = _RUN_ID_RE.match(os.path.basename(abs_run_dir))
+      if not match:
+         raise RecoveryFinalizeError(
+            "cannot infer run_id from directory name %r (expected "
+            "'phase0-<run_id>'); pass run_id explicitly"
+            % (os.path.basename(abs_run_dir),))
+      run_id = match.group("run_id")
+
+   # manifest.json is optional context only (never required to
+   # finalize -- a run that crashed before even writing its manifest
+   # is not this incident's shape, but recovery should not need a
+   # manifest to do its one job of scanning the JSONL artifacts that
+   # DO exist). Verified through the same owned-regular-file check as
+   # every other artifact; a symlinked/foreign manifest is refused
+   # rather than silently read.
+   manifest = None
+   manifest_fd = _open_child_verified(dir_fd, "manifest.json")
+   if manifest_fd is not None:
+      try:
+         with os.fdopen(manifest_fd, "r") as handle:
+            manifest = json.load(handle)
+      except (OSError, ValueError) as exc:
+         raise RecoveryFinalizeError(
+            "manifest.json exists but could not be read as JSON: %s"
+            % (exc,)) from exc
+
+   files_summary = {}
+   for record_type, filename in _FILENAMES.items():
+      artifact_fd = _open_child_verified(dir_fd, filename)
+      if artifact_fd is None:
+         # No records of this type were ever written -- exactly the
+         # same "safe to call with zero records written to any given
+         # file" case Phase0Sink.finalize_summary's own docstring
+         # documents, not a recovery-specific defect.
+         scan = {
+            "byte_size": 0, "sha256": None, "valid_count": 0,
+            "malformed_count": 0, "truncated_final_line": False,
+         }
+         record_count = 0
+      else:
+         # os.fdopen takes ownership of artifact_fd -- its own `with`
+         # block closes it, so no separate os.close is needed or
+         # correct here.
+         with os.fdopen(artifact_fd, "rb") as artifact_handle:
+            scan = _scan_jsonl_fileobj(artifact_handle)
+         record_count = scan["valid_count"]
+      files_summary[record_type] = {
+         "filename": filename,
+         "record_count": record_count,
+         "byte_size": scan["byte_size"],
+         "malformed_count": scan["malformed_count"],
+         "truncated_final_line": scan["truncated_final_line"],
+         "sha256": scan["sha256"],
+      }
+
+   summary = {
+      "run_id": run_id,
+      "finalized_utc": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
+      "files": files_summary,
+      "recovery": {
+         "recovered": True,
+         "reason": (
+            "daemon process died before finalize_summary()/write_done() "
+            "completed (old whole-file finalization path); artifacts "
+            "were re-scanned and summarized after the fact by the "
+            "recovery finalizer, never by the daemon itself"),
+         "recovered_utc": time.strftime(
+            "%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
+         "manifest_present": manifest is not None,
+      },
+   }
+   # Never overwrite an existing summary.json/DONE. Both writes below
+   # are ATOMICALLY all-or-nothing against a concurrently or previously
+   # created same-named file (O_EXCL / os.link's own exclusivity) --
+   # deliberately NOT a separate "check absent, then write" pair, which
+   # would reopen exactly the TOCTOU window every other path-resolution
+   # in this function goes out of its way to close. A run that already
+   # reached either state was not actually orphaned; this raises
+   # FileExistsError (an OSError, so it is NOT silently swallowed by
+   # any Phase0SinkError-only catch elsewhere) rather than clobbering
+   # real historical data with an inferior, reconstructed one.
+   try:
+      _atomic_write_json_dir_fd(dir_fd, "summary.json", summary)
+   except FileExistsError as exc:
+      raise RecoveryFinalizeError(
+         "refusing to finalize %r: 'summary.json' already exists -- "
+         "this run was not actually orphaned, or a prior finalize "
+         "attempt already completed; recovery never overwrites an "
+         "existing summary/DONE" % (abs_run_dir,)) from exc
+   try:
+      _write_done_file_dir_fd(dir_fd)
+   except FileExistsError as exc:
+      # summary.json was just written successfully above, but DONE
+      # already existed -- an inconsistent state (summary present,
+      # pre-existing DONE from some other origin) that must be
+      # surfaced loudly rather than silently left half-finalized.
+      raise RecoveryFinalizeError(
+         "wrote summary.json for %r but 'DONE' already existed -- "
+         "refusing to overwrite it; the run directory is now in an "
+         "inconsistent state (summary.json written, pre-existing DONE "
+         "left untouched) and needs manual inspection"
+         % (abs_run_dir,)) from exc
+   return summary
