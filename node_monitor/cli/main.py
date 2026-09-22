@@ -447,6 +447,10 @@ def finalize_recovered_run(run_dir, run_id):
    * Never overwrites an existing summary.json or DONE -- a run that
      already reached either state is refused outright, not silently
      re-finalized.
+   * Never publishes summary.json/DONE over untrustworthy artifact
+     content -- a run directory with no .jsonl artifacts at all, or
+     any artifact containing a malformed line or a truncated final
+     line, is refused before either output is written.
    * Never fabricates the crashed daemon's own in-memory acceptance
      telemetry (scheduling-delay samples, per-node success totals,
      etc.) -- that state is gone with the dead process. The produced

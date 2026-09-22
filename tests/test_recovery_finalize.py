@@ -13,6 +13,13 @@ finalizer:
   production ``Phase0Sink.finalize_summary`` uses -- never a second,
   independently-implemented checksum/validation pass.
 * Never overwrites an existing summary.json/DONE.
+* Strictly fails closed BEFORE publishing summary.json/DONE when there
+  are no .jsonl artifacts at all, or any artifact has a malformed line
+  or a truncated final line -- recovery never blesses corrupt or
+  non-dataset input as finalized.
+* Publishes DONE with the same write-temp/fsync/no-clobber-link
+  discipline as summary.json, so a crash or write/fsync failure can
+  never leave a final-named DONE (empty or partial) behind.
 * Never fabricates an "acceptance" verdict -- the crashed daemon's own
   in-memory telemetry cannot be reconstructed, and the summary must
   never claim it was.
@@ -331,26 +338,96 @@ class TestFinalizeOrphanedRunRefusals:
 
 
 # --------------------------------------------------------------------------
-# Malformed / truncated artifact content is reported, not swallowed
+# Malformed / truncated / empty artifact content is strictly REFUSED,
+# never silently finalized -- publishing summary.json/DONE over
+# untrustworthy input would bless corrupt or non-dataset content as a
+# completed recovery, contradicting this tool's fail-closed requirement.
 # --------------------------------------------------------------------------
 
 class TestFinalizeOrphanedRunArtifactAccounting:
-   def test_malformed_line_is_counted(self, tmp_path):
+   def test_malformed_line_is_refused_before_any_write(self, tmp_path):
       run_dir = _make_orphaned_run_dir(tmp_path)
       path = os.path.join(run_dir, "node_hardware.jsonl")
       with open(path, "a") as handle:
          handle.write("{not valid json\n")
 
-      summary = finalize_orphaned_run(run_dir)
+      with pytest.raises(RecoveryFinalizeError):
+         finalize_orphaned_run(run_dir)
 
-      assert summary["files"]["node_hardware"]["malformed_count"] == 1
+      assert not os.path.exists(os.path.join(run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(run_dir, "DONE"))
 
-   def test_truncated_final_line_is_reported(self, tmp_path):
+   def test_truncated_final_line_is_refused_before_any_write(self, tmp_path):
       run_dir = _make_orphaned_run_dir(tmp_path)
       path = os.path.join(run_dir, "node_hardware.jsonl")
       with open(path, "a") as handle:
          handle.write('{"system": "polaris", "trun')  # no trailing newline
 
-      summary = finalize_orphaned_run(run_dir)
+      with pytest.raises(RecoveryFinalizeError):
+         finalize_orphaned_run(run_dir)
 
-      assert summary["files"]["node_hardware"]["truncated_final_line"] is True
+      assert not os.path.exists(os.path.join(run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(run_dir, "DONE"))
+
+   def test_no_jsonl_artifacts_at_all_is_refused(self, tmp_path):
+      """An empty/non-dataset directory (no .jsonl artifacts written at
+      all) is not this incident's shape and must never be blessed as a
+      completed recovery."""
+      run_dir = os.path.join(str(tmp_path), "phase0-empty-run")
+      os.mkdir(run_dir, mode=0o700)
+
+      with pytest.raises(RecoveryFinalizeError):
+         finalize_orphaned_run(run_dir)
+
+      assert not os.path.exists(os.path.join(run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(run_dir, "DONE"))
+
+
+# --------------------------------------------------------------------------
+# DONE is published atomically -- a write/fsync failure partway through
+# writing DONE's content must never leave a final-named DONE (empty or
+# partial) that would falsely signal a completed finalization.
+# --------------------------------------------------------------------------
+
+class TestDoneFilePublishedAtomically:
+   def test_fsync_failure_leaves_no_final_named_done(self, tmp_path, monkeypatch):
+      """Inject a failure into the fsync call that persists DONE's
+      content BEFORE it is linked into its final name. If DONE were
+      created directly under its final name (the pre-fix behavior),
+      this would leave an empty 'DONE' on disk despite the raised
+      exception -- a false completion signal. With write-temp +
+      fsync + link discipline, the failure must happen while only the
+      hidden temp name exists, so no final-named DONE is ever visible.
+      """
+      run_dir = _make_orphaned_run_dir(tmp_path)
+      from node_monitor.output import jsonl as jsonl_mod
+
+      real_fsync = os.fsync
+      calls = {"n": 0}
+
+      def _flaky_fsync(fd):
+         calls["n"] += 1
+         # Let the run-directory-open fsync-free path and summary.json's
+         # own two fsyncs (file + directory) through untouched; fail
+         # only on DONE's own content fsync (the first fsync call made
+         # from inside _write_done_file_dir_fd).
+         if calls["n"] > 2:
+            raise OSError("injected fsync failure for DONE content")
+         return real_fsync(fd)
+
+      monkeypatch.setattr(jsonl_mod.os, "fsync", _flaky_fsync)
+
+      with pytest.raises(OSError):
+         finalize_orphaned_run(run_dir)
+
+      # summary.json legitimately got written before the injected DONE
+      # failure (finalize_orphaned_run does not roll it back on a DONE
+      # write failure -- see _finalize_orphaned_run_locked's own
+      # "inconsistent state" comment) -- what this test proves is that
+      # DONE specifically never exists under its real name, empty or
+      # otherwise, and that no stray temp file is left behind either.
+      assert not os.path.exists(os.path.join(run_dir, "DONE"))
+      leftovers = [
+         name for name in os.listdir(run_dir)
+         if name.startswith("DONE.tmp-")]
+      assert leftovers == []

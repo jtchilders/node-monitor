@@ -559,6 +559,28 @@ class TestFinalizeRecoveredRun:
          summary = json.load(handle)
       assert summary["run_id"] == "override-name"
 
+   def test_refuses_directory_with_no_jsonl_artifacts(self, tmp_path):
+      run_dir = tmp_path / "phase0-empty"
+      run_dir.mkdir(mode=0o700)
+
+      result = _invoke(["finalize-recovered-run", str(run_dir)])
+
+      assert result.exit_code != 0
+      assert not os.path.exists(str(run_dir / "summary.json"))
+      assert not os.path.exists(str(run_dir / "DONE"))
+
+   def test_refuses_malformed_artifact_before_publishing(
+         self, tmp_path, fake_proc_env):
+      run_dir = self._orphaned_run_dir(tmp_path, fake_proc_env, run_id="orphan-3")
+      with open(os.path.join(run_dir, "node_hardware.jsonl"), "a") as handle:
+         handle.write("{not json\n")
+
+      result = _invoke(["finalize-recovered-run", run_dir])
+
+      assert result.exit_code != 0
+      assert not os.path.exists(os.path.join(run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(run_dir, "DONE"))
+
 
 # --------------------------------------------------------------------------
 # Mixed local/remote transport dispatch (review round 1 finding #1,

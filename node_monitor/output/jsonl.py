@@ -855,6 +855,13 @@ def finalize_orphaned_run(run_dir, run_id=None):
      one of those states was not actually orphaned, and overwriting
      either would risk destroying real historical data with an
      inferior, reconstructed one.
+   * NEVER publishes ``summary.json``/``DONE`` when the artifact content
+     itself cannot be trusted as a complete, uncorrupted dataset: a run
+     directory with zero ``.jsonl`` artifacts at all, or any artifact
+     with a malformed line or a truncated final line, is refused
+     BEFORE either output is written -- recovery reconstructs a
+     genuinely complete dataset's terminal state, never blesses
+     corrupt or empty input as finalized.
    * NEVER fabricates the daemon's own in-memory acceptance telemetry
      (bounded scheduling-delay/probe-wall-time samples, per-node
      success totals, complete-window counts) -- that state lived only
@@ -947,23 +954,36 @@ def _atomic_write_json_dir_fd(dir_fd, name, payload):
 
 
 def _write_done_file_dir_fd(dir_fd):
-   """DONE-flag equivalent of ``_atomic_write_json_dir_fd``: creates the
-   file with ``O_EXCL`` (atomically refusing to clobber an existing
-   DONE) directly under the real name -- DONE's content is a single
-   timestamp line, not something that needs a rename-into-place for
-   atomicity of PARTIAL content the way JSON does, but ``O_EXCL`` still
-   gives the same "never overwrite" guarantee as ``_atomic_write_json_dir_fd``'s
-   link step.
+   """DONE-flag equivalent of ``_atomic_write_json_dir_fd``, published
+   with the exact same write-temp/fsync/link/no-clobber discipline --
+   the content is written and fsynced into a hidden temp name FIRST,
+   and only linked into the real ``DONE`` name once that content is
+   safely on disk. A crash or write/fsync failure partway through
+   therefore can never leave a final-named ``DONE`` at all (empty or
+   partial), which would otherwise falsely signal a completed
+   finalization to anything checking for ``DONE``'s mere presence
+   (e.g. ``validate-run``). ``os.link`` (not ``os.rename``/``os.replace``)
+   is used for the same reason ``_atomic_write_json_dir_fd`` uses it:
+   it raises ``FileExistsError`` rather than silently clobbering an
+   existing ``DONE``.
    """
+   tmp_name = "DONE.tmp-%d" % os.getpid()
    fd = os.open(
-      "DONE", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+      tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
       _FILE_MODE, dir_fd=dir_fd)
-   with os.fdopen(fd, "w") as handle:
-      handle.write(
-         time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z\n")
-      handle.flush()
-      os.fsync(handle.fileno())
-   os.chmod("DONE", _FILE_MODE, dir_fd=dir_fd)
+   try:
+      with os.fdopen(fd, "w") as handle:
+         handle.write(
+            time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z\n")
+         handle.flush()
+         os.fsync(handle.fileno())
+      os.chmod(tmp_name, _FILE_MODE, dir_fd=dir_fd)
+      os.link(tmp_name, "DONE", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+   finally:
+      try:
+         os.unlink(tmp_name, dir_fd=dir_fd)
+      except FileNotFoundError:
+         pass
    os.fsync(dir_fd)
 
 
@@ -1022,6 +1042,7 @@ def _finalize_orphaned_run_locked(abs_run_dir, dir_fd, run_id):
             % (exc,)) from exc
 
    files_summary = {}
+   any_artifact_present = False
    for record_type, filename in _FILENAMES.items():
       artifact_fd = _open_child_verified(dir_fd, filename)
       if artifact_fd is None:
@@ -1035,6 +1056,7 @@ def _finalize_orphaned_run_locked(abs_run_dir, dir_fd, run_id):
          }
          record_count = 0
       else:
+         any_artifact_present = True
          # os.fdopen takes ownership of artifact_fd -- its own `with`
          # block closes it, so no separate os.close is needed or
          # correct here.
@@ -1049,6 +1071,46 @@ def _finalize_orphaned_run_locked(abs_run_dir, dir_fd, run_id):
          "truncated_final_line": scan["truncated_final_line"],
          "sha256": scan["sha256"],
       }
+
+   # Strictly fail-closed on the artifact content itself, BEFORE either
+   # summary.json or DONE is published: this recovery tool's entire
+   # purpose is to finalize a run whose daemon collected a genuinely
+   # complete dataset and only failed to reach the old whole-file
+   # finalization step -- never to bless an empty, corrupt, or
+   # mid-write directory as "finalized". A directory with zero .jsonl
+   # artifacts at all is not this incident's shape (nothing was ever
+   # collected, or the wrong directory was pointed at); any malformed
+   # line or a truncated final line means the artifact content itself
+   # cannot be trusted as a complete, uncorrupted dataset. Earlier
+   # per-file accounting (malformed_count/truncated_final_line) still
+   # exists above for diagnostic purposes inside this function's own
+   # scan, but must never reach a published summary/DONE -- refusal
+   # happens here, before either write, not merely reported alongside
+   # a "successful" finalize.
+   if not any_artifact_present:
+      raise RecoveryFinalizeError(
+         "refusing to finalize %r: no .jsonl artifact files found -- "
+         "this is not an orphaned run with a complete collected "
+         "dataset (nothing was ever written, or this is the wrong "
+         "directory)" % (abs_run_dir,))
+   malformed_files = sorted(
+      record_type for record_type, entry in files_summary.items()
+      if entry["malformed_count"] > 0)
+   if malformed_files:
+      raise RecoveryFinalizeError(
+         "refusing to finalize %r: malformed JSONL line(s) found in "
+         "%s -- artifact content cannot be trusted as a complete, "
+         "uncorrupted dataset; recovery never publishes summary.json/"
+         "DONE over corrupt input" % (abs_run_dir, ", ".join(malformed_files)))
+   truncated_files = sorted(
+      record_type for record_type, entry in files_summary.items()
+      if entry["truncated_final_line"])
+   if truncated_files:
+      raise RecoveryFinalizeError(
+         "refusing to finalize %r: truncated final line found in %s "
+         "-- artifact content cannot be trusted as a complete, "
+         "uncorrupted dataset; recovery never publishes summary.json/"
+         "DONE over corrupt input" % (abs_run_dir, ", ".join(truncated_files)))
 
    summary = {
       "run_id": run_id,
