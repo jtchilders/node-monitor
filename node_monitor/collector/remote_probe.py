@@ -411,21 +411,22 @@ def _read_first_line(path):
 
 
 def _read_link(path):
-   """Read a /proc symlink (exe, cwd). Returns None if unreadable/absent.
+   """Read a /proc symlink (exe, cwd). Returns None on ANY IOError/OSError.
 
-   Same routine-failure set as _read_text: EACCES/EPERM (another user's
-   process), ENOENT/ESRCH (vanished or never had the link, e.g. kernel
-   threads have no /proc/<pid>/exe). A deleted-binary target (Linux appends
-   " (deleted)" to the link target after the inode is unlinked) is returned
-   verbatim -- readlink does not strip it and neither do we.
+   Unlike _read_text, this deliberately does not narrow to a specific
+   errno set: a readlink failure is provenance-collection noise, never a
+   reason to crash the walk or drop the row. Covers the routine cases
+   (EACCES/EPERM for another user's process, ENOENT/ESRCH for vanished or
+   link-less entries such as kernel threads) as well as anything else the
+   kernel might raise (e.g. ELOOP, ENAMETOOLONG). A deleted-binary target
+   (Linux appends " (deleted)" to the link target after the inode is
+   unlinked) is returned verbatim -- readlink does not strip it and
+   neither do we.
    """
    try:
       return os.readlink(path)
-   except (IOError, OSError) as exc:
-      if exc.errno in (errno.EACCES, errno.EPERM, errno.ENOENT, errno.ESRCH,
-                       errno.EINVAL, errno.EIO, errno.ENXIO):
-         return None
-      raise
+   except (IOError, OSError):
+      return None
 
 
 # --------------------------------------------------------------------------

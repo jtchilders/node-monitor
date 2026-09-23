@@ -518,6 +518,41 @@ class TestExeArgv0Cwd:
       assert rows[0]["argv0"] == "-bash"
       assert rows[0]["cwd"] == "/home/u"
 
+   def test_read_link_returns_none_on_any_oserror_not_just_listed_errnos(
+         self, monkeypatch):
+      """_read_link's contract is: None on ANY IOError/OSError, not a
+      narrowed errno allowlist. Reproduce with an errno that is NOT in the
+      routine set (ELOOP -- a symlink loop, real thing /proc can produce)
+      and assert it does not propagate."""
+      def fake_readlink(path):
+         raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+
+      monkeypatch.setattr(os, "readlink", fake_readlink)
+      assert probe._read_link("/proc/100/exe") is None
+
+   def test_row_still_emitted_when_readlink_raises_unlisted_oserror(
+         self, proc_root, monkeypatch):
+      """End-to-end: an unlisted OSError from os.readlink during the walk
+      must not crash _collect_processes or drop the row -- it must be
+      counted like any other unreadable link."""
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "exe": "/usr/bin/bash", "cwd": "/home/u"}])
+      real_readlink = os.readlink
+
+      def flaky_readlink(path):
+         if path.endswith("/exe") or path.endswith("/cwd"):
+            raise OSError(errno.ENAMETOOLONG, "File name too long")
+         return real_readlink(path)
+
+      monkeypatch.setattr(os, "readlink", flaky_readlink)
+      rows, coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert len(rows) == 1
+      assert rows[0]["exe_path"] is None
+      assert rows[0]["cwd"] is None
+      assert coverage["exe_unreadable"] == 1
+      assert coverage["cwd_unreadable"] == 1
+
 
 # --------------------------------------------------------------------------
 # On-node tool-instance aggregates (privacy-preserving; computed while argv
