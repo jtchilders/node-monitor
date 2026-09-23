@@ -31,6 +31,14 @@ def write_proc(root, pids, loadavg=None, meminfo=None, stat_line=None,
 
    pids: list of dicts with keys pid, comm, cmdline, uid, and any make_stat
    override. cmdline=None means the file is absent (kernel thread).
+
+   Optional per-pid keys `exe` and `cwd`: when present, a real symlink is
+   created at <pid_dir>/exe or <pid_dir>/cwd pointing at the given target
+   string (the target need not exist -- os.symlink/os.readlink don't
+   validate it, which is exactly what lets a target end in a literal
+   " (deleted)" suffix the way a real unlinked-binary /proc/<pid>/exe
+   does). Omitting the key leaves the symlink absent entirely, reproducing
+   ENOENT (denied/vanished/kernel-thread) on read.
    """
    os.makedirs(root, exist_ok=True)
    with open(os.path.join(root, "uptime"), "w") as handle:
@@ -83,6 +91,16 @@ def write_proc(root, pids, loadavg=None, meminfo=None, stat_line=None,
       if spec.get("cmdline") is not None:
          with open(os.path.join(pid_dir, "cmdline"), "wb") as handle:
             handle.write(spec["cmdline"].replace(" ", "\x00").encode() + b"\x00")
+      if spec.get("exe") is not None:
+         exe_link = os.path.join(pid_dir, "exe")
+         if os.path.lexists(exe_link):
+            os.remove(exe_link)
+         os.symlink(spec["exe"], exe_link)
+      if spec.get("cwd") is not None:
+         cwd_link = os.path.join(pid_dir, "cwd")
+         if os.path.lexists(cwd_link):
+            os.remove(cwd_link)
+         os.symlink(spec["cwd"], cwd_link)
    return root
 
 

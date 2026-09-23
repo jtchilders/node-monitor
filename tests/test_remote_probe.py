@@ -411,6 +411,115 @@ class TestCensus:
 
 
 # --------------------------------------------------------------------------
+# exe_path / argv0 / cwd -- per-process provenance (B2+B3)
+# --------------------------------------------------------------------------
+
+class TestExeArgv0Cwd:
+   def test_row_has_exe_path_argv0_cwd_keys(self, proc_root):
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "exe": "/usr/bin/bash", "cwd": "/home/u"}])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      row = rows[0]
+      assert "exe_path" in row
+      assert "argv0" in row
+      assert "cwd" in row
+
+   def test_exe_path_equals_symlink_target(self, proc_root):
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "exe": "/usr/bin/bash"}])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["exe_path"] == "/usr/bin/bash"
+
+   def test_exe_path_none_and_coverage_increments_when_unreadable(
+         self, proc_root):
+      """No /proc/<pid>/exe symlink at all (denied/vanished/kernel) --
+      the row must still be emitted, exe_path null, coverage counted."""
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash"}])
+      rows, coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["exe_path"] is None
+      assert coverage["exe_unreadable"] == 1
+
+   def test_exe_path_deleted_suffix_preserved_verbatim(self, proc_root):
+      """A binary unlinked after exec: real signal, must not be stripped."""
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "exe": "/tmp/build/a.out (deleted)"}])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["exe_path"] == "/tmp/build/a.out (deleted)"
+
+   def test_argv0_is_first_nul_token_before_space_join(self, proc_root):
+      root = proc_root([{"pid": 100, "comm": "python3",
+                          "cmdline": "x"}])
+      # Overwrite the fixture's space-joined cmdline with a real
+      # NUL-delimited argv so the split-before-join distinction is
+      # actually exercised (the fixture's cmdline= convenience arg joins
+      # on spaces, which loses the NUL positions this test needs).
+      cmdline_path = os.path.join(root, "100", "cmdline")
+      with open(cmdline_path, "wb") as handle:
+         handle.write(b"/usr/bin/python3\x00-m\x00http.server\x00")
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["argv0"] == "/usr/bin/python3"
+
+   def test_argv0_nonempty_for_every_emitted_row(self, proc_root):
+      """Rows with empty cmdline are excluded upstream, so every emitted
+      row's argv0 must be non-empty."""
+      proc_root([
+         {"pid": 3, "comm": "kworker", "cmdline": ""},
+         {"pid": 100, "comm": "bash", "cmdline": "-bash"},
+      ])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert len(rows) == 1
+      assert rows[0]["argv0"]
+
+   def test_cwd_equals_symlink_target(self, proc_root):
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "cwd": "/home/u/project"}])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["cwd"] == "/home/u/project"
+
+   def test_cwd_none_and_coverage_increments_when_unreadable(
+         self, proc_root):
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash"}])
+      rows, coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["cwd"] is None
+      assert coverage["cwd_unreadable"] == 1
+
+   def test_cwd_deleted_suffix_preserved_verbatim(self, proc_root):
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "cwd": "/home/u/removed-dir (deleted)"}])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["cwd"] == "/home/u/removed-dir (deleted)"
+
+   def test_coverage_always_has_exe_and_cwd_unreadable_keys(self, proc_root):
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "exe": "/usr/bin/bash", "cwd": "/home/u"}])
+      _rows, coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert coverage["exe_unreadable"] == 0
+      assert coverage["cwd_unreadable"] == 0
+
+   def test_exe_argv0_cwd_captured_regardless_of_drop_raw_args(
+         self, proc_root):
+      """These are provenance fields, not argv -- always captured."""
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "exe": "/usr/bin/bash", "cwd": "/home/u"}])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert "cmdline" not in rows[0]
+      assert rows[0]["exe_path"] == "/usr/bin/bash"
+      assert rows[0]["argv0"] == "-bash"
+      assert rows[0]["cwd"] == "/home/u"
+
+
+# --------------------------------------------------------------------------
 # On-node tool-instance aggregates (privacy-preserving; computed while argv
 # is still available, before drop_raw_args strips cmdline from the rows).
 # --------------------------------------------------------------------------
@@ -833,7 +942,7 @@ class TestPayloadContract:
          "pid", "ppid", "uid", "username", "comm", "category", "behavior",
          "activity", "activity_confidence", "project_path_hint",
          "utime_ticks", "stime_ticks", "rss_kb", "state",
-         "start_time_ticks", "interactive",
+         "start_time_ticks", "interactive", "exe_path", "argv0", "cwd",
       }
       for row in payload["processes"][:20]:
          missing = required - set(row)
