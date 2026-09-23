@@ -91,6 +91,12 @@ def write_proc(root, pids, loadavg=None, meminfo=None, stat_line=None,
       pid = spec["pid"]
       pid_dir = os.path.join(root, str(pid))
       os.makedirs(pid_dir, exist_ok=True)
+      # `uid` is documented here for callers, but ownership itself is never
+      # set by this function: a non-root test process cannot chown a file
+      # to an arbitrary uid it doesn't own. Tests that need a /proc entry
+      # to genuinely report a different owning uid (e.g. a root-owned sshd
+      # outside the probe's own uid) must call `spoof_uids()` below, which
+      # intercepts os.stat() instead of touching real ownership.
       with open(os.path.join(pid_dir, "stat"), "w") as handle:
          handle.write(make_stat(
             pid, spec["comm"],
@@ -116,6 +122,52 @@ def write_proc(root, pids, loadavg=None, meminfo=None, stat_line=None,
             os.remove(cwd_link)
          os.symlink(spec["cwd"], cwd_link)
    return root
+
+
+class FakeStatResult(object):
+   """Wraps a real os.stat_result, overriding only st_uid.
+
+   os.stat_result is a C structseq with no public way to construct or copy
+   one with a single field changed, and the test process cannot chown a
+   file it owns to an arbitrary uid (e.g. 0/root) without real root
+   privileges. This is the standalone-testable substitute: it forwards
+   every attribute except st_uid to the real result via __getattr__, so
+   any caller that only reads `.st_uid` (as `_collect_processes` does)
+   sees a genuinely different owning uid without touching real ownership.
+   """
+
+   def __init__(self, real_result, uid):
+      self._real_result = real_result
+      self.st_uid = uid
+
+   def __getattr__(self, name):
+      return getattr(self._real_result, name)
+
+
+def spoof_uid(monkeypatch, path, uid):
+   """Make os.stat(path) report `uid` as st_uid, for exactly that path.
+
+   Used to reproduce a genuinely different-uid /proc entry (e.g. a
+   root-owned sshd) without requiring the test process to run as root.
+   All other paths fall through to the real os.stat unchanged.
+   """
+   real_stat = os.stat
+
+   def _spoofed(target, *args, **kwargs):
+      result = real_stat(target, *args, **kwargs)
+      if target == path:
+         return FakeStatResult(result, uid)
+      return result
+
+   monkeypatch.setattr(os, "stat", _spoofed)
+
+
+def deny_read(path):
+   """chmod a file to 0o000 so a real EACCES is raised on open() by a
+   non-root reader -- reproducing the actual permission barrier a
+   different-uid /proc entry (e.g. root-owned sshd's cmdline) presents on
+   a real fleet node, rather than an empty-file stand-in for it."""
+   os.chmod(path, 0o000)
 
 
 # --------------------------------------------------------------------------
