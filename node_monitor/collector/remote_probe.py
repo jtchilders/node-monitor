@@ -153,6 +153,13 @@ _BEHAVIOR_INTERACTIVE = "interactive"
 _BEHAVIOR_BATCH = "batch"
 _BEHAVIOR_DAEMON = "daemon"
 
+# Reused (not re-compiled) by the B4 parent/lineage classifier below --
+# `parent_kind`'s "shell" and "multiplexer" buckets are the SAME compiled
+# pattern object as the shell/terminal-multiplexer activity rules, not a
+# hand-rolled duplicate that could drift from them.
+_SHELL_RE = re.compile(r"(^|/)(bash|zsh|tcsh|csh|ksh|sh)( |$)|^-")
+_MULTIPLEXER_RE = re.compile(r"(^|/)(screen|tmux)( |$)")
+
 _ACTIVITY_RULES = [
    ("vscode-remote-server", re.compile(r"vscode-server|code-server"), 10),
    ("cursor-remote-server", re.compile(r"cursor-server"), 10),
@@ -175,9 +182,9 @@ _ACTIVITY_RULES = [
       r"(^|/)(rsync|scp|sftp|globus|globus-url-copy|curl|wget)( |$)"), 10),
    ("filesystem-scan", re.compile(r"(^|/)(find|du|ncdu|updatedb)( |$)"), 10),
    ("pbs-query", re.compile(r"(^|/)(qstat|qsub|qdel|pbsnodes)( |$)"), 10),
-   ("shell", re.compile(r"(^|/)(bash|zsh|tcsh|csh|ksh|sh)( |$)|^-"), 10),
+   ("shell", _SHELL_RE, 10),
    ("ssh-session", re.compile(r"(^|/)sshd( |:|$)"), 10),
-   ("terminal-multiplexer", re.compile(r"(^|/)(screen|tmux)( |$)"), 10),
+   ("terminal-multiplexer", _MULTIPLEXER_RE, 10),
 ]
 
 # Paths that qualify a process to a project with high confidence.
@@ -865,6 +872,13 @@ def _parse_stat(raw):
    whitespace breaks on any process whose name contains a space -- which on
    this fleet includes real processes -- and splitting on the first ')'
    breaks on names containing parens, e.g. '(sd-pam)'. Both occur here.
+
+   `tail` is 0-indexed starting at stat's field 3 (state): tail[i] is
+   stat's 1-indexed field (i + 3). So tail[0]=state(3), tail[1]=ppid(4),
+   tail[3]=session id/sid(6), tail[4]=tty_nr(7), tail[11]=utime(14),
+   tail[12]=stime(15), tail[19]=starttime(22), tail[21]=rss_pages(24) --
+   see proc(5). `is_session_leader` (B4) reads tail[3]; pinned by
+   TestCensus.test_is_session_leader_field_index against this same layout.
    """
    open_paren = raw.find("(")
    close_paren = raw.rfind(")")
@@ -943,6 +957,91 @@ def _project_from_path(cmdline):
    return match.group(1) if match else None
 
 
+def _parent_kind(ppid, parent_comm):
+   """Classify the parent process (B4): why does this process have the
+   parent it has, at a glance.
+
+   Checked in this fixed order, per the card's spec:
+   1. `ppid == 1` -> "init": reparented-to-init is the orphaned/abandoned-
+      daemon signal, and wins regardless of what pid 1's own comm is.
+   2. `parent_comm is None` -> "unknown": parent unreadable/vanished.
+   3. multiplexer / sshd / shell regexes against the resolved `parent_comm`.
+   4. "other" otherwise.
+   """
+   if ppid == 1:
+      return "init"
+   if parent_comm is None:
+      return "unknown"
+   if _MULTIPLEXER_RE.search(parent_comm):
+      return "multiplexer"
+   if parent_comm.startswith("sshd"):
+      return "sshd"
+   if _SHELL_RE.search(parent_comm):
+      return "shell"
+   return "other"
+
+
+def _resolve_parent_direct(ppid):
+   """Single bounded direct /proc read for a parent NOT in `pid_meta` (a
+   process outside the uid set we walked, e.g. root-owned sshd/systemd).
+
+   Guarded end to end: any unreadable/vanished piece yields None for that
+   field, never raises, and never triggers a second recursive resolution
+   (the parent-of-the-parent is out of scope for this card).
+   """
+   proc_dir = _proc(str(ppid))
+   raw_stat = _read_text(proc_dir + "/stat")
+   parent_comm = None
+   if raw_stat is not None:
+      parsed = _parse_stat(raw_stat)
+      if parsed is not None:
+         parent_comm = parsed[0]
+   parent_exe_path = _read_link(proc_dir + "/exe")
+   parent_argv0 = None
+   raw_cmdline = _read_text(proc_dir + "/cmdline")
+   if raw_cmdline:
+      parent_argv0 = raw_cmdline.split("\x00", 1)[0] or None
+   return parent_comm, parent_exe_path, parent_argv0
+
+
+def _enrich_parent_lineage(rows, pid_meta, coverage):
+   """Post-walk, in-memory-only enrichment pass (B4): fills the six
+   parent/lineage fields on every row already built by the /proc walk.
+
+   Deliberately a SEPARATE pass over `rows`, after the walk is finished,
+   rather than computed inline per-row during the walk -- at row-build
+   time the parent's own row may not exist yet (PIDs are not walked in
+   any guaranteed parent-before-child order), so resolving from `pid_meta`
+   inline would silently miss walked-parents that just hadn't been visited
+   yet and fall through to an unnecessary direct read.
+
+   `under_screen_or_tmux` is deliberately based on the DIRECT parent's
+   comm only, not the full ancestor chain -- deeper multi-hop lineage
+   (e.g. process -> shell -> tmux) is out of scope for this card.
+   """
+   for row in rows:
+      ppid = row["ppid"]
+      meta = pid_meta.get(ppid)
+      if meta is not None:
+         # Parent is one of OUR walked processes -- zero extra /proc reads.
+         parent_comm = meta["comm"]
+         parent_exe_path = meta["exe_path"]
+         parent_argv0 = meta["argv0"]
+      else:
+         parent_comm, parent_exe_path, parent_argv0 = (
+            _resolve_parent_direct(ppid))
+
+      if parent_comm is None:
+         coverage["parent_unresolved"] += 1
+
+      row["parent_comm"] = parent_comm
+      row["parent_exe_path"] = parent_exe_path
+      row["parent_argv0"] = parent_argv0
+      row["under_screen_or_tmux"] = bool(
+         parent_comm and _MULTIPLEXER_RE.search(parent_comm))
+      row["parent_kind"] = _parent_kind(ppid, parent_comm)
+
+
 def _collect_processes(uid_names, drop_raw_args, deadline):
    """Walk /proc once. Returns (rows, coverage, tools).
 
@@ -968,6 +1067,7 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
       "vanished": 0,
       "exe_unreadable": 0,
       "cwd_unreadable": 0,
+      "parent_unresolved": 0,
    }
    # Internal working representation for the tool aggregates below. Keyed by
    # pid so ancestor lookups (parent tool, grandparent tool, ...) don't need
@@ -976,6 +1076,14 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
    # outlives the per-row `cmdline` local.
    pid_index = {}
    tool_matches = []
+
+   # B4 parent/lineage enrichment: stash of the comm/exe_path/argv0 already
+   # read for EVERY successfully-parsed pid during the one /proc walk below,
+   # so the post-walk enrichment pass can resolve a parent that is one of
+   # our OWN walked processes with zero extra /proc reads. Populated at the
+   # same point in the loop as `pid_index`, from the same already-in-scope
+   # local variables -- never a second read of the same file.
+   pid_meta = {}
 
    try:
       entries = os.listdir(PROC_ROOT)
@@ -1031,6 +1139,7 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
       try:
          state = tail[0]
          ppid = int(tail[1])
+         sid = int(tail[3])
          tty_nr = int(tail[4])
          utime = int(tail[11])
          stime = int(tail[12])
@@ -1073,6 +1182,7 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
          "exe_path": exe_path,
          "argv0": argv0,
          "cwd": cwd,
+         "is_session_leader": int(entry) == sid,
       }
       if not drop_raw_args:
          row["cmdline"] = cmdline
@@ -1081,6 +1191,9 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
       pid_int = int(entry)
       matched_tools = _match_tools(cmdline)
       pid_index[pid_int] = {"ppid": ppid, "tools": set(matched_tools)}
+      pid_meta[pid_int] = {
+         "comm": comm, "exe_path": exe_path, "argv0": argv0,
+      }
       for tool in matched_tools:
          tool_matches.append({
             "pid": pid_int,
@@ -1091,6 +1204,7 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
             if tool in _INSTALL_ID_TOOLS else (),
          })
    tools = _build_tool_aggregates(pid_index, tool_matches)
+   _enrich_parent_lineage(rows, pid_meta, coverage)
    return rows, coverage, tools
 
 

@@ -9,13 +9,26 @@ import os
 
 
 # /proc/<pid>/stat field layout after the comm field (0-indexed into the
-# post-comm tail): 0=state 1=ppid 4=tty_nr 11=utime 12=stime 19=starttime
-# 21=rss_pages. Padded to 44 fields, which is what a real kernel emits.
+# post-comm tail): 0=state 1=ppid 3=sid 4=tty_nr 11=utime 12=stime
+# 19=starttime 21=rss_pages. Padded to 44 fields, which is what a real
+# kernel emits.
+#
+# tail[i] corresponds to the (i+3)'th 1-indexed /proc/<pid>/stat field per
+# proc(5): 3=state, 4=ppid, 5=pgrp, 6=session, 7=tty_nr, ... -- so session
+# id (field 6) lands at tail[6-3] == tail[3]. This is pinned by
+# TestCensus.test_is_session_leader_field_index (B4) against the same
+# real-field numbering that makes tail[1]=ppid (field 4) and
+# tail[4]=tty_nr (field 7) already correct above.
+#
+# `sid=None` (the default) leaves tail[3] as "0" -- indistinguishable from
+# "not a session leader" for any pid > 0 -- so existing fixtures that never
+# pass `sid` are unaffected.
 def make_stat(pid, comm, state="S", ppid=1, tty_nr=0, utime=100, stime=50,
-              starttime=98765, rss_pages=1024):
+              starttime=98765, rss_pages=1024, sid=None):
    tail = ["0"] * 44
    tail[0] = state
    tail[1] = str(ppid)
+   tail[3] = str(sid if sid is not None else 0)
    tail[4] = str(tty_nr)
    tail[11] = str(utime)
    tail[12] = str(stime)
@@ -87,7 +100,8 @@ def write_proc(root, pids, loadavg=None, meminfo=None, stat_line=None,
             utime=spec.get("utime", 100),
             stime=spec.get("stime", 50),
             starttime=spec.get("starttime", 98765),
-            rss_pages=spec.get("rss_pages", 1024)))
+            rss_pages=spec.get("rss_pages", 1024),
+            sid=spec.get("sid")))
       if spec.get("cmdline") is not None:
          with open(os.path.join(pid_dir, "cmdline"), "wb") as handle:
             handle.write(spec["cmdline"].replace(" ", "\x00").encode() + b"\x00")
