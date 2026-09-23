@@ -44,6 +44,7 @@ _DEFAULTS = {
    "ssh_connect_timeout_sec": 8,
    "max_parallel_polls": 8,
    "min_free_disk_pct": 10,
+   "keep_raw_args": True,
 }
 
 # Fields required to be present with no built-in default.
@@ -141,6 +142,7 @@ class Phase0Config:
    ssh_connect_timeout_sec: float
    max_parallel_polls: int
    min_free_disk_pct: float
+   keep_raw_args: bool
 
    @property
    def local_node(self):
@@ -189,6 +191,12 @@ def _validate_max_parallel_polls(value):
       raise ConfigError("max_parallel_polls must be a positive integer, got %r" % (value,))
    if value <= 0:
       raise ConfigError("max_parallel_polls must be positive, got %r" % (value,))
+   return value
+
+
+def _validate_keep_raw_args(value):
+   if not isinstance(value, bool):
+      raise ConfigError("keep_raw_args must be a bool, got %r" % (value,))
    return value
 
 
@@ -317,6 +325,8 @@ def load_config(raw, home):
       values[key] = _validate_positive_number(value, key)
    values["max_parallel_polls"] = _validate_max_parallel_polls(
       raw.get("max_parallel_polls", _DEFAULTS["max_parallel_polls"]))
+   values["keep_raw_args"] = _validate_keep_raw_args(
+      raw.get("keep_raw_args", _DEFAULTS["keep_raw_args"]))
 
    return Phase0Config(
       system=system,

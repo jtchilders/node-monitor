@@ -62,12 +62,13 @@ class TestBuildLocalArgv:
       assert argv == [
          "/usr/bin/python3.11", "/path/to/remote_probe.py",
          "--loop", "counter", "--max-seconds", "4",
+         "--keep-raw-args",
       ]
 
    def test_fractional_max_seconds_preserved(self):
       argv = transport.build_local_argv(
          "/usr/bin/python3.11", "/p/remote_probe.py", "census", 2.5)
-      assert argv[-1] == "2.5"
+      assert argv[-2] == "2.5"
 
    def test_missing_probe_python_rejected(self):
       with pytest.raises(ValueError):
@@ -76,6 +77,18 @@ class TestBuildLocalArgv:
    def test_missing_script_path_rejected(self):
       with pytest.raises(ValueError):
          transport.build_local_argv("/usr/bin/python3.11", "", "census", 4)
+
+   def test_keep_raw_args_true_appends_keep_flag(self):
+      argv = transport.build_local_argv(
+         "/usr/bin/python3.11", "/p/remote_probe.py", "census", 4,
+         keep_raw_args=True)
+      assert argv[-1] == "--keep-raw-args"
+
+   def test_keep_raw_args_false_appends_drop_flag(self):
+      argv = transport.build_local_argv(
+         "/usr/bin/python3.11", "/p/remote_probe.py", "census", 4,
+         keep_raw_args=False)
+      assert argv[-1] == "--drop-raw-args"
 
 
 class TestBuildRemoteArgv:
@@ -104,6 +117,7 @@ class TestBuildRemoteArgv:
          "/usr/bin/python3.11", "-",
          "--loop", "census",
          "--max-seconds", "20",
+         "--keep-raw-args",
       ]
 
    def test_uses_head_alias_verbatim_never_substitutes(self):
@@ -144,6 +158,14 @@ class TestBuildRemoteArgv:
    def test_missing_hostname_rejected(self):
       with pytest.raises(ValueError):
          self._build(hostname="")
+
+   def test_keep_raw_args_true_appends_keep_flag(self):
+      argv = self._build(keep_raw_args=True)
+      assert argv[-1] == "--keep-raw-args"
+
+   def test_keep_raw_args_false_appends_drop_flag(self):
+      argv = self._build(keep_raw_args=False)
+      assert argv[-1] == "--drop-raw-args"
 
 
 # --------------------------------------------------------------------------
@@ -261,7 +283,8 @@ class TestRunLocalProbe:
          base_env=env,
       ))
       assert result.payload["argv"] == [
-         probe_script_path, "--loop", "census", "--max-seconds", "7"]
+         probe_script_path, "--loop", "census", "--max-seconds", "7",
+         "--keep-raw-args"]
 
    def test_ld_preload_stripped_from_local_child(
          self, fake_probe, probe_script_path):
