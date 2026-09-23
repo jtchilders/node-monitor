@@ -411,6 +411,150 @@ class TestCensus:
 
 
 # --------------------------------------------------------------------------
+# exe_path / argv0 / cwd -- per-process provenance (B2+B3)
+# --------------------------------------------------------------------------
+
+class TestExeArgv0Cwd:
+   def test_row_has_exe_path_argv0_cwd_keys(self, proc_root):
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "exe": "/usr/bin/bash", "cwd": "/home/u"}])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      row = rows[0]
+      assert "exe_path" in row
+      assert "argv0" in row
+      assert "cwd" in row
+
+   def test_exe_path_equals_symlink_target(self, proc_root):
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "exe": "/usr/bin/bash"}])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["exe_path"] == "/usr/bin/bash"
+
+   def test_exe_path_none_and_coverage_increments_when_unreadable(
+         self, proc_root):
+      """No /proc/<pid>/exe symlink at all (denied/vanished/kernel) --
+      the row must still be emitted, exe_path null, coverage counted."""
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash"}])
+      rows, coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["exe_path"] is None
+      assert coverage["exe_unreadable"] == 1
+
+   def test_exe_path_deleted_suffix_preserved_verbatim(self, proc_root):
+      """A binary unlinked after exec: real signal, must not be stripped."""
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "exe": "/tmp/build/a.out (deleted)"}])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["exe_path"] == "/tmp/build/a.out (deleted)"
+
+   def test_argv0_is_first_nul_token_before_space_join(self, proc_root):
+      root = proc_root([{"pid": 100, "comm": "python3",
+                          "cmdline": "x"}])
+      # Overwrite the fixture's space-joined cmdline with a real
+      # NUL-delimited argv so the split-before-join distinction is
+      # actually exercised (the fixture's cmdline= convenience arg joins
+      # on spaces, which loses the NUL positions this test needs).
+      cmdline_path = os.path.join(root, "100", "cmdline")
+      with open(cmdline_path, "wb") as handle:
+         handle.write(b"/usr/bin/python3\x00-m\x00http.server\x00")
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["argv0"] == "/usr/bin/python3"
+
+   def test_argv0_nonempty_for_every_emitted_row(self, proc_root):
+      """Rows with empty cmdline are excluded upstream, so every emitted
+      row's argv0 must be non-empty."""
+      proc_root([
+         {"pid": 3, "comm": "kworker", "cmdline": ""},
+         {"pid": 100, "comm": "bash", "cmdline": "-bash"},
+      ])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert len(rows) == 1
+      assert rows[0]["argv0"]
+
+   def test_cwd_equals_symlink_target(self, proc_root):
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "cwd": "/home/u/project"}])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["cwd"] == "/home/u/project"
+
+   def test_cwd_none_and_coverage_increments_when_unreadable(
+         self, proc_root):
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash"}])
+      rows, coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["cwd"] is None
+      assert coverage["cwd_unreadable"] == 1
+
+   def test_cwd_deleted_suffix_preserved_verbatim(self, proc_root):
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "cwd": "/home/u/removed-dir (deleted)"}])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["cwd"] == "/home/u/removed-dir (deleted)"
+
+   def test_coverage_always_has_exe_and_cwd_unreadable_keys(self, proc_root):
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "exe": "/usr/bin/bash", "cwd": "/home/u"}])
+      _rows, coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert coverage["exe_unreadable"] == 0
+      assert coverage["cwd_unreadable"] == 0
+
+   def test_exe_argv0_cwd_captured_regardless_of_drop_raw_args(
+         self, proc_root):
+      """These are provenance fields, not argv -- always captured."""
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "exe": "/usr/bin/bash", "cwd": "/home/u"}])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert "cmdline" not in rows[0]
+      assert rows[0]["exe_path"] == "/usr/bin/bash"
+      assert rows[0]["argv0"] == "-bash"
+      assert rows[0]["cwd"] == "/home/u"
+
+   def test_read_link_returns_none_on_any_oserror_not_just_listed_errnos(
+         self, monkeypatch):
+      """_read_link's contract is: None on ANY IOError/OSError, not a
+      narrowed errno allowlist. Reproduce with an errno that is NOT in the
+      routine set (ELOOP -- a symlink loop, real thing /proc can produce)
+      and assert it does not propagate."""
+      def fake_readlink(path):
+         raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+
+      monkeypatch.setattr(os, "readlink", fake_readlink)
+      assert probe._read_link("/proc/100/exe") is None
+
+   def test_row_still_emitted_when_readlink_raises_unlisted_oserror(
+         self, proc_root, monkeypatch):
+      """End-to-end: an unlisted OSError from os.readlink during the walk
+      must not crash _collect_processes or drop the row -- it must be
+      counted like any other unreadable link."""
+      proc_root([{"pid": 100, "comm": "bash", "cmdline": "-bash",
+                  "exe": "/usr/bin/bash", "cwd": "/home/u"}])
+      real_readlink = os.readlink
+
+      def flaky_readlink(path):
+         if path.endswith("/exe") or path.endswith("/cwd"):
+            raise OSError(errno.ENAMETOOLONG, "File name too long")
+         return real_readlink(path)
+
+      monkeypatch.setattr(os, "readlink", flaky_readlink)
+      rows, coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert len(rows) == 1
+      assert rows[0]["exe_path"] is None
+      assert rows[0]["cwd"] is None
+      assert coverage["exe_unreadable"] == 1
+      assert coverage["cwd_unreadable"] == 1
+
+
+# --------------------------------------------------------------------------
 # On-node tool-instance aggregates (privacy-preserving; computed while argv
 # is still available, before drop_raw_args strips cmdline from the rows).
 # --------------------------------------------------------------------------
@@ -833,7 +977,7 @@ class TestPayloadContract:
          "pid", "ppid", "uid", "username", "comm", "category", "behavior",
          "activity", "activity_confidence", "project_path_hint",
          "utime_ticks", "stime_ticks", "rss_kb", "state",
-         "start_time_ticks", "interactive",
+         "start_time_ticks", "interactive", "exe_path", "argv0", "cwd",
       }
       for row in payload["processes"][:20]:
          missing = required - set(row)

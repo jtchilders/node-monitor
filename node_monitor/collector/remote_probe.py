@@ -410,6 +410,25 @@ def _read_first_line(path):
    return text.split("\n", 1)[0]
 
 
+def _read_link(path):
+   """Read a /proc symlink (exe, cwd). Returns None on ANY IOError/OSError.
+
+   Unlike _read_text, this deliberately does not narrow to a specific
+   errno set: a readlink failure is provenance-collection noise, never a
+   reason to crash the walk or drop the row. Covers the routine cases
+   (EACCES/EPERM for another user's process, ENOENT/ESRCH for vanished or
+   link-less entries such as kernel threads) as well as anything else the
+   kernel might raise (e.g. ELOOP, ENAMETOOLONG). A deleted-binary target
+   (Linux appends " (deleted)" to the link target after the inode is
+   unlinked) is returned verbatim -- readlink does not strip it and
+   neither do we.
+   """
+   try:
+      return os.readlink(path)
+   except (IOError, OSError):
+      return None
+
+
 # --------------------------------------------------------------------------
 # Node-level counters (both loops)
 # --------------------------------------------------------------------------
@@ -947,6 +966,8 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
       "cmdline_empty": 0,
       "owner_unresolved": 0,
       "vanished": 0,
+      "exe_unreadable": 0,
+      "cwd_unreadable": 0,
    }
    # Internal working representation for the tool aggregates below. Keyed by
    # pid so ancestor lookups (parent tool, grandparent tool, ...) don't need
@@ -1005,6 +1026,7 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
          # node, neither could we.
          coverage["cmdline_empty"] += 1
          continue
+      argv0 = raw_cmdline.split("\x00", 1)[0]
 
       try:
          state = tail[0]
@@ -1021,6 +1043,14 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
       username = uid_names.get(uid)
       if username is None:
          coverage["owner_unresolved"] += 1
+
+      exe_path = _read_link(proc_dir + "/exe")
+      if exe_path is None:
+         coverage["exe_unreadable"] += 1
+
+      cwd = _read_link(proc_dir + "/cwd")
+      if cwd is None:
+         coverage["cwd_unreadable"] += 1
 
       category, activity, confidence = _classify(comm, cmdline)
       row = {
@@ -1040,6 +1070,9 @@ def _collect_processes(uid_names, drop_raw_args, deadline):
          "state": state,
          "start_time_ticks": start_time,
          "interactive": bool(tty_nr),
+         "exe_path": exe_path,
+         "argv0": argv0,
+         "cwd": cwd,
       }
       if not drop_raw_args:
          row["cmdline"] = cmdline
