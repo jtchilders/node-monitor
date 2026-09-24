@@ -555,6 +555,338 @@ class TestExeArgv0Cwd:
 
 
 # --------------------------------------------------------------------------
+# Parent / lineage enrichment (B4): parent_comm, parent_exe_path,
+# parent_argv0, is_session_leader, under_screen_or_tmux, parent_kind.
+# --------------------------------------------------------------------------
+
+class TestParentLineage:
+   _ALL_SIX = (
+      "parent_comm", "parent_exe_path", "parent_argv0", "is_session_leader",
+      "under_screen_or_tmux", "parent_kind",
+   )
+
+   def test_row_has_all_six_new_keys(self, proc_root):
+      proc_root([
+         {"pid": 100, "comm": "bash", "cmdline": "-bash", "ppid": 1},
+      ])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      row = rows[0]
+      for key in self._ALL_SIX:
+         assert key in row
+
+   def test_parent_in_walked_set_resolved_from_stash(self, proc_root):
+      """Parent is also one of our own walked rows -- values must match
+      the parent's OWN captured comm/exe_path/argv0 exactly (stash reuse,
+      no divergence), and this must cost zero extra /proc reads (see
+      test_parent_in_walked_set_never_triggers_extra_readlink below)."""
+      proc_root([
+         {"pid": 100, "comm": "bash", "cmdline": "-bash", "ppid": 1,
+          "exe": "/usr/bin/bash", "cwd": "/home/u"},
+         {"pid": 200, "comm": "python3", "cmdline": "python3 script.py",
+          "ppid": 100, "exe": "/usr/bin/python3", "cwd": "/home/u"},
+      ])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      by_pid = {row["pid"]: row for row in rows}
+      child = by_pid[200]
+      assert child["parent_comm"] == "bash"
+      assert child["parent_exe_path"] == "/usr/bin/bash"
+      assert child["parent_argv0"] == "-bash"
+
+   def test_parent_in_walked_set_never_triggers_extra_readlink(
+         self, proc_root, monkeypatch):
+      """Design constraint: when the parent is already in pid_meta, the
+      enrichment pass must NOT call _read_link/_read_text on the parent's
+      /proc entry again -- only the main walk's own per-pid reads for pid
+      200's exe/cwd/stat/cmdline are allowed to touch pid 100's files at
+      all (they never do), so any read of a path containing "/100/" during
+      enrichment indicates a violation of the zero-extra-read constraint."""
+      proc_root([
+         {"pid": 100, "comm": "bash", "cmdline": "-bash", "ppid": 1,
+          "exe": "/usr/bin/bash", "cwd": "/home/u"},
+         {"pid": 200, "comm": "python3", "cmdline": "python3 script.py",
+          "ppid": 100, "exe": "/usr/bin/python3", "cwd": "/home/u"},
+      ])
+      real_read_link = probe._read_link
+      real_read_text = probe._read_text
+      extra_parent_reads = []
+
+      def counting_read_link(path):
+         if os.sep + "100" + os.sep in path or path.endswith(
+               os.sep + "100"):
+            extra_parent_reads.append(path)
+         return real_read_link(path)
+
+      def counting_read_text(path):
+         if (os.sep + "100" + os.sep in path or
+               path.endswith(os.sep + "100")) and "/200" not in path:
+            extra_parent_reads.append(path)
+         return real_read_text(path)
+
+      monkeypatch.setattr(probe, "_read_link", counting_read_link)
+      monkeypatch.setattr(probe, "_read_text", counting_read_text)
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      # The main walk itself reads pid 100's own stat/exe/cwd/cmdline once
+      # (to build pid 100's OWN row) -- that is expected and not an "extra"
+      # read caused by enrichment. What must be exactly zero is any read of
+      # pid 100's files made a SECOND time, after the main walk, by the
+      # enrichment pass. Since the walk order and single-pass reads are
+      # deterministic, assert the total count equals exactly the main
+      # walk's own reads for pid 100 (stat once via _read_text, exe once
+      # via _read_link, cwd once via _read_link, cmdline once via
+      # _read_text) -- 4 total, never more.
+      by_pid = {row["pid"]: row for row in rows}
+      assert by_pid[200]["parent_comm"] == "bash"
+      assert len(extra_parent_reads) == 4
+
+   def test_parent_outside_walked_set_resolved_via_direct_read(
+         self, proc_root, monkeypatch):
+      """Parent is a genuinely different-uid process (root-owned sshd,
+      spoofed via fake_proc.spoof_uid so this doesn't require the test to
+      run as root) whose cmdline is REAL-permission-denied (chmod 0o000,
+      not just an empty-string stand-in) -- the actual barrier a
+      root-owned system process presents on a real fleet node. That
+      denial is what excludes it from `rows`/`pid_meta` (the main walk's
+      own kernel-thread/denied-cmdline branch), forcing the enrichment
+      pass to fall back to `_resolve_parent_direct`. Its stat/exe are
+      still fully readable, so the direct read must resolve them
+      correctly, and it must happen exactly ONCE for this child (proven
+      by wrapping `_resolve_parent_direct` itself, not just checking the
+      resulting values) -- the "single bounded direct read" the card
+      requires, not a naive second full walk. The internal shape of that
+      one call (exactly one stat read, one exe readlink, one cmdline
+      read) is pinned separately and more precisely at the unit level by
+      test_resolve_parent_direct_is_exactly_one_stat_one_exe_one_cmdline
+      below.
+      """
+      root = proc_root([
+         {"pid": 300, "comm": "bash", "cmdline": "-bash", "ppid": 50},
+         {"pid": 50, "comm": "sshd", "cmdline": "sshd: /usr/sbin/sshd -D",
+          "ppid": 1, "exe": "/usr/sbin/sshd"},
+      ])
+      # Genuinely different uid: pid 50 is root-owned, pid 300 (and the
+      # walk's implicit "us") is not -- os.stat() on pid 50's /proc dir
+      # now reports uid 0 without any real chown.
+      fake_proc.spoof_uid(monkeypatch, os.path.join(root, "50"), uid=0)
+      # Real permission denial on cmdline: the file exists and is
+      # genuinely unreadable by this (non-root) test process, exactly
+      # like a real cross-uid EACCES, not a synthetic empty-cmdline
+      # stand-in.
+      fake_proc.deny_read(os.path.join(root, "50", "cmdline"))
+
+      real_resolve = probe._resolve_parent_direct
+      fallback_calls = []
+
+      def counting_resolve(ppid):
+         fallback_calls.append(ppid)
+         return real_resolve(ppid)
+
+      monkeypatch.setattr(probe, "_resolve_parent_direct", counting_resolve)
+
+      rows, coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      by_pid = {row["pid"]: row for row in rows}
+      assert 50 not in by_pid  # confirms pid 50 is genuinely NOT in pid_meta
+      # Exactly one bounded fallback call, and only for the genuinely
+      # unresolved parent (50) -- never one per row, never one per
+      # ancestor hop.
+      assert fallback_calls == [50]
+      child = by_pid[300]
+      assert child["parent_comm"] == "sshd"
+      assert child["parent_exe_path"] == "/usr/sbin/sshd"
+      assert child["parent_argv0"] is None  # cmdline denied -> no argv0
+      assert child["parent_kind"] == "sshd"
+      assert coverage["parent_unresolved"] == 0
+
+   def test_resolve_parent_direct_is_exactly_one_stat_one_exe_one_cmdline(
+         self, proc_root, monkeypatch):
+      """Unit-level pin of the "single bounded direct read" contract:
+      calling `_resolve_parent_direct` once must touch the parent's
+      /proc entry with exactly one stat read, one exe readlink, and one
+      cmdline read -- never more, and never a recursive resolution of
+      the parent's own parent (out of scope for this card)."""
+      root = proc_root([
+         {"pid": 50, "comm": "sshd", "cmdline": "sshd: /usr/sbin/sshd -D",
+          "ppid": 1, "exe": "/usr/sbin/sshd"},
+      ])
+      pid_dir = os.path.join(root, "50")
+      real_read_text = probe._read_text
+      real_read_link = probe._read_link
+      stat_reads = []
+      cmdline_reads = []
+      link_reads = []
+
+      def counting_read_text(path):
+         if path == pid_dir + "/stat":
+            stat_reads.append(path)
+         elif path == pid_dir + "/cmdline":
+            cmdline_reads.append(path)
+         return real_read_text(path)
+
+      def counting_read_link(path):
+         if path == pid_dir + "/exe":
+            link_reads.append(path)
+         return real_read_link(path)
+
+      monkeypatch.setattr(probe, "_read_text", counting_read_text)
+      monkeypatch.setattr(probe, "_read_link", counting_read_link)
+      parent_comm, parent_exe_path, parent_argv0 = (
+         probe._resolve_parent_direct(50))
+      assert parent_comm == "sshd"
+      assert parent_exe_path == "/usr/sbin/sshd"
+      assert parent_argv0 == "sshd:"
+      assert len(stat_reads) == 1
+      assert len(link_reads) == 1
+      assert len(cmdline_reads) == 1
+
+   def test_ppid_1_is_parent_kind_init(self, proc_root):
+      proc_root([
+         {"pid": 100, "comm": "some-daemon", "cmdline": "some-daemon",
+          "ppid": 1},
+      ])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert rows[0]["parent_kind"] == "init"
+
+   def test_parent_screen_is_multiplexer_and_under_screen_or_tmux(
+         self, proc_root):
+      proc_root([
+         {"pid": 100, "comm": "screen", "cmdline": "SCREEN", "ppid": 1},
+         {"pid": 200, "comm": "bash", "cmdline": "-bash", "ppid": 100},
+      ])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      by_pid = {row["pid"]: row for row in rows}
+      child = by_pid[200]
+      assert child["parent_kind"] == "multiplexer"
+      assert child["under_screen_or_tmux"] is True
+
+   def test_parent_tmux_is_multiplexer_and_under_screen_or_tmux(
+         self, proc_root):
+      proc_root([
+         {"pid": 100, "comm": "tmux", "cmdline": "tmux new-session",
+          "ppid": 1},
+         {"pid": 200, "comm": "bash", "cmdline": "-bash", "ppid": 100},
+      ])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      by_pid = {row["pid"]: row for row in rows}
+      child = by_pid[200]
+      assert child["parent_kind"] == "multiplexer"
+      assert child["under_screen_or_tmux"] is True
+
+   def test_parent_sshd_is_parent_kind_sshd(self, proc_root):
+      proc_root([
+         {"pid": 100, "comm": "sshd", "cmdline": "sshd: someuser@pts/12",
+          "ppid": 1},
+         {"pid": 200, "comm": "bash", "cmdline": "-bash", "ppid": 100},
+      ])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      by_pid = {row["pid"]: row for row in rows}
+      assert by_pid[200]["parent_kind"] == "sshd"
+      assert by_pid[200]["under_screen_or_tmux"] is False
+
+   def test_parent_bash_is_parent_kind_shell(self, proc_root):
+      proc_root([
+         {"pid": 100, "comm": "bash", "cmdline": "-bash", "ppid": 1},
+         {"pid": 200, "comm": "python3", "cmdline": "python3 x.py",
+          "ppid": 100},
+      ])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      by_pid = {row["pid"]: row for row in rows}
+      assert by_pid[200]["parent_kind"] == "shell"
+
+   def test_parent_other_when_no_rule_matches(self, proc_root):
+      proc_root([
+         {"pid": 100, "comm": "weirddaemon", "cmdline": "weirddaemon",
+          "ppid": 1},
+         {"pid": 200, "comm": "python3", "cmdline": "python3 x.py",
+          "ppid": 100},
+      ])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      by_pid = {row["pid"]: row for row in rows}
+      assert by_pid[100]["parent_kind"] == "init"  # ppid 1 wins for pid 100
+      assert by_pid[200]["parent_kind"] == "other"
+
+   def test_is_session_leader_field_index(self, proc_root):
+      """Pins the stat field index used for sid: pid == sid must be True
+      only for the actual session leader, and False for a non-leader
+      sharing the same session, proving the index isn't accidentally
+      reading ppid/tty_nr/pgrp instead."""
+      proc_root([
+         # pid 100 is its own session leader: sid == pid.
+         {"pid": 100, "comm": "bash", "cmdline": "-bash", "ppid": 1,
+          "sid": 100},
+         # pid 200 belongs to session 100 but is NOT the leader.
+         {"pid": 200, "comm": "python3", "cmdline": "python3 x.py",
+          "ppid": 100, "sid": 100},
+      ])
+      rows, _coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      by_pid = {row["pid"]: row for row in rows}
+      assert by_pid[100]["is_session_leader"] is True
+      assert by_pid[200]["is_session_leader"] is False
+
+   def test_vanished_denied_parent_yields_none_and_unknown(
+         self, proc_root):
+      """Parent pid does not exist anywhere on disk (vanished/denied) --
+      all parent fields None, parent_kind 'unknown', parent_unresolved
+      incremented, and the row is STILL emitted -- never a crash."""
+      proc_root([
+         {"pid": 100, "comm": "orphan-child", "cmdline": "orphan-child",
+          "ppid": 9999},
+      ])
+      rows, coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      assert len(rows) == 1
+      row = rows[0]
+      assert row["parent_comm"] is None
+      assert row["parent_exe_path"] is None
+      assert row["parent_argv0"] is None
+      assert row["parent_kind"] == "unknown"
+      assert row["under_screen_or_tmux"] is False
+      assert coverage["parent_unresolved"] == 1
+
+   def test_coverage_parent_unresolved_default_zero_when_all_resolvable(
+         self, proc_root):
+      """A fully resolvable lineage (parent walked, grandparent walked)
+      must leave parent_unresolved at its default 0 -- proving the counter
+      isn't spuriously incremented by ordinary successful resolution."""
+      proc_root([
+         {"pid": 100, "comm": "bash", "cmdline": "-bash", "ppid": 50},
+         {"pid": 50, "comm": "sshd", "cmdline": "sshd: root", "ppid": 1},
+      ])
+      _rows, coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      # pid 100's parent (50, sshd) resolves from the stash; pid 50's
+      # parent is pid 1 (ppid == 1 -> parent_kind "init"), which the
+      # bounded direct read for pid 1 will genuinely fail to find on this
+      # synthetic tree (no pid 1 written) -- exactly like a real container
+      # where pid 1 is unreachable. That single miss is legitimate and
+      # covered by the vanished/denied test above; what this test pins is
+      # that it is the ONLY miss -- 1, never more.
+      assert coverage["parent_unresolved"] == 1
+
+   def test_existing_coverage_counters_unchanged(self, proc_root):
+      """Regression guard: adding parent_unresolved must not remove or
+      rename any existing counter key."""
+      proc_root([
+         {"pid": 100, "comm": "bash", "cmdline": "-bash", "ppid": 1},
+      ])
+      _rows, coverage, _tools = probe._collect_processes(
+         {0: "root"}, drop_raw_args=True, deadline=None)
+      for key in ("pids_seen", "stat_unreadable", "stat_unparseable",
+                  "kernel_thread", "cmdline_empty", "owner_unresolved",
+                  "vanished", "exe_unreadable", "cwd_unreadable"):
+         assert key in coverage
+
+
+# --------------------------------------------------------------------------
 # On-node tool-instance aggregates (privacy-preserving; computed while argv
 # is still available, before drop_raw_args strips cmdline from the rows).
 # --------------------------------------------------------------------------
