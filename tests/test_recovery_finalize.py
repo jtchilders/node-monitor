@@ -82,24 +82,57 @@ def _hardware_record(hostname="polaris-login-04.example.org"):
    }
 
 
-def _make_orphaned_run_dir(tmp_path, run_id="canary-20260916T172446Z"):
+def _census_record(index=0, hostname="polaris-login-04.example.org"):
+   """Kanban task B7: a minimal valid diagnostic_census record, matching
+   the shape ``tests.test_jsonl_output.test_diagnostic_census_uses_plural_filename``
+   already uses -- the one record type this card's gzip sink applies to.
+   """
+   return {
+      "system": "polaris",
+      "source_hostname": hostname,
+      "timestamp_utc": "2026-09-16T17:24:%02dZ" % (index % 60),
+      "probe_version": 4,
+      "processes": [],
+      "cpu_deltas": {"deltas": [], "unmeasured": [], "anomalies": []},
+   }
+
+
+def _make_orphaned_run_dir(tmp_path, run_id="canary-20260916T172446Z",
+                            compress_census=False, census_records=0):
    """Build a run directory shaped exactly like the real incident: real
    JSONL artifacts written through the production sink internals (never
    hand-crafted file content that could drift from the real on-disk
    format), but WITHOUT ever calling finalize_summary()/write_done() --
    simulating the daemon dying before it got there.
+
+   ``compress_census``/``census_records``: kanban task B7 -- when
+   ``compress_census`` is True, ``census_records`` diagnostic_census
+   records are ALSO written (through the same production sink, so the
+   on-disk file is a real ``diagnostic_censuses.jsonl.gz`` written by
+   ``Phase0Sink._handle_for``'s gzip path, never hand-crafted gzip
+   bytes) and every open handle -- including the gzip one -- is closed
+   the same "simulate a killed process" way as the plain handles.
    """
    import asyncio
 
    sink = Phase0Sink(
-      str(tmp_path), run_id, disk_usage_fn=_full_disk_usage)
+      str(tmp_path), run_id, disk_usage_fn=_full_disk_usage,
+      compress_census=compress_census)
    asyncio.run(sink.write_record(
       "node_hardware", _hardware_record("a.example.org")))
    asyncio.run(sink.write_record(
       "node_hardware", _hardware_record("b.example.org")))
+   for index in range(census_records):
+      asyncio.run(sink.write_record(
+         "diagnostic_census", _census_record(index)))
    # Close the sink's own open file handles directly (bypassing
    # finalize_summary/write_done entirely) -- mirrors a killed process
    # leaving its fds closed by the OS but never reaching finalization.
+   # For the gzip census handle this closes the GzipFile FIRST (see
+   # _GzipTextAppendHandle.close), which is what makes this fixture's
+   # "orphaned" gzip census a CLEANLY CLOSED gzip member (a genuinely
+   # killed process would very likely NOT get this chance -- see the
+   # separate raw-fd-close fixture below for that harsher case).
    for handle in sink._file_handles.values():
       handle.close()
    return sink.run_dir
@@ -431,3 +464,101 @@ class TestDoneFilePublishedAtomically:
          name for name in os.listdir(run_dir)
          if name.startswith("DONE.tmp-")]
       assert leftovers == []
+
+
+# --------------------------------------------------------------------------
+# Kanban task B7: finalize_orphaned_run on a gzip census. Must reuse the
+# exact same production scan (_scan_jsonl_fileobj, gzip-transparent by
+# content-sniffed magic bytes) and produce the identical summary shape --
+# never a second, gzip-specific recovery code path.
+# --------------------------------------------------------------------------
+
+class TestFinalizeOrphanedRunGzipCensus:
+   def test_gzip_census_finalizes_successfully(self, tmp_path):
+      run_dir = _make_orphaned_run_dir(
+         tmp_path, compress_census=True, census_records=3)
+
+      # The orphaned directory really does hold a .jsonl.gz census, not
+      # a plain one -- otherwise this test would not actually be
+      # exercising the gzip recovery path at all.
+      assert os.path.exists(
+         os.path.join(run_dir, "diagnostic_censuses.jsonl.gz"))
+      assert not os.path.exists(
+         os.path.join(run_dir, "diagnostic_censuses.jsonl"))
+
+      summary = finalize_orphaned_run(run_dir)
+
+      assert os.path.exists(os.path.join(run_dir, "summary.json"))
+      assert os.path.exists(os.path.join(run_dir, "DONE"))
+      entry = summary["files"]["diagnostic_census"]
+      assert entry["filename"] == "diagnostic_censuses.jsonl.gz"
+      assert entry["record_count"] == 3
+      assert entry["malformed_count"] == 0
+      assert entry["truncated_final_line"] is False
+      assert summary["recovery"]["recovered"] is True
+
+   def test_gzip_census_summary_matches_production_streaming_scan(
+         self, tmp_path):
+      """Same cross-check as the plain-artifact test above, but for the
+      gzip census -- proves finalize_orphaned_run's gzip handling goes
+      through the exact same scan_jsonl_artifact/_scan_jsonl_fileobj
+      the production Phase0Sink.finalize_summary uses, never a forked
+      gzip-specific scanner of its own."""
+      from node_monitor.output.jsonl import scan_jsonl_artifact
+
+      run_dir = _make_orphaned_run_dir(
+         tmp_path, compress_census=True, census_records=5)
+      artifact_path = os.path.join(
+         run_dir, "diagnostic_censuses.jsonl.gz")
+      expected = scan_jsonl_artifact(artifact_path)
+
+      summary = finalize_orphaned_run(run_dir)
+
+      entry = summary["files"]["diagnostic_census"]
+      assert entry["byte_size"] == expected["byte_size"]
+      assert entry["sha256"] == expected["sha256"]
+      assert entry["malformed_count"] == expected["malformed_count"]
+      assert entry["truncated_final_line"] == expected["truncated_final_line"]
+
+   def test_zero_record_gzip_census_is_not_truncated(self, tmp_path):
+      """A run configured for compress_census that genuinely wrote zero
+      census records still cleanly closes its gzip stream (see
+      Phase0Sink._handle_for/_GzipTextAppendHandle) -- recovery must
+      NOT refuse this as a truncated/corrupt artifact."""
+      run_dir = _make_orphaned_run_dir(
+         tmp_path, compress_census=True, census_records=0)
+      # No census file was ever opened at all (zero writes -> no
+      # handle -> _handle_for never called for diagnostic_census) --
+      # this is the "record type the run never wrote a single record
+      # for" case, not a truncated-empty-gzip case; both must finalize
+      # cleanly, so this is folded into the same assertion as the
+      # populated-census test below via record_count == 0.
+      summary = finalize_orphaned_run(run_dir)
+      entry = summary["files"]["diagnostic_census"]
+      assert entry["record_count"] == 0
+      assert entry["truncated_final_line"] is False
+
+   def test_corrupt_gzip_census_is_refused_before_publishing(self, tmp_path):
+      """Recovery's fail-closed contract extends to a corrupted gzip
+      census exactly as it already does for a malformed plain JSONL
+      line: truncation/corruption must be refused BEFORE summary.json/
+      DONE are published, never silently blessed as a clean recovery.
+      """
+      run_dir = _make_orphaned_run_dir(
+         tmp_path, compress_census=True, census_records=3)
+      path = os.path.join(run_dir, "diagnostic_censuses.jsonl.gz")
+      with open(path, "rb") as handle:
+         content = bytearray(handle.read())
+      # Flip a byte inside the compressed stream (well past the header,
+      # well before the trailer) to force a zlib decode error -- the
+      # exact "mid-stream corruption" case this card's design section
+      # documents as caught and reported, never crashing.
+      content[20] ^= 0xFF
+      with open(path, "wb") as handle:
+         handle.write(bytes(content))
+
+      with pytest.raises(RecoveryFinalizeError):
+         finalize_orphaned_run(run_dir)
+
+      assert not os.path.exists(os.path.join(run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(run_dir, "DONE"))

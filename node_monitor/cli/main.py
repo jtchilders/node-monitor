@@ -260,7 +260,8 @@ def _run_daemon(config, config_path, run_id, probe_version):
    os.makedirs(output_root, exist_ok=True)
    sink = Phase0Sink(
       output_root, run_id, metadata={"system": config.system},
-      min_free_disk_pct=config.min_free_disk_pct)
+      min_free_disk_pct=config.min_free_disk_pct,
+      compress_census=config.compress_census)
    run_dir = sink.run_dir
 
    _print_status(config, config_path, run_dir)
@@ -377,7 +378,7 @@ def validate_run(run_dir):
    any_file_checked = False
    any_truncated = False
    for filename in sorted(os.listdir(abs_run_dir)):
-      if not filename.endswith(".jsonl"):
+      if not (filename.endswith(".jsonl") or filename.endswith(".jsonl.gz")):
          continue
       any_file_checked = True
       path = os.path.join(abs_run_dir, filename)
@@ -534,6 +535,8 @@ def _config_to_raw(config):
       "ssh_connect_timeout_sec": config.ssh_connect_timeout_sec,
       "max_parallel_polls": config.max_parallel_polls,
       "min_free_disk_pct": config.min_free_disk_pct,
+      "keep_raw_args": config.keep_raw_args,
+      "compress_census": config.compress_census,
    }
 
 

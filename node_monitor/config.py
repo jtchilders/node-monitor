@@ -45,6 +45,14 @@ _DEFAULTS = {
    "max_parallel_polls": 8,
    "min_free_disk_pct": 10,
    "keep_raw_args": True,
+   # Kanban task B7: opt-in gzip compression for the diagnostic_census
+   # artifact only (by far the largest -- a real 24h canary produced a
+   # 1.7 GB diagnostic_censuses.jsonl). Defaults to False so every
+   # existing config/run/test is byte-for-byte unaffected; flip to True
+   # only in a config that wants the on-disk census gzipped
+   # (node_monitor/output/jsonl.py's Phase0Sink/scan_jsonl_artifact
+   # handle the write/read sides transparently).
+   "compress_census": False,
 }
 
 # Fields required to be present with no built-in default.
@@ -143,6 +151,7 @@ class Phase0Config:
    max_parallel_polls: int
    min_free_disk_pct: float
    keep_raw_args: bool
+   compress_census: bool
 
    @property
    def local_node(self):
@@ -197,6 +206,12 @@ def _validate_max_parallel_polls(value):
 def _validate_keep_raw_args(value):
    if not isinstance(value, bool):
       raise ConfigError("keep_raw_args must be a bool, got %r" % (value,))
+   return value
+
+
+def _validate_compress_census(value):
+   if not isinstance(value, bool):
+      raise ConfigError("compress_census must be a bool, got %r" % (value,))
    return value
 
 
@@ -327,6 +342,8 @@ def load_config(raw, home):
       raw.get("max_parallel_polls", _DEFAULTS["max_parallel_polls"]))
    values["keep_raw_args"] = _validate_keep_raw_args(
       raw.get("keep_raw_args", _DEFAULTS["keep_raw_args"]))
+   values["compress_census"] = _validate_compress_census(
+      raw.get("compress_census", _DEFAULTS["compress_census"]))
 
    return Phase0Config(
       system=system,
