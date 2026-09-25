@@ -175,6 +175,75 @@ class TestBuildDiagnosticCensus:
       assert row["state"] == "S"
       assert row["interactive"] is True
 
+   # Kanban task C1: reversed privacy posture -- keep_raw_args=True must
+   # let cmdline survive into the diagnostic_census record verbatim,
+   # while the other five forbidden keys stay banned in every mode.
+   def test_keep_raw_args_true_retains_cmdline_verbatim(self):
+      payload = _census(10.0, [
+         _row(1, 5, cmdline="/usr/bin/python3 --secret-token abc123"),
+      ])
+
+      record = build_diagnostic_census(
+         "polaris", "polaris-login-04.example.org", payload,
+         keep_raw_args=True)
+
+      assert record["processes"][0]["cmdline"] == \
+         "/usr/bin/python3 --secret-token abc123"
+      validate_diagnostic_census(record, keep_raw_args=True)
+
+   def test_keep_raw_args_false_still_strips_cmdline(self):
+      payload = _census(10.0, [
+         _row(1, 5, cmdline="/usr/bin/python3 --secret-token abc123"),
+      ])
+
+      record = build_diagnostic_census(
+         "polaris", "polaris-login-04.example.org", payload,
+         keep_raw_args=False)
+
+      assert "cmdline" not in record["processes"][0]
+      validate_diagnostic_census(record)
+
+   def test_keep_raw_args_default_matches_false(self):
+      payload = _census(10.0, [
+         _row(1, 5, cmdline="/usr/bin/python3 --secret-token abc123"),
+      ])
+
+      record = build_diagnostic_census(
+         "polaris", "polaris-login-04.example.org", payload)
+
+      assert "cmdline" not in record["processes"][0]
+
+   def test_keep_raw_args_true_still_strips_environ(self):
+      payload = _census(10.0, [{
+         **_row(1, 5, cmdline="/usr/bin/python3"),
+         "environ": {"SECRET": "x"},
+      }])
+
+      record = build_diagnostic_census(
+         "polaris", "polaris-login-04.example.org", payload,
+         keep_raw_args=True)
+
+      row = record["processes"][0]
+      assert row["cmdline"] == "/usr/bin/python3"
+      assert "environ" not in row
+
+   def test_keep_raw_args_true_still_strips_other_forbidden_keys(self):
+      payload = _census(10.0, [{
+         **_row(1, 5),
+         "argv": ["python3"],
+         "cmdline_raw": "python3",
+         "raw_argv": ["python3"],
+         "raw_cmdline": "python3",
+      }])
+
+      record = build_diagnostic_census(
+         "polaris", "polaris-login-04.example.org", payload,
+         keep_raw_args=True)
+
+      row = record["processes"][0]
+      for key in ("argv", "cmdline_raw", "raw_argv", "raw_cmdline"):
+         assert key not in row
+
 
 # --------------------------------------------------------------------------
 # build_usage_observations -- joins cpu_delta results back to census rows

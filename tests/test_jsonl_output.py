@@ -20,6 +20,7 @@ import stat
 
 import pytest
 
+from node_monitor.output.contracts import ContractError
 from node_monitor.output.jsonl import (
    Phase0Sink,
    Phase0SinkDiskFullError,
@@ -1022,6 +1023,50 @@ class TestGzipCensusSinkRoundTrip:
       assert entry["truncated_final_line"] is False
       assert not os.path.exists(
          os.path.join(sink.run_dir, "diagnostic_censuses.jsonl.gz"))
+
+
+# --------------------------------------------------------------------------
+# Kanban task C1: reversed privacy posture -- Phase0Sink(keep_raw_args=True)
+# must let a diagnostic_census record's cmdline field survive write_record
+# and round-trip back off disk intact; keep_raw_args=False (and the
+# default, no-arg construction) must still raise ContractError today.
+# --------------------------------------------------------------------------
+
+def _census_record_with_cmdline(index=0, cmdline="/usr/bin/python3 --secret"):
+   record = _census_record(index)
+   record["processes"] = [
+      {"pid": 1, "username": "u", "category": "other", "cmdline": cmdline},
+   ]
+   return record
+
+
+class TestKeepRawArgsSink:
+   def test_keep_raw_args_true_persists_cmdline(self, tmp_path):
+      sink = Phase0Sink(
+         str(tmp_path), "kra-run1", disk_usage_fn=_full_disk_usage,
+         keep_raw_args=True)
+      record = _census_record_with_cmdline()
+      _run(sink.write_record("diagnostic_census", record))
+      path = os.path.join(sink.run_dir, "diagnostic_censuses.jsonl")
+      with open(path) as handle:
+         read_back = json.loads(handle.readline())
+      assert read_back["processes"][0]["cmdline"] == \
+         "/usr/bin/python3 --secret"
+
+   def test_keep_raw_args_false_still_rejects_cmdline(self, tmp_path):
+      sink = Phase0Sink(
+         str(tmp_path), "kra-run2", disk_usage_fn=_full_disk_usage,
+         keep_raw_args=False)
+      record = _census_record_with_cmdline()
+      with pytest.raises(ContractError):
+         _run(sink.write_record("diagnostic_census", record))
+
+   def test_keep_raw_args_default_still_rejects_cmdline(self, tmp_path):
+      sink = Phase0Sink(
+         str(tmp_path), "kra-run3", disk_usage_fn=_full_disk_usage)
+      record = _census_record_with_cmdline()
+      with pytest.raises(ContractError):
+         _run(sink.write_record("diagnostic_census", record))
 
 
 class TestGzipCensusScanning:

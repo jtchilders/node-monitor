@@ -261,7 +261,8 @@ def _run_daemon(config, config_path, run_id, probe_version):
    sink = Phase0Sink(
       output_root, run_id, metadata={"system": config.system},
       min_free_disk_pct=config.min_free_disk_pct,
-      compress_census=config.compress_census)
+      compress_census=config.compress_census,
+      keep_raw_args=config.keep_raw_args)
    run_dir = sink.run_dir
 
    _print_status(config, config_path, run_dir)

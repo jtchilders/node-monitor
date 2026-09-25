@@ -1676,7 +1676,10 @@ class TestSchedulerMissPersisted:
 class TestRawArgvNeverPersistedEndToEnd:
    def test_daemon_never_persists_cmdline_from_a_hostile_census_payload(
          self, tmp_path):
-      config = _config(tmp_path, duration_sec=5)
+      # Reversed privacy posture (Kanban task C1): config.keep_raw_args
+      # now defaults to True, so this test -- which specifically proves
+      # the never-persist invariant -- must pin the opt-out explicitly.
+      config = _config(tmp_path, duration_sec=5, keep_raw_args=False)
       output_root = os.path.join(str(tmp_path), "phase0-runs")
       sink = Phase0Sink(
          output_root, "daemon-run-argv-1", metadata={"system": config.system},

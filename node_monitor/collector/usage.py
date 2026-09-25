@@ -11,10 +11,13 @@ Two layers, matching the file map's task write-up:
   prints for ``loop="census"``) plus the daemon-known ``system``/
   ``source_hostname`` identity and an optional pre-computed
   ``cpu_delta.compute_cpu_delta`` result against the previous sample. It
-  privacy-filters every process row -- raw argv/cmdline is stripped here
-  regardless of what the probe payload happens to contain, because this
-  function is the last checkpoint before a census-derived record reaches
-  the sink (same rationale as ``output.contracts``'s own
+  privacy-filters every process row -- per the reversed privacy posture
+  (Kanban task C1), ``cmdline`` is retained verbatim when the caller
+  passes ``keep_raw_args=True`` (threaded from ``config.keep_raw_args``)
+  and stripped otherwise; the other five forbidden keys are always
+  stripped regardless of what the probe payload happens to contain,
+  because this function is the last checkpoint before a census-derived
+  record reaches the sink (same rationale as ``output.contracts``'s own
   ``_reject_forbidden_argv_keys``: never rely solely on an upstream
   default). It never sees a window or state; it returns exactly one
   ``diagnostic_censuses`` record for the one payload it was given.
@@ -37,24 +40,37 @@ from node_monitor.collector.cpu_delta import compute_cpu_delta
 # build_diagnostic_census -- pure per-sample privacy-filtered transform
 # --------------------------------------------------------------------------
 
-# Design: "Raw argv, environment, file descriptors, and process I/O never
-# persist." remote_probe.py's own --drop-raw-args default already omits
-# `cmdline` from process rows, but this module strips it again
-# unconditionally rather than trusting that upstream default -- the same
-# defense-in-depth rationale as output.contracts._reject_forbidden_argv_keys:
-# this is the last checkpoint before a census-derived record reaches disk.
+# Design: reversed privacy posture (Kanban task C1) -- the facility owner
+# directive is now "capture full argv verbatim, no redaction." When the
+# caller passes ``keep_raw_args=True`` (config.keep_raw_args, threaded down
+# from the daemon), `cmdline` is retained verbatim on every process row.
+# The other five keys -- `argv`, `cmdline_raw`, `raw_argv`, `raw_cmdline`,
+# `environ` -- are never legitimately emitted by remote_probe.py and stay
+# unconditionally forbidden in every mode as defense-in-depth, the same
+# rationale as output.contracts._reject_forbidden_argv_keys: this is the
+# last checkpoint before a census-derived record reaches disk. When
+# ``keep_raw_args=False`` (the default), all six keys are stripped --
+# current/legacy behavior, unchanged.
 _FORBIDDEN_PROCESS_KEYS = frozenset((
    "cmdline", "argv", "cmdline_raw", "raw_argv", "raw_cmdline", "environ",
 ))
 
 
-def _sanitize_process_row(row):
-   """Copy of ``row`` with every forbidden raw-argv/environment key removed."""
+def _sanitize_process_row(row, keep_raw_args=False):
+   """Copy of ``row`` with every forbidden raw-argv/environment key removed.
+
+   When ``keep_raw_args`` is True, ``cmdline`` is exempted from the strip
+   set (kept verbatim); the other five keys are still stripped
+   unconditionally. The module-level ``_FORBIDDEN_PROCESS_KEYS`` frozenset
+   itself is never mutated -- a per-call strip-set is computed instead.
+   """
+   strip = _FORBIDDEN_PROCESS_KEYS - {"cmdline"} if keep_raw_args else _FORBIDDEN_PROCESS_KEYS
    return {key: value for key, value in row.items()
-           if key not in _FORBIDDEN_PROCESS_KEYS}
+           if key not in strip}
 
 
-def build_diagnostic_census(system, source_hostname, payload, cpu_deltas=None):
+def build_diagnostic_census(system, source_hostname, payload, cpu_deltas=None,
+                             keep_raw_args=False):
    """Build one ``diagnostic_censuses`` record from a raw census payload.
 
    ``system``, ``source_hostname``: daemon-known identity, not read from
@@ -71,13 +87,21 @@ def build_diagnostic_census(system, source_hostname, payload, cpu_deltas=None):
       sample yet for this node (e.g. the first census of a run) -- in
       which case an empty-but-valid ``cpu_deltas`` shape is used instead
       of fabricating deltas that were never computed.
+   ``keep_raw_args``: reversed-privacy-posture opt-in (Kanban task C1),
+      threaded from ``config.keep_raw_args``. When True, the probe's
+      ``cmdline`` field is retained verbatim on every process row. When
+      False (the default), ``cmdline`` is stripped -- current/legacy
+      behavior, unchanged. The other five forbidden keys (``argv``,
+      ``cmdline_raw``, ``raw_argv``, ``raw_cmdline``, ``environ``) are
+      never legitimately present and stay stripped in either mode.
 
    Returns a dict matching the ``diagnostic_census`` contract
    (``output.contracts.validate_diagnostic_census``). The design's
    "Diagnostic records" section: "preserves the privacy-filtered census
    payload and derived process CPU deltas needed to audit classifications
-   and aggregation during Phase 0. It is not a future production table.
-   Raw argv is absent."
+   and aggregation during Phase 0. It is not a future production table."
+   Per the reversed directive, raw argv (``cmdline``) is retained when
+   ``keep_raw_args=True``; otherwise it remains absent as before.
    """
    if cpu_deltas is None:
       cpu_deltas = {"deltas": [], "unmeasured": [], "anomalies": []}
@@ -90,7 +114,7 @@ def build_diagnostic_census(system, source_hostname, payload, cpu_deltas=None):
       "source_hostname": source_hostname,
       "timestamp_utc": payload.get("wall_clock_utc"),
       "probe_version": payload.get("probe_version"),
-      "processes": [_sanitize_process_row(row)
+      "processes": [_sanitize_process_row(row, keep_raw_args=keep_raw_args)
                     for row in payload.get("processes", [])],
       "cpu_deltas": cpu_deltas_out,
    }
