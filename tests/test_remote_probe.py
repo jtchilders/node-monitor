@@ -331,6 +331,25 @@ class TestB5HarnessTaxonomy:
       cmdline = "/home/u/scripts/my_cursor_notes.sh"
       assert probe._match_tools(cmdline) == []
 
+   def test_cursor_cli_bare_cursor_server_form_no_double_tag(self):
+      """Review round 3 finding: the bare 'cursor' alternative in the
+      cursor-cli _TOOL_RULES entry previously used `_bounded(r"cursor")`,
+      whose AFTER set excludes only alnum/`_`/`.` -- NOT `-` -- so it
+      wrongly matched inside 'cursor-server' too, double-tagging a plain
+      cursor-server process as both cursor-cli AND cursor-server. The
+      earlier positive test only exercised the dotted '.cursor-server/'
+      path form, where the '.' lookbehind happened to save it and masked
+      the bug for the bare (non-dotted) 'cursor-server' form exercised
+      here.
+      """
+      assert probe._match_tools("cursor-server --port 9000") == [
+         "cursor-server"]
+      assert probe._match_tools("/usr/local/bin/cursor-server") == [
+         "cursor-server"]
+      # Positive cases must still work after the fix.
+      assert "cursor-cli" in probe._match_tools("cursor-agent")
+      assert probe._match_tools("/opt/bin/cursor foo") == ["cursor-cli"]
+
    # -- Hermes Agent (English word -- anchor hardest) -------------------
 
    def test_hermes_positive(self):

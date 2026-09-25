@@ -378,13 +378,21 @@ _TOOL_RULES = [
       _bounded(r"windsurf-server") + "|" +
       _bounded_path(r"\.windsurf-server") + _TOOL_BOUNDARY_AFTER)),
    # Cursor CLI agent -- a SEPARATE tool label from cursor-server (the IDE
-   # backend above). cursor-agent is the specific CLI marker; a boundary-
-   # anchored bare "cursor" is also accepted, but it cannot match inside
-   # "cursor-server" because "cursor-server" fails the AFTER boundary (the
-   # character right after "cursor" is "-", which is a name character
-   # under _TOOL_BOUNDARY_AFTER, not " " or end-of-string).
+   # backend above). cursor-agent is the specific CLI marker. The bare
+   # "cursor" alternative deliberately does NOT use `_bounded`: `_bounded`'s
+   # AFTER set excludes only alnum/`_`/`.`, NOT `-`, so `_bounded(r"cursor")`
+   # wrongly matched inside "cursor-server" (review round 3 finding --
+   # confirmed live: _match_tools("cursor-server") returned
+   # ["cursor-cli", "cursor-server"], a false double-tag). The prior test
+   # only exercised the dotted ".cursor-server/" path form, where the "."
+   # lookbehind happens to save it, masking the bug for the bare
+   # "cursor-server" form. Fixed by using the same anchored executable
+   # form `(^|/)cursor( |$)` already used in `_ACTIVITY_RULES` above,
+   # which requires "cursor" to be a whole path component immediately
+   # followed by a space or end-of-string -- "cursor-server" fails that
+   # trailing check because the next character is "-", not " "/end.
    ("cursor-cli", re.compile(
-      _bounded(r"cursor-agent") + "|" + _bounded(r"cursor"))),
+      _bounded(r"cursor-agent") + "|" + r"(?:^|/)cursor(?= |$)")),
    # Hermes Agent. "hermes" is an ordinary English/myth word that could
    # appear as a username or unrelated path component (e.g.
    # "/data/hermes/results"), so the bare form is NOT boundary-anchored
