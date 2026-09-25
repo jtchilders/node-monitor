@@ -120,10 +120,17 @@ _CATEGORY_RULES = [
    # live-Polaris impact of getting this wrong (2026-09-04): ~24% undercount
    # of AI-agent processes, 9 distinct users reported instead of 12.
    ("ai-coding-agent", re.compile(
-      r"(^|/)(claude|codex|opencode|aider|gemini|cline|goose)( |$)|"
-      r"-m\s+(claude|codex|opencode|aider|gemini|cline|goose)[_.\s]|"
+      r"(^|/)(claude|codex|opencode|aider|gemini|cline|goose|windsurf|"
+      r"hermes|hermes-agent|hermes_cli|openclaw|open-claw|open_claw)"
+      r"( |$)|"
+      r"-m\s+(claude|codex|opencode|aider|gemini|cline|goose|windsurf|"
+      r"hermes_cli|openclaw)[_.\s]|"
       r"anthropic\.claude-code|openai\.chatgpt|claude-code|claude_code|"
-      r"copilot-language"), 20),
+      r"copilot-language|copilot-agent|gh-copilot|github\.copilot|"
+      r"codeium-windsurf|codeium\.windsurf|windsurf-server|"
+      r"\.windsurf-server|cursor-agent|"
+      r"roo-cline|roo-code|rooveterinaryinc\.roo-cline|"
+      r"continue\.continue|continuedev|\.continue/"), 20),
    ("jupyter", re.compile(r"jupyter|ipykernel|jupyter-lab|jupyterhub"), 10),
    ("pbs-client", re.compile(
       r"(^|/)(qstat|qsub|qdel|qhold|qrls|qalter|pbsnodes|pbs_[a-z]+|"
@@ -169,6 +176,47 @@ _ACTIVITY_RULES = [
    ("claude-code", re.compile(
       r"claude-code|anthropic\.claude-code|(^|/)claude( |$)"), 20),
    ("codex-cli", re.compile(r"(^|/)codex( |$)|openai\.chatgpt"), 20),
+   # Windsurf (Codeium): the desktop app's own agent/IDE-server process
+   # and the extension marker (accepts both the hyphenated wrapper name
+   # and the real dotted VS Code extension id "codeium.windsurf"). Bare
+   # "windsurf" is not an English word in this context, but is still
+   # boundary-anchored like everything else here to avoid a
+   # "my_windsurf_notes" style false hit.
+   ("windsurf", re.compile(
+      r"(^|/)windsurf( |$)|codeium-windsurf|codeium\.windsurf|"
+      r"windsurf-server|\.windsurf-server"), 20),
+   # Cursor CLI agent -- deliberately a SEPARATE label from
+   # cursor-remote-server (the cursor-server IDE backend below) per the
+   # card: cursor-agent is the standalone CLI marker; a bare "cursor"
+   # executable form is also accepted but anchored the same way as every
+   # other bare-name marker, so it cannot match inside "cursor-server" or
+   # "my_cursor_notes".
+   ("cursor-cli", re.compile(r"cursor-agent|(^|/)cursor( |$)"), 20),
+   # Hermes Agent -- "hermes" alone is a common English word AND a Greek
+   # myth name that could show up in unrelated paths/usernames (e.g.
+   # "/data/hermes/results"), so the bare form requires the executable
+   # boundary (^|/)...( |$) exactly like "claude"/"codex" above, which
+   # already rejects any occurrence that is not a whole path component --
+   # "/data/hermes/results" has "hermes" as a whole directory component
+   # followed by "/", not " " or end-of-string, so it does NOT match; only
+   # "hermes" as the actual argv0/executable ("hermes" or ".../bin/hermes"
+   # followed by a space or end of string) matches.
+   ("hermes", re.compile(
+      r"hermes-agent|hermes_cli|(^|/)hermes( |$)"), 20),
+   ("openclaw", re.compile(
+      r"open-claw|openclaw|open_claw"), 20),
+   # Roo Code / Roo Cline -- bare "roo" is too collision-prone (card
+   # explicitly forbids it), so only the compound markers count.
+   ("roo", re.compile(
+      r"roo-cline|roo-code|rooveterinaryinc\.roo-cline"), 20),
+   # Continue.dev -- "continue" alone is an English word / shell keyword,
+   # so only the extension id, dotted config path, and vendor-prefixed
+   # package name count.
+   ("continue", re.compile(
+      r"continue\.continue|continuedev|(^|/)\.continue/"), 20),
+   ("copilot-agent", re.compile(
+      r"copilot-agent|copilot-language-server|gh-copilot|"
+      r"github\.copilot"), 20),
    ("jupyter-kernel", re.compile(r"ipykernel"), 10),
    ("jupyter-server", re.compile(r"jupyter"), 10),
    ("torch-distributed", re.compile(r"torch\.distributed|torchrun"), 10),
@@ -185,6 +233,49 @@ _ACTIVITY_RULES = [
    ("shell", _SHELL_RE, 10),
    ("ssh-session", re.compile(r"(^|/)sshd( |:|$)"), 10),
    ("terminal-multiplexer", _MULTIPLEXER_RE, 10),
+   # --------------------------------------------------------------------
+   # Residual "agent-like (unclassified)" bucket -- LAST RESORT.
+   #
+   # Priority 15: strictly BETWEEN the broad IDE rule (vscode-remote-
+   # server, priority 10) and every NAMED agent rule above (priority 20).
+   # This is what makes the ordering work without any explicit exclusion
+   # list in the regex itself: `_resolve_rule` always returns the
+   # HIGHEST-priority match among every rule that matches, so
+   #   * a KNOWN harness's extension path matches both this rule and its
+   #     own priority-20 rule -- the named rule wins, exactly as the
+   #     claude-code/codex-cli overlap with vscode-remote-server already
+   #     works;
+   #   * an ordinary (non-agent) vscode-server path -- e.g. ms-python's
+   #     interpreter extension -- matches only vscode-remote-server
+   #     (priority 10) because it carries no agent-vendor hint, so it
+   #     correctly stays `ide-remote`/`vscode-remote-server`, never this
+   #     bucket;
+   #   * a NOVEL agent harness with no named rule at all, but whose VS
+   #     Code extension id carries a generic agent/AI hint, beats the
+   #     broad IDE rule and surfaces as this bucket instead of silently
+   #     vanishing into `vscode-remote-server`.
+   #
+   # Card note (per its "if a clean generic signature is hard to define"
+   # fallback): implemented as PRECISELY the conservative fallback it
+   # names -- "matched no named agent BUT lives under a
+   # .vscode-server/extensions/<vendor>.<name> path with an unknown
+   # vendor.name" -- narrowed further by requiring an explicit
+   # agent/assistant/copilot/chatbot hint token in the extension name
+   # itself, rather than firing on ANY unrecognized extension (which
+   # would swamp the bucket with every ordinary non-agent extension on
+   # the fleet, e.g. ms-python.python, dbaeumer.vscode-eslint). A bare
+   # process-name generic signature (any node/python running a path with
+   # "agent" in it) was deliberately NOT implemented: it is not
+   # distinguishable from a huge amount of ordinary HPC/ML tooling that
+   # legitimately uses the word "agent" (RL/simulation "agent" scripts
+   # are common on this fleet), so it would fail the "false agent-like is
+   # worse than a missed one" bar the card sets. This keeps `python3
+   # train.py` (no vscode-server extension path at all) permanently
+   # outside this rule's reach.
+   ("agent-like-unclassified", re.compile(
+      r"(^|/)\.vscode-server/extensions/[A-Za-z0-9_-]+\."
+      r"[A-Za-z0-9_.-]*(?:agent|assistant|copilot|chatbot)"
+      r"[A-Za-z0-9_.-]*(?:/|$)"), 15),
 ]
 
 # Paths that qualify a process to a project with high confidence.
@@ -277,6 +368,67 @@ _TOOL_RULES = [
       _bounded(r"jupyter") + "|" +
       _TOOL_BOUNDARY_BEFORE + r"ipykernel(?:_launcher)?" +
       _TOOL_BOUNDARY_AFTER)),
+   # Windsurf (Codeium). Bare "windsurf" is boundary-anchored the same as
+   # every other bare marker here, so "my_windsurf_notes" cannot match.
+   # Includes both the hyphenated wrapper name and the real dotted VS
+   # Code extension id "codeium.windsurf".
+   ("windsurf", re.compile(
+      _bounded(r"windsurf") + "|" + _bounded(r"codeium-windsurf") + "|" +
+      _bounded(r"codeium\.windsurf") + "|" +
+      _bounded(r"windsurf-server") + "|" +
+      _bounded_path(r"\.windsurf-server") + _TOOL_BOUNDARY_AFTER)),
+   # Cursor CLI agent -- a SEPARATE tool label from cursor-server (the IDE
+   # backend above). cursor-agent is the specific CLI marker. The bare
+   # "cursor" alternative deliberately does NOT use `_bounded`: `_bounded`'s
+   # AFTER set excludes only alnum/`_`/`.`, NOT `-`, so `_bounded(r"cursor")`
+   # wrongly matched inside "cursor-server" (review round 3 finding --
+   # confirmed live: _match_tools("cursor-server") returned
+   # ["cursor-cli", "cursor-server"], a false double-tag). The prior test
+   # only exercised the dotted ".cursor-server/" path form, where the "."
+   # lookbehind happens to save it, masking the bug for the bare
+   # "cursor-server" form. Fixed by using the same anchored executable
+   # form `(^|/)cursor( |$)` already used in `_ACTIVITY_RULES` above,
+   # which requires "cursor" to be a whole path component immediately
+   # followed by a space or end-of-string -- "cursor-server" fails that
+   # trailing check because the next character is "-", not " "/end.
+   ("cursor-cli", re.compile(
+      _bounded(r"cursor-agent") + "|" + r"(?:^|/)cursor(?= |$)")),
+   # Hermes Agent. "hermes" is an ordinary English/myth word that could
+   # appear as a username or unrelated path component (e.g.
+   # "/data/hermes/results"), so the bare form is NOT boundary-anchored
+   # with the generic `_bounded` helper -- `_bounded` only excludes
+   # alnum/`_`/`.` neighbors, and "/" is not in that excluded set, so
+   # "/data/hermes/results" (hermes preceded and followed by "/") would
+   # incorrectly satisfy it. Instead the bare form uses the SAME
+   # anchored `(^|/)...( |$)` style already used for the executable-name
+   # alternatives in `_CATEGORY_RULES`/`_ACTIVITY_RULES`, which requires
+   # "hermes" to be a whole path COMPONENT (start-of-string or after
+   # "/") AND immediately followed by a space or end-of-string -- a
+   # directory component followed by another "/" fails that trailing
+   # check, so "/data/hermes/results" does not match; only the real
+   # executable ("hermes" or ".../bin/hermes" followed by an argument or
+   # end of string) does.
+   ("hermes", re.compile(
+      _bounded(r"hermes-agent") + "|" + _bounded(r"hermes_cli") + "|" +
+      r"(?:^|/)hermes(?= |$)")),
+   ("openclaw", re.compile(
+      _bounded(r"open-claw") + "|" + _bounded(r"openclaw") + "|" +
+      _bounded(r"open_claw"))),
+   # Roo Code / Roo Cline -- bare "roo" deliberately excluded (too
+   # collision-prone per the card); only the compound markers count.
+   ("roo", re.compile(
+      _bounded(r"roo-cline") + "|" + _bounded(r"roo-code") + "|" +
+      _bounded(r"rooveterinaryinc\.roo-cline"))),
+   # Continue.dev -- bare "continue" deliberately excluded (English word /
+   # shell keyword); only the extension id, vendor package name, or the
+   # real ".continue/" config path component count.
+   ("continue", re.compile(
+      _bounded(r"continue\.continue") + "|" + _bounded(r"continuedev") +
+      "|" + _bounded_path(r"\.continue/"))),
+   ("copilot-agent", re.compile(
+      _bounded(r"copilot-agent") + "|" +
+      _bounded(r"copilot-language-server") + "|" +
+      _bounded(r"gh-copilot") + "|" + _bounded(r"github\.copilot"))),
 ]
 
 # VS Code / Cursor embed a 40-hex installation id as a whole path component:

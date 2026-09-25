@@ -267,6 +267,260 @@ class TestClassificationPriority:
       assert act_priority["claude-code"] > act_priority["vscode-remote-server"]
 
 
+class TestB5HarnessTaxonomy:
+   """B5: expand the agent-harness taxonomy + residual bucket.
+
+   For every new harness: one positive test (real invocation -> correct
+   activity label, correct _match_tools label, ai-coding-agent category)
+   and one negative/lookalike test proving an unrelated string containing
+   the marker does NOT match. Same discipline as the review-round
+   findings documented above _TOOL_RULES: no raw substring regex, every
+   marker boundary-anchored.
+   """
+
+   # -- Windsurf --------------------------------------------------------
+
+   def test_windsurf_positive(self):
+      cmdline = "/soft/windsurf/bin/windsurf --headless"
+      category, activity, _ = probe._classify("windsurf", cmdline)
+      assert category == "ai-coding-agent"
+      assert activity == "windsurf"
+      assert probe._match_tools(cmdline) == ["windsurf"]
+
+   def test_windsurf_extension_path_positive(self):
+      cmdline = (
+         "/home/u/.vscode-server/extensions/codeium.windsurf-1.0.0/"
+         "bin/node")
+      category, activity, _ = probe._classify("node", cmdline)
+      assert category == "ai-coding-agent"
+      assert activity == "windsurf"
+
+   def test_windsurf_negative_lookalike(self):
+      """'my_windsurf_notes' must not match -- underscore near-miss, same
+      class of hazard as my_claude_helper in review round 2."""
+      cmdline = "/home/u/scripts/my_windsurf_notes.sh"
+      assert probe._match_tools(cmdline) == []
+      category, activity, _ = probe._classify("bash", cmdline)
+      assert activity != "windsurf"
+
+   # -- Cursor CLI (distinct from cursor-server) ------------------------
+
+   def test_cursor_cli_positive(self):
+      cmdline = "cursor-agent --resume"
+      category, activity, _ = probe._classify("cursor-agent", cmdline)
+      assert category == "ai-coding-agent"
+      assert activity == "cursor-cli"
+      assert probe._match_tools(cmdline) == ["cursor-cli"]
+
+   def test_cursor_cli_does_not_collide_with_cursor_server(self):
+      """cursor-server (the IDE backend) must keep its own distinct label
+      and must NOT also report as cursor-cli, and vice versa."""
+      server_cmdline = (
+         "/home/u/.cursor-server/bin/xyz/node --max-old-space-size=4096 "
+         "server.js")
+      _, server_activity, _ = probe._classify("node", server_cmdline)
+      assert server_activity == "cursor-remote-server"
+      assert probe._match_tools(server_cmdline) == ["cursor-server"]
+
+      cli_cmdline = "/usr/local/bin/cursor-agent exec"
+      _, cli_activity, _ = probe._classify("cursor-agent", cli_cmdline)
+      assert cli_activity == "cursor-cli"
+      assert probe._match_tools(cli_cmdline) == ["cursor-cli"]
+
+   def test_cursor_cli_negative_lookalike(self):
+      cmdline = "/home/u/scripts/my_cursor_notes.sh"
+      assert probe._match_tools(cmdline) == []
+
+   def test_cursor_cli_bare_cursor_server_form_no_double_tag(self):
+      """Review round 3 finding: the bare 'cursor' alternative in the
+      cursor-cli _TOOL_RULES entry previously used `_bounded(r"cursor")`,
+      whose AFTER set excludes only alnum/`_`/`.` -- NOT `-` -- so it
+      wrongly matched inside 'cursor-server' too, double-tagging a plain
+      cursor-server process as both cursor-cli AND cursor-server. The
+      earlier positive test only exercised the dotted '.cursor-server/'
+      path form, where the '.' lookbehind happened to save it and masked
+      the bug for the bare (non-dotted) 'cursor-server' form exercised
+      here.
+      """
+      assert probe._match_tools("cursor-server --port 9000") == [
+         "cursor-server"]
+      assert probe._match_tools("/usr/local/bin/cursor-server") == [
+         "cursor-server"]
+      # Positive cases must still work after the fix.
+      assert "cursor-cli" in probe._match_tools("cursor-agent")
+      assert probe._match_tools("/opt/bin/cursor foo") == ["cursor-cli"]
+
+   # -- Hermes Agent (English word -- anchor hardest) -------------------
+
+   def test_hermes_positive(self):
+      cmdline = "/soft/hermes/bin/hermes --profile coder"
+      category, activity, _ = probe._classify("hermes", cmdline)
+      assert category == "ai-coding-agent"
+      assert activity == "hermes"
+      assert probe._match_tools(cmdline) == ["hermes"]
+
+   def test_hermes_dash_agent_form_positive(self):
+      cmdline = "hermes-agent --task t_1"
+      category, activity, _ = probe._classify("hermes-agent", cmdline)
+      assert category == "ai-coding-agent"
+      assert activity == "hermes"
+
+   def test_hermes_negative_unrelated_path(self):
+      """'/data/hermes/results' -- hermes as a directory component of an
+      unrelated data path, not the executable -- must NOT match. This is
+      the exact hazard the card calls out: hermes is a common word."""
+      cmdline = "/soft/python/bin/python /data/hermes/results/analyze.py"
+      assert probe._match_tools(cmdline) == []
+      category, activity, _ = probe._classify("python", cmdline)
+      assert activity != "hermes"
+      assert category != "ai-coding-agent"
+
+   def test_hermes_negative_username_lookalike(self):
+      """A username or comm containing 'hermes' as a substring, not a
+      whole path component, must not match either."""
+      cmdline = "-bash"
+      assert probe._match_tools("/home/hermesuser/.bashrc") == []
+
+   # -- OpenClaw ----------------------------------------------------------
+
+   def test_openclaw_positive(self):
+      cmdline = "/opt/openclaw/bin/openclaw serve"
+      category, activity, _ = probe._classify("openclaw", cmdline)
+      assert category == "ai-coding-agent"
+      assert activity == "openclaw"
+      assert probe._match_tools(cmdline) == ["openclaw"]
+
+   def test_openclaw_dashed_and_underscored_forms_positive(self):
+      assert probe._match_tools("open-claw --run") == ["openclaw"]
+      assert probe._match_tools("open_claw --run") == ["openclaw"]
+
+   def test_openclaw_negative_lookalike(self):
+      cmdline = "/home/u/scripts/my_openclaw_wrapper.sh"
+      assert probe._match_tools(cmdline) == []
+
+   # -- Roo Code / Roo Cline (bare 'roo' forbidden) ----------------------
+
+   def test_roo_positive(self):
+      cmdline = (
+         "/home/u/.vscode-server/extensions/"
+         "rooveterinaryinc.roo-cline-1.2.3/bin/node")
+      category, activity, _ = probe._classify("node", cmdline)
+      assert category == "ai-coding-agent"
+      assert activity == "roo"
+      # Legitimately matches BOTH roo and vscode-server tool rules --
+      # same overlap contract as claude-code/vscode-server documented
+      # above _TOOL_RULES: one process, two true facts.
+      assert probe._match_tools(cmdline) == ["roo", "vscode-server"]
+
+   def test_roo_bare_token_negative(self):
+      """Bare 'roo' token must NOT match -- too collision-prone per the
+      card (a project or path literally named 'roo')."""
+      assert probe._match_tools("/opt/foo.roo/bin/node") == []
+      assert probe._match_tools("roo --status") == []
+      assert probe._match_tools("/home/u/roo/notes.txt") == []
+
+   # -- Continue.dev (bare 'continue' forbidden) -------------------------
+
+   def test_continue_positive(self):
+      cmdline = (
+         "/home/u/.vscode-server/extensions/continue.continue-0.9.5/"
+         "bin/node")
+      category, activity, _ = probe._classify("node", cmdline)
+      assert category == "ai-coding-agent"
+      assert activity == "continue"
+      # Same legitimate vscode-server overlap as the roo test above.
+      assert probe._match_tools(cmdline) == ["continue", "vscode-server"]
+
+   def test_continue_config_path_positive(self):
+      cmdline = "/soft/python/bin/python -m server --config /home/u/.continue/config.json"
+      assert probe._match_tools(cmdline) == ["continue"]
+
+   def test_continue_bare_word_negative(self):
+      """'continue' as an ordinary English word / shell keyword inside an
+      unrelated cmdline must NOT match -- explicitly forbidden by the
+      card since it is common vocabulary, not a tool marker."""
+      cmdline = "/bin/bash -c 'for i in 1 2 3; do continue; done'"
+      assert probe._match_tools(cmdline) == []
+      category, activity, _ = probe._classify("bash", cmdline)
+      assert activity != "continue"
+
+   # -- GitHub Copilot agent/CLI ------------------------------------------
+
+   def test_copilot_agent_positive(self):
+      cmdline = "copilot-agent --serve"
+      category, activity, _ = probe._classify("copilot-agent", cmdline)
+      assert category == "ai-coding-agent"
+      assert activity == "copilot-agent"
+      assert probe._match_tools(cmdline) == ["copilot-agent"]
+
+   def test_copilot_cli_and_extension_forms_positive(self):
+      assert probe._match_tools("gh-copilot suggest") == ["copilot-agent"]
+      # Same legitimate vscode-server overlap as the roo/continue tests
+      # above -- the extension process is truly both things at once.
+      assert probe._match_tools(
+         "/home/u/.vscode-server/extensions/github.copilot-1.0.0/bin/node"
+      ) == ["copilot-agent", "vscode-server"]
+
+   def test_copilot_agent_negative_lookalike(self):
+      cmdline = "/home/u/scripts/my_copilot_agent_helper.sh"
+      assert probe._match_tools(cmdline) == []
+
+
+class TestB5AgentLikeUnclassified:
+   """Residual bucket: 'agent-like-unclassified' fires ONLY when no named
+   rule matched, using the conservative fallback the card names --
+   a .vscode-server/extensions/<vendor>.<name> path whose name carries an
+   explicit agent/assistant/copilot/chatbot hint but is not one of the
+   already-named harnesses.
+   """
+
+   def test_plain_python_is_not_agent_like(self):
+      """A plain python3 train.py must NOT get agent-like-unclassified --
+      the single most important negative for this bucket per the card."""
+      cmdline = "/soft/python/bin/python3 train.py --epochs 10"
+      category, activity, _ = probe._classify("python3", cmdline)
+      assert activity != "agent-like-unclassified"
+      assert category != "ai-coding-agent"
+
+   def test_novel_vscode_extension_with_agent_hint_is_unclassified(self):
+      """A never-named vendor.name extension whose name contains an
+      explicit agent-ish hint token surfaces as the residual bucket
+      rather than silently vanishing into vscode-remote-server."""
+      cmdline = (
+         "/home/u/.vscode-server/extensions/"
+         "somevendor.some-ai-agent-2.0.0/bin/node")
+      category, activity, _ = probe._classify("node", cmdline)
+      assert activity == "agent-like-unclassified"
+
+   def test_known_harness_never_falls_back_to_residual(self):
+      """A KNOWN harness extension path must get its own specific label,
+      never the residual bucket, even though its path also satisfies the
+      residual pattern's generic shape."""
+      cmdline = (
+         "/home/u/.vscode-server/extensions/anthropic.claude-code-1.2.3/"
+         "bin/claude")
+      category, activity, _ = probe._classify("claude", cmdline)
+      assert activity == "claude-code"
+      assert activity != "agent-like-unclassified"
+
+   def test_ordinary_unrelated_extension_is_not_agent_like(self):
+      """An unrecognized but ordinary (non-agent) VS Code extension --
+      e.g. a linter -- must stay vscode-remote-server, not be swept into
+      the residual bucket just for being unrecognized."""
+      cmdline = (
+         "/home/u/.vscode-server/extensions/dbaeumer.vscode-eslint-2.4.0/"
+         "bin/node")
+      category, activity, _ = probe._classify("node", cmdline)
+      assert activity == "vscode-remote-server"
+      assert activity != "agent-like-unclassified"
+
+   def test_residual_priority_between_ide_and_named_agents(self):
+      priorities = {label: pr for label, _, pr in probe._ACTIVITY_RULES}
+      assert (priorities["vscode-remote-server"] <
+              priorities["agent-like-unclassified"] <
+              priorities["claude-code"])
+
+
 class TestBehavior:
    def test_tty_implies_interactive(self):
       assert probe._behavior(34816, 100, "bash") == "interactive"

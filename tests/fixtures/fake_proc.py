@@ -341,4 +341,15 @@ CMDLINE_CORPUS = [
 
    # other -- must NOT be forced into a category
    ("/usr/libexec/some-unknown-daemon --flag", "other"),
+
+   # ai-coding-agent -- B5 expanded taxonomy
+   ("windsurf --headless", "ai-coding-agent"),
+   ("cursor-agent --resume", "ai-coding-agent"),
+   ("hermes-agent run", "ai-coding-agent"),
+   ("/opt/openclaw/bin/openclaw serve", "ai-coding-agent"),
+   ("/home/u/.vscode-server/extensions/rooveterinaryinc.roo-cline-1.0.0/"
+    "bin/node", "ai-coding-agent"),
+   ("/home/u/.vscode-server/extensions/continue.continue-0.9.0/bin/node",
+    "ai-coding-agent"),
+   ("gh-copilot suggest", "ai-coding-agent"),
 ]
