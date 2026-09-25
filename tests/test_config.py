@@ -246,6 +246,44 @@ class TestKeepRawArgs:
 
 
 # --------------------------------------------------------------------------
+# compress_census: optional, defaults to False, bool-validated exactly like
+# keep_raw_args (kanban task B7). Back-compatible: an old config with no
+# compress_census key at all still loads (default False, byte-for-byte
+# unaffected).
+# --------------------------------------------------------------------------
+
+class TestCompressCensus:
+   def test_absent_defaults_to_false(self):
+      cfg = _load()
+      assert cfg.compress_census is False
+
+   def test_explicit_true_accepted(self):
+      cfg = _load(compress_census=True)
+      assert cfg.compress_census is True
+
+   def test_explicit_false_accepted(self):
+      cfg = _load(compress_census=False)
+      assert cfg.compress_census is False
+
+   def test_non_bool_rejected(self):
+      with pytest.raises(ConfigError):
+         _load(compress_census="yes")
+
+   def test_int_rejected(self):
+      with pytest.raises(ConfigError):
+         _load(compress_census=1)
+
+   def test_old_config_without_compress_census_still_loads(self):
+      """Back-compat: a config dict with no compress_census key at all --
+      exactly what every config predating kanban task B7 looks like --
+      must still load successfully with the new field defaulted."""
+      raw = _base_config()
+      assert "compress_census" not in raw
+      cfg = load_config(raw, home=HOME)
+      assert cfg.compress_census is False
+
+
+# --------------------------------------------------------------------------
 # Unknown-key rejection / required fields
 # --------------------------------------------------------------------------
 

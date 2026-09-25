@@ -15,6 +15,7 @@ map.
 
 import asyncio
 import codecs
+import gzip
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ import re
 import shutil
 import stat
 import time
+import zlib
 
 from node_monitor.output._incremental_json import (
    IncrementalJsonValidator,
@@ -58,6 +60,43 @@ _FILENAMES = {
    "node_collection_log": "node_collection_log.jsonl",
    "diagnostic_census": "diagnostic_censuses.jsonl",
 }
+
+# Kanban task B7: the diagnostic_census artifact is by far the largest
+# (a real 24h canary produced 1,764,399,017 bytes) and Workstream B
+# roughly doubles its per-row size, so it is the only artifact that
+# may optionally be written gzip-compressed on disk
+# (Phase0Config.compress_census, default False). Every OTHER record
+# type is always plain JSONL -- there is deliberately no generalized
+# per-record-type compression map, only this one flag-gated filename
+# for the one artifact that is worth it.
+_CENSUS_RECORD_TYPE = "diagnostic_census"
+_CENSUS_FILENAME_PLAIN = _FILENAMES[_CENSUS_RECORD_TYPE]
+_CENSUS_FILENAME_GZIP = _CENSUS_FILENAME_PLAIN + ".gz"
+
+
+def _filenames_for(compress_census):
+   """Return the record_type -> on-disk-filename map to use for one run,
+   identical to ``_FILENAMES`` except the census entry is swapped for
+   its ``.gz`` counterpart when ``compress_census`` is True. A small
+   indirection over a single shared base map -- never a second,
+   independently maintained ``_FILENAMES``-shaped dict that could
+   silently drift from it (e.g. if a future record type were added to
+   one map and not the other).
+   """
+   if not compress_census:
+      return _FILENAMES
+   filenames = dict(_FILENAMES)
+   filenames[_CENSUS_RECORD_TYPE] = _CENSUS_FILENAME_GZIP
+   return filenames
+
+
+# gzip magic bytes -- the two leading bytes of every valid gzip stream
+# (RFC 1952 section 2.3.1: ID1=0x1f, ID2=0x8b). Detected by CONTENT,
+# never trusted from the filename extension alone (design: "gzip
+# detected by magic bytes") -- a ``.jsonl.gz`` file that is somehow
+# plain text, or a plain ``.jsonl`` file that somehow got gzipped
+# content, is handled correctly either way.
+_GZIP_MAGIC = b"\x1f\x8b"
 
 _RUN_DIR_MODE = 0o700
 _FILE_MODE = 0o600
@@ -106,44 +145,21 @@ def validate_jsonl_artifact(path):
    truncation separately from an ordinary malformed line elsewhere in
    the file.
 
+   Kanban task B7: gzip-transparent, exactly like ``scan_jsonl_artifact``
+   -- this is now a thin wrapper around that function (never a second,
+   independently maintained line-validation implementation that could
+   silently drift from it, gzip-aware or otherwise) that simply drops
+   the two fields (``byte_size``/``sha256``) this function's callers
+   never asked for. Detects gzip by CONTENT (magic bytes), never by
+   trusting ``path``'s extension.
+
    Returns {"valid_count", "malformed_count", "truncated_final_line"}.
    """
-   if not os.path.exists(path):
-      return {"valid_count": 0, "malformed_count": 0, "truncated_final_line": False}
-
-   with open(path, "rb") as handle:
-      content = handle.read()
-
-   if not content:
-      return {"valid_count": 0, "malformed_count": 0, "truncated_final_line": False}
-
-   ends_with_newline = content.endswith(b"\n")
-   text = content.decode("utf-8", "replace")
-   lines = text.split("\n")
-   if lines and lines[-1] == "":
-      lines.pop()  # trailing newline produces one empty split segment
-
-   valid_count = 0
-   malformed_count = 0
-   truncated_final_line = False
-
-   last_index = len(lines) - 1
-   for index, line in enumerate(lines):
-      if not line:
-         continue
-      try:
-         json.loads(line)
-         valid_count += 1
-      except ValueError:
-         if index == last_index and not ends_with_newline:
-            truncated_final_line = True
-         else:
-            malformed_count += 1
-
+   scan = scan_jsonl_artifact(path)
    return {
-      "valid_count": valid_count,
-      "malformed_count": malformed_count,
-      "truncated_final_line": truncated_final_line,
+      "valid_count": scan["valid_count"],
+      "malformed_count": scan["malformed_count"],
+      "truncated_final_line": scan["truncated_final_line"],
    }
 
 
@@ -261,195 +277,370 @@ def _scan_jsonl_fileobj(handle, chunk_bytes=_SCAN_CHUNK_BYTES):
    verification and reintroduce the very race the caller opened the file
    to avoid. ``handle`` is consumed but never closed here -- the caller
    owns its lifecycle.
+
+   If the first bytes read from ``handle`` are the gzip magic
+   (``_GZIP_MAGIC``), this transparently routes through the bounded
+   gzip-decode scan (``_scan_gzip_fileobj``) instead of treating the
+   on-disk bytes as plain JSONL text -- kanban task B7: gzip is
+   detected by CONTENT, never trusted from a filename extension alone,
+   so a caller need not know or care whether the path it opened is
+   ``diagnostic_censuses.jsonl`` or ``diagnostic_censuses.jsonl.gz``.
    """
-   digest = hashlib.sha256()
-   byte_size = 0
-   valid_count = 0
-   malformed_count = 0
-   truncated_final_line = False
+   peek = handle.read(len(_GZIP_MAGIC))
+   if peek == _GZIP_MAGIC:
+      return _scan_gzip_fileobj(handle, peek, chunk_bytes=chunk_bytes)
+   return _scan_plain_jsonl_fileobj(handle, peek, chunk_bytes=chunk_bytes)
 
-   # The only per-line state carried across chunk-read iterations while
-   # under the fast-path threshold: the bytes of whichever line is
-   # currently in progress. Freed (a fresh bytearray) the instant that
-   # line is parsed/counted, so at any given moment this holds exactly
-   # one line's worth of content -- up to the threshold -- never the
-   # whole file, never a list of all lines.
-   line_buf = bytearray()
 
-   # Set instead of line_buf once a line crosses
-   # _FAST_PATH_LINE_LIMIT_BYTES: an IncrementalJsonValidator consuming
-   # that same line's remaining bytes without retaining them, plus the
-   # incremental UTF-8 decoder feeding it (mirrors
-   # ``content.decode("utf-8", "replace")`` exactly, just incrementally
-   # -- see decode_incremental's own note).
-   fallback_validator = None
-   fallback_decoder = None
-   # Review round 5 finding: JsonSyntaxError raised mid-feed does not by
-   # itself leave the validator's grammar state such that finish() will
-   # also raise -- e.g. an unexpected character between a completed
-   # value and its container's closing brace/bracket is a syntax error,
-   # but the container's stack frame is untouched, so a subsequent
-   # matching close character can still walk the stack back to empty
-   # and finish() reports success. Swallowing the error without
-   # recording it therefore let a line that IS malformed report as
-   # valid. This flag makes any syntax error sticky for the rest of the
-   # current line, independent of what the validator's internal state
-   # happens to look like afterward.
-   fallback_failed = False
+class _LineAccountant:
+   """Streaming JSONL line-accounting state machine: counts valid/
+   malformed lines and detects a truncated final line, from whatever
+   raw bytes are fed to it via ``feed()`` -- one line's worth of state
+   at a time, never the whole artifact. Shared by both
+   ``_scan_plain_jsonl_fileobj`` (fed directly from the file's own
+   bytes) and ``_scan_gzip_fileobj`` (fed from the bounded gzip-decode
+   output) so the two scans agree EXACTLY on what counts as valid,
+   malformed, or truncated -- there is only one JSONL-grammar verdict
+   implementation in this module, regardless of what container format
+   the bytes arrived in.
 
-   def _decode_incremental(raw_bytes, final):
-      # decode() with errors="replace" one chunk at a time is exactly
-      # equivalent to decoding the whole line's bytes at once with
-      # errors="replace", for any way the bytes are chopped up --
-      # verified during development with randomized chunking including
-      # splits that land inside multi-byte sequences. ``final=True``
-      # must be passed at the true end of the line's bytes (a real
-      # newline terminator, or EOF) -- see review round 5 finding #2:
-      # omitting it silently drops a dangling incomplete multi-byte
-      # sequence instead of turning it into U+FFFD the way a one-shot
-      # ``bytes.decode("utf-8", "replace")`` on the whole line does.
-      return fallback_decoder.decode(raw_bytes, final)
+   This is exactly the fast-path-bytearray / bounded-memory-fallback
+   two-tier strategy ``_scan_plain_jsonl_fileobj`` (née
+   ``_scan_jsonl_fileobj``) has always used -- see that function's
+   original docstring/review history for why both tiers are required
+   together. Extracted into its own class purely so it can be driven
+   by two different byte sources without duplicating the (subtle,
+   multiply-reviewed) per-line state machine.
+   """
 
-   def _start_fallback():
-      nonlocal fallback_validator, fallback_decoder, fallback_failed, line_buf
-      fallback_validator = IncrementalJsonValidator()
-      fallback_decoder = codecs.getincrementaldecoder("utf-8")("replace")
-      fallback_failed = False
-      if line_buf:
-         text = _decode_incremental(bytes(line_buf), False)
+   def __init__(self):
+      self.valid_count = 0
+      self.malformed_count = 0
+      self.truncated_final_line = False
+      self._line_buf = bytearray()
+      self._fallback_validator = None
+      self._fallback_decoder = None
+      self._fallback_failed = False
+
+   def _decode_incremental(self, raw_bytes, final):
+      return self._fallback_decoder.decode(raw_bytes, final)
+
+   def _start_fallback(self):
+      self._fallback_validator = IncrementalJsonValidator()
+      self._fallback_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+      self._fallback_failed = False
+      if self._line_buf:
+         text = self._decode_incremental(bytes(self._line_buf), False)
          try:
-            fallback_validator.feed_str(text)
+            self._fallback_validator.feed_str(text)
          except JsonSyntaxError:
-            fallback_failed = True  # sticky -- see fallback_failed's comment
-      line_buf = bytearray()
+            self._fallback_failed = True
+      self._line_buf = bytearray()
 
-   def _feed_fallback(raw_bytes):
-      nonlocal fallback_failed
-      text = _decode_incremental(raw_bytes, False)
-      if fallback_failed:
-         return  # already known-invalid; keep consuming bytes, don't re-feed
+   def _feed_fallback(self, raw_bytes):
+      text = self._decode_incremental(raw_bytes, False)
+      if self._fallback_failed:
+         return
       try:
-         fallback_validator.feed_str(text)
+         self._fallback_validator.feed_str(text)
       except JsonSyntaxError:
-         fallback_failed = True  # sticky -- see fallback_failed's comment
+         self._fallback_failed = True
 
-   def _finalize_fallback_line():
-      nonlocal fallback_validator, fallback_decoder, fallback_failed
-      nonlocal valid_count, malformed_count
-      # Flush the incremental UTF-8 decoder with final=True so a
-      # dangling incomplete multi-byte sequence at the line's true end
-      # becomes U+FFFD (matching validate_jsonl_artifact's one-shot
-      # decode) instead of being silently dropped -- review round 5
-      # finding #2.
-      tail_text = _decode_incremental(b"", True)
-      if tail_text and not fallback_failed:
+   def _finalize_fallback_line(self):
+      tail_text = self._decode_incremental(b"", True)
+      if tail_text and not self._fallback_failed:
          try:
-            fallback_validator.feed_str(tail_text)
+            self._fallback_validator.feed_str(tail_text)
          except JsonSyntaxError:
-            fallback_failed = True
-      if fallback_failed:
-         malformed_count += 1
+            self._fallback_failed = True
+      if self._fallback_failed:
+         self.malformed_count += 1
       else:
          try:
-            fallback_validator.finish()
-            valid_count += 1
+            self._fallback_validator.finish()
+            self.valid_count += 1
          except JsonSyntaxError:
-            malformed_count += 1
-      fallback_validator = None
-      fallback_decoder = None
+            self.malformed_count += 1
+      self._fallback_validator = None
+      self._fallback_decoder = None
 
-   def _append_to_current_line(segment):
-      # Route segment either into the fast bytearray path or the
-      # bounded-memory fallback, switching the moment the fast path
-      # would exceed its threshold.
-      nonlocal line_buf
-      if fallback_validator is not None:
+   def _append_to_current_line(self, segment):
+      if self._fallback_validator is not None:
          if segment:
-            _feed_fallback(segment)
+            self._feed_fallback(segment)
          return
       if segment:
-         line_buf.extend(segment)
-      if len(line_buf) > _FAST_PATH_LINE_LIMIT_BYTES:
-         _start_fallback()
+         self._line_buf.extend(segment)
+      if len(self._line_buf) > _FAST_PATH_LINE_LIMIT_BYTES:
+         self._start_fallback()
 
-   def _finalize_complete_line():
-      # Called exactly when a real b"\n" terminator has been found for the
-      # accumulated line -- i.e. this line can never be the truncated
-      # final line, only valid or ordinarily malformed.
-      nonlocal malformed_count, valid_count, line_buf
-      if fallback_validator is not None:
-         _finalize_fallback_line()
+   def _finalize_complete_line(self):
+      if self._fallback_validator is not None:
+         self._finalize_fallback_line()
          return
-      if line_buf:
+      if self._line_buf:
          try:
-            json.loads(bytes(line_buf).decode("utf-8", "replace"))
-            valid_count += 1
+            json.loads(bytes(self._line_buf).decode("utf-8", "replace"))
+            self.valid_count += 1
          except ValueError:
-            malformed_count += 1
-      # else: an empty line (consecutive newlines) -- matches
-      # validate_jsonl_artifact's `if not line: continue`, counted as
-      # neither valid nor malformed.
+            self.malformed_count += 1
+      # else: an empty line (consecutive newlines) -- counted as
+      # neither valid nor malformed, matching validate_jsonl_artifact.
 
-   while True:
-      chunk = handle.read(chunk_bytes)
-      if not chunk:
-         break
-      digest.update(chunk)
-      byte_size += len(chunk)
-
+   def feed(self, chunk):
+      """Feed one bounded chunk of raw (already-decompressed, for the
+      gzip caller) bytes, splitting it on ``b"\\n"`` and finalizing
+      every complete line found. At most ``chunk`` worth of new data is
+      ever processed per call; the still-open final line's bytes are
+      carried in internal state (bounded exactly as
+      ``_scan_plain_jsonl_fileobj`` always was) across calls.
+      """
       start = 0
       chunk_len = len(chunk)
       while True:
          newline_index = chunk.find(b"\n", start)
          if newline_index == -1:
             remainder = chunk[start:chunk_len]
-            _append_to_current_line(remainder)
+            self._append_to_current_line(remainder)
             break
-
          segment = chunk[start:newline_index]
-         _append_to_current_line(segment)
-
-         _finalize_complete_line()
-         line_buf = bytearray()
+         self._append_to_current_line(segment)
+         self._finalize_complete_line()
+         self._line_buf = bytearray()
          start = newline_index + 1
 
-   # A non-empty (or in-fallback) line buffer at EOF means the file's
-   # last bytes were never terminated by b"\n" -- exactly the
-   # truncated-final-line case (or a well-formed final line missing
-   # only its trailing newline, which is valid, not truncated).
-   if fallback_validator is not None:
-      # Same final-flush-then-sticky-failure logic as
-      # _finalize_fallback_line, but a failure at true EOF (no
-      # newline) is "truncated", not "malformed" -- matching every
-      # other truncated-final-line branch in this function.
-      tail_text = _decode_incremental(b"", True)
-      if tail_text and not fallback_failed:
+   def finalize(self, forced_truncated=False):
+      """Called once at the true end of input. ``forced_truncated``
+      lets a caller (the gzip scan) declare the final line truncated
+      REGARDLESS of whether it parses as valid JSON -- e.g. a gzip
+      stream that never reached a clean end-of-stream marker means the
+      underlying JSONL bytes themselves may be incomplete even where
+      they happen to look like well-formed JSON so far.
+      """
+      if forced_truncated:
+         self.truncated_final_line = True
+         return
+      if self._fallback_validator is not None:
+         tail_text = self._decode_incremental(b"", True)
+         if tail_text and not self._fallback_failed:
+            try:
+               self._fallback_validator.feed_str(tail_text)
+            except JsonSyntaxError:
+               self._fallback_failed = True
+         if self._fallback_failed:
+            self.truncated_final_line = True
+         else:
+            try:
+               self._fallback_validator.finish()
+               self.valid_count += 1
+            except JsonSyntaxError:
+               self.truncated_final_line = True
+      elif self._line_buf:
          try:
-            fallback_validator.feed_str(tail_text)
-         except JsonSyntaxError:
-            fallback_failed = True
-      if fallback_failed:
-         truncated_final_line = True
-      else:
-         try:
-            fallback_validator.finish()
-            valid_count += 1
-         except JsonSyntaxError:
-            truncated_final_line = True
-   elif line_buf:
-      try:
-         json.loads(bytes(line_buf).decode("utf-8", "replace"))
-         valid_count += 1
-      except ValueError:
-         truncated_final_line = True
+            json.loads(bytes(self._line_buf).decode("utf-8", "replace"))
+            self.valid_count += 1
+         except ValueError:
+            self.truncated_final_line = True
+
+
+def _scan_plain_jsonl_fileobj(handle, first_bytes, chunk_bytes=_SCAN_CHUNK_BYTES):
+   """The plain-text JSONL scan behind ``_scan_jsonl_fileobj``, given
+   whichever bytes were already peeked off the front of ``handle`` to
+   decide it was NOT gzip (``first_bytes`` -- up to
+   ``len(_GZIP_MAGIC)`` bytes, already consumed from ``handle`` and
+   must be folded back into the scan as the start of the first chunk,
+   never re-read).
+   """
+   digest = hashlib.sha256()
+   byte_size = 0
+   accountant = _LineAccountant()
+
+   while True:
+      chunk = first_bytes if first_bytes is not None else handle.read(chunk_bytes)
+      first_bytes = None
+      if not chunk:
+         break
+      digest.update(chunk)
+      byte_size += len(chunk)
+      accountant.feed(chunk)
+
+   accountant.finalize()
 
    return {
       "byte_size": byte_size,
       "sha256": digest.hexdigest(),
-      "valid_count": valid_count,
-      "malformed_count": malformed_count,
-      "truncated_final_line": truncated_final_line,
+      "valid_count": accountant.valid_count,
+      "malformed_count": accountant.malformed_count,
+      "truncated_final_line": accountant.truncated_final_line,
    }
+
+
+# Bounded output chunk size for the gzip decompressor -- how much
+# DECOMPRESSED data ``zlib.decompressobj.decompress()`` is allowed to
+# hand back per call. Mirrors ``_SCAN_CHUNK_BYTES``'s own bound but on
+# the decompressed side: capping this is what keeps a highly
+# compressible pathological gzip member (e.g. gigabytes of repeated
+# bytes compressing down to a tiny compressed size) from handing back
+# an enormous decompressed blob in one call -- the compressed
+# ``chunk_bytes`` read alone would not bound that.
+_GZIP_DECODE_OUT_CHUNK_BYTES = 1 << 20  # 1 MiB per decompress() call.
+
+
+def _scan_gzip_fileobj(handle, first_bytes, chunk_bytes=_SCAN_CHUNK_BYTES):
+   """Bounded-memory scan of a gzip-compressed JSONL artifact, given
+   whichever bytes were already peeked off the front of ``handle`` to
+   detect the gzip magic (``first_bytes`` -- exactly ``_GZIP_MAGIC``,
+   already consumed from ``handle`` and folded back as the start of
+   the first compressed chunk, never re-read).
+
+   Design: kanban task B7's validated bounded gzip-decode approach.
+   ``handle`` is read in fixed-size COMPRESSED chunks (``chunk_bytes``,
+   same bound as the plain scan) -- a running ``hashlib.sha256`` digests
+   each compressed chunk exactly as read, so ``byte_size``/``sha256``
+   describe the ON-DISK (compressed) bytes, never the decompressed
+   payload. Each compressed chunk is fed to a single
+   ``zlib.decompressobj(zlib.MAX_WBITS | 16)`` (the documented
+   incantation for gzip-framed, as opposed to raw zlib-framed, data);
+   its decompressed output is drained in bounded
+   ``_GZIP_DECODE_OUT_CHUNK_BYTES``-sized pieces (via the
+   ``unconsumed_tail`` loop) and fed straight into a ``_LineAccountant``
+   -- the SAME line-validation state machine ``_scan_plain_jsonl_fileobj``
+   uses, so a gzip census and a plain census agree exactly on what
+   counts as a valid/malformed/truncated line. At no point is the
+   whole compressed file, or the whole decompressed payload, held in
+   memory at once.
+
+   Truncation semantics (empirically validated during this card's
+   design phase): a clean, fully-closed gzip stream decompresses with
+   ``decompressor.eof`` ending True and never raises; ANY of (a) a
+   ``zlib.error`` raised mid-decode (CRC/incorrect-data-check -- a
+   corrupted member), (b) input exhausted with ``eof`` still False (a
+   trailer cut short, or a stream truncated anywhere before its final
+   member), is reported as ``truncated_final_line=True`` -- exactly
+   mirroring the plain scan's truncated-final-line semantics, just
+   keyed off the gzip framing's own end-of-stream signal instead of a
+   missing trailing newline. Earlier, successfully-decompressed lines
+   are still counted normally; a truncated/corrupt gzip never crashes
+   this function and never silently reports as clean.
+
+   A genuinely empty (0 records) but CLEANLY CLOSED gzip member (i.e.
+   ``gzip.compress(b"")``, or ``Phase0Sink``'s write path finalizing
+   with zero writes) decompresses to zero bytes with ``eof=True`` --
+   correctly NOT truncated. A literal zero-byte file (no gzip framing
+   at all) can only reach this function if its first two bytes somehow
+   still matched ``_GZIP_MAGIC``, which is impossible for a 0-byte
+   file -- that case is handled by ``_scan_jsonl_fileobj``'s peek
+   returning ``b\"\"`` and routing to the plain scan instead, which
+   already reports a 0-byte file as valid_count=0/malformed_count=0/
+   truncated_final_line=False (an empty artifact, not a truncated
+   one) -- consistent with a "no records written" run.
+   """
+   digest = hashlib.sha256()
+   byte_size = 0
+   accountant = _LineAccountant()
+   decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+   decode_error = False
+
+   while True:
+      compressed = first_bytes if first_bytes is not None else handle.read(chunk_bytes)
+      first_bytes = None
+      if not compressed:
+         break
+      digest.update(compressed)
+      byte_size += len(compressed)
+
+      if decode_error or decompressor.eof:
+         # Already known-corrupt or already reached a clean end-of-
+         # stream marker: keep consuming (and hashing/sizing) whatever
+         # bytes remain on disk -- e.g. trailing garbage after a valid
+         # member -- without feeding them to the decompressor again.
+         continue
+
+      pending = compressed
+      while pending:
+         try:
+            piece = decompressor.decompress(pending, _GZIP_DECODE_OUT_CHUNK_BYTES)
+         except zlib.error:
+            decode_error = True
+            break
+         if piece:
+            accountant.feed(piece)
+         pending = decompressor.unconsumed_tail
+         if decompressor.eof:
+            break
+
+   if not decode_error and not decompressor.eof:
+      try:
+         tail = decompressor.flush()
+         if tail:
+            accountant.feed(tail)
+      except zlib.error:
+         decode_error = True
+
+   truncated = decode_error or not decompressor.eof
+   accountant.finalize(forced_truncated=truncated)
+
+   return {
+      "byte_size": byte_size,
+      "sha256": digest.hexdigest(),
+      "valid_count": accountant.valid_count,
+      "malformed_count": accountant.malformed_count,
+      "truncated_final_line": accountant.truncated_final_line,
+   }
+
+
+class _GzipTextAppendHandle:
+   """Adapts a ``gzip.GzipFile`` (binary, append-mode) plus its
+   underlying raw binary file object to the same narrow interface
+   ``write_record``/``finalize_summary`` already use against a plain
+   ``os.fdopen(fd, "a", encoding="utf-8")`` text handle: ``write(str)``,
+   ``flush()``, ``fileno()``, ``close()``.
+
+   Kept deliberately minimal -- this is not a general-purpose file-like
+   shim, just the exact four operations the rest of this module needs,
+   so gzip-vs-plain stays an invisible implementation detail to every
+   caller of ``Phase0Sink._handle_for``.
+
+   ``write(text)`` encodes ``text`` as UTF-8 (matching the plain
+   handle's ``encoding="utf-8"``) and feeds it to the ``GzipFile``,
+   which itself buffers/compresses/writes to the underlying raw binary
+   file object as needed -- ``write_record`` calling ``.flush()``
+   right after every ``write()`` (exactly as it always has for the
+   plain path) is what keeps each record's compressed bytes actually
+   pushed into the raw OS-level file promptly, not held indefinitely
+   inside zlib's own internal buffer.
+
+   ``fileno()`` returns the RAW underlying fd (never the ``GzipFile``
+   object's own, which does not implement a real ``fileno()`` in every
+   version) -- ``write_record``'s ``os.fsync(handle.fileno())`` must
+   fsync the actual on-disk bytes, and ``flush()`` is called on the
+   ``GzipFile`` immediately beforehand in both call sites to guarantee
+   the compressor's pending output has already been pushed into that
+   same raw fd before the fsync happens.
+
+   ``close()`` closes the ``GzipFile`` FIRST (writing gzip's own
+   trailer/CRC/end-of-stream marker so the on-disk stream is a cleanly
+   terminated gzip member -- this is what makes a 0-record run's
+   census a validly-closed EMPTY-payload gzip, not a truncated one),
+   THEN closes the raw underlying file object.
+   """
+
+   def __init__(self, gzobj, raw):
+      self._gzobj = gzobj
+      self._raw = raw
+
+   def write(self, text):
+      self._gzobj.write(text.encode("utf-8"))
+
+   def flush(self):
+      self._gzobj.flush()
+
+   def fileno(self):
+      return self._raw.fileno()
+
+   def close(self):
+      self._gzobj.close()
+      self._raw.close()
 
 
 class Phase0Sink:
@@ -464,7 +655,8 @@ class Phase0Sink:
    def __init__(self, output_root, run_id, metadata=None,
                 flush_interval_sec=_DEFAULT_FLUSH_INTERVAL_SEC,
                 min_free_disk_pct=_DEFAULT_MIN_FREE_DISK_PCT,
-                clock=time.monotonic, disk_usage_fn=shutil.disk_usage):
+                clock=time.monotonic, disk_usage_fn=shutil.disk_usage,
+                compress_census=False):
       self.output_root = output_root
       self.run_id = run_id
       self.run_dir = os.path.join(output_root, "phase0-%s" % run_id)
@@ -472,6 +664,13 @@ class Phase0Sink:
       self._min_free_disk_pct = min_free_disk_pct
       self._clock = clock
       self._disk_usage_fn = disk_usage_fn
+      # Kanban task B7: opt-in gzip compression for the diagnostic_census
+      # artifact only -- see _filenames_for()'s own docstring. Resolved
+      # ONCE at construction into self._filenames so every other method
+      # (write, finalize) uses this single per-run filename map rather
+      # than re-deciding per call.
+      self._compress_census = compress_census
+      self._filenames = _filenames_for(compress_census)
 
       # Created lazily (see _get_lock) rather than here: asyncio.Lock()
       # binds to the running event loop at construction time on Python
@@ -482,7 +681,7 @@ class Phase0Sink:
       # synchronous construction.
       self._lock = None
       self._file_handles = {}
-      self._record_counts = {name: 0 for name in _FILENAMES}
+      self._record_counts = {name: 0 for name in self._filenames}
       self._last_fsync_at = {}
       self._summary_finalized = False
       # Test-only hook: an async callable invoked once inside the locked
@@ -519,11 +718,30 @@ class Phase0Sink:
             % (free_pct, self._min_free_disk_pct, self.output_root))
 
    def _handle_for(self, record_type):
+      """Return the (lazily opened, cached) writable text handle for
+      ``record_type``, honoring ``self._compress_census``.
+
+      For the plain path this is the same append-mode text handle as
+      before. For the gzip-compressed census, the underlying fd is
+      opened exactly the same way (``O_WRONLY|O_CREAT|O_APPEND``,
+      mode 0600) and then wrapped in a ``gzip.GzipFile`` in append
+      mode so ``write_record`` can call ``.write(line + "\\n")``
+      identically regardless of which path this run uses. Kanban task
+      B7 design: "on crash the gzip census may lose slightly more
+      trailing data than plain, but the run is recoverable and
+      truncation is REPORTED" -- see ``write_record``'s fsync step and
+      ``_scan_gzip_fileobj`` for how that truncation is detected.
+      """
       handle = self._file_handles.get(record_type)
       if handle is None:
-         path = os.path.join(self.run_dir, _FILENAMES[record_type])
+         path = os.path.join(self.run_dir, self._filenames[record_type])
          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, _FILE_MODE)
-         handle = os.fdopen(fd, "a", encoding="utf-8")
+         if self._compress_census and record_type == _CENSUS_RECORD_TYPE:
+            raw = os.fdopen(fd, "ab")
+            gzobj = gzip.GzipFile(fileobj=raw, mode="ab")
+            handle = _GzipTextAppendHandle(gzobj, raw)
+         else:
+            handle = os.fdopen(fd, "a", encoding="utf-8")
          os.chmod(path, _FILE_MODE)
          self._file_handles[record_type] = handle
       return handle
@@ -648,7 +866,7 @@ class Phase0Sink:
          # pattern transiently need multiple GiB of RAM right at
          # finalization.
          files_summary = {}
-         for record_type, filename in _FILENAMES.items():
+         for record_type, filename in self._filenames.items():
             path = os.path.join(self.run_dir, filename)
             scan = scan_jsonl_artifact(path)
             files_summary[record_type] = {
@@ -1044,7 +1262,23 @@ def _finalize_orphaned_run_locked(abs_run_dir, dir_fd, run_id):
    files_summary = {}
    any_artifact_present = False
    for record_type, filename in _FILENAMES.items():
-      artifact_fd = _open_child_verified(dir_fd, filename)
+      if record_type == _CENSUS_RECORD_TYPE:
+         # The gzip flag is a per-run Phase0Sink construction choice
+         # (Phase0Config.compress_census) that this recovery path has
+         # no other record of -- an orphaned directory carries no
+         # manifest field for it, so both possible on-disk census
+         # names are tried. At most one can exist for any given run
+         # (Phase0Sink always opens exactly one of them), so trying
+         # the gzip name first when present is unambiguous; falling
+         # back to the plain name preserves this function's existing
+         # "never written" zero-count case when NEITHER exists.
+         filename = _CENSUS_FILENAME_GZIP
+         artifact_fd = _open_child_verified(dir_fd, filename)
+         if artifact_fd is None:
+            filename = _CENSUS_FILENAME_PLAIN
+            artifact_fd = _open_child_verified(dir_fd, filename)
+      else:
+         artifact_fd = _open_child_verified(dir_fd, filename)
       if artifact_fd is None:
          # No records of this type were ever written -- exactly the
          # same "safe to call with zero records written to any given
@@ -1059,7 +1293,11 @@ def _finalize_orphaned_run_locked(abs_run_dir, dir_fd, run_id):
          any_artifact_present = True
          # os.fdopen takes ownership of artifact_fd -- its own `with`
          # block closes it, so no separate os.close is needed or
-         # correct here.
+         # correct here. _scan_jsonl_fileobj itself detects gzip vs
+         # plain content by magic bytes (never trusting `filename`'s
+         # extension), so this one call is correct for either on-disk
+         # form -- the SAME scanner Phase0Sink.finalize_summary uses,
+         # never a forked/duplicate scan implementation.
          with os.fdopen(artifact_fd, "rb") as artifact_handle:
             scan = _scan_jsonl_fileobj(artifact_handle)
          record_count = scan["valid_count"]

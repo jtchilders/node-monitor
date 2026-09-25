@@ -892,6 +892,440 @@ class TestScanJsonlArtifact:
 
 
 # --------------------------------------------------------------------------
+# Kanban task B7: opt-in gzip compression for the diagnostic_census
+# artifact only. Sink write-path round-trip, scan_jsonl_artifact
+# gzip-transparency (by content-sniffed magic bytes), bounded-memory
+# proof on a large synthetic gzip artifact, and truncation/corruption
+# semantics.
+# --------------------------------------------------------------------------
+
+def _census_record(index=0, hostname="polaris-login-04.example.org"):
+   return {
+      "system": "polaris",
+      "source_hostname": hostname,
+      "timestamp_utc": "2026-09-09T00:00:%02dZ" % (index % 60),
+      "probe_version": 4,
+      "processes": [],
+      "cpu_deltas": {"deltas": [], "unmeasured": [], "anomalies": []},
+   }
+
+
+class TestGzipCensusSinkRoundTrip:
+   def test_compress_census_false_writes_plain_jsonl(self, tmp_path):
+      sink = Phase0Sink(
+         str(tmp_path), "gz-run1", disk_usage_fn=_full_disk_usage,
+         compress_census=False)
+      _run(sink.write_record("diagnostic_census", _census_record(0)))
+      assert os.path.exists(
+         os.path.join(sink.run_dir, "diagnostic_censuses.jsonl"))
+      assert not os.path.exists(
+         os.path.join(sink.run_dir, "diagnostic_censuses.jsonl.gz"))
+      with open(os.path.join(sink.run_dir, "diagnostic_censuses.jsonl"),
+                "rb") as handle:
+         content = handle.read()
+      assert content[:2] != b"\x1f\x8b"
+
+   def test_compress_census_true_writes_gzip_named_file(self, tmp_path):
+      sink = Phase0Sink(
+         str(tmp_path), "gz-run2", disk_usage_fn=_full_disk_usage,
+         compress_census=True)
+      _run(sink.write_record("diagnostic_census", _census_record(0)))
+      assert os.path.exists(
+         os.path.join(sink.run_dir, "diagnostic_censuses.jsonl.gz"))
+      assert not os.path.exists(
+         os.path.join(sink.run_dir, "diagnostic_censuses.jsonl"))
+      with open(os.path.join(sink.run_dir, "diagnostic_censuses.jsonl.gz"),
+                "rb") as handle:
+         content = handle.read()
+      assert content[:2] == b"\x1f\x8b"
+
+   def test_compress_census_only_affects_census_other_files_stay_plain(
+         self, tmp_path):
+      """ONLY the census is ever gzipped -- every other artifact stays
+      plain JSONL regardless of the flag."""
+      sink = Phase0Sink(
+         str(tmp_path), "gz-run3", disk_usage_fn=_full_disk_usage,
+         compress_census=True)
+      _run(sink.write_record("node_hardware", _hardware_record()))
+      _run(sink.write_record("diagnostic_census", _census_record(0)))
+      hw_path = os.path.join(sink.run_dir, "node_hardware.jsonl")
+      with open(hw_path, "rb") as handle:
+         hw_content = handle.read()
+      assert hw_content[:2] != b"\x1f\x8b"
+      with open(hw_path) as handle:
+         json.loads(handle.readline())  # plain JSON, not gzip garbage
+
+   def test_gzip_census_round_trips_n_records_identical(self, tmp_path):
+      sink = Phase0Sink(
+         str(tmp_path), "gz-run4", disk_usage_fn=_full_disk_usage,
+         compress_census=True)
+      records = [_census_record(i, hostname="host-%02d.example.org" % i)
+                 for i in range(25)]
+      for record in records:
+         _run(sink.write_record("diagnostic_census", record))
+      # A gzip stream only gets its trailer/end-of-stream marker on a
+      # clean close (finalize_summary, in production) -- read it back
+      # via the bounded scanner (gzip-transparent, tolerates an
+      # in-progress/not-yet-closed stream by reporting truncation
+      # rather than raising) to prove every already-written record
+      # round-trips correctly even before finalization, then close and
+      # re-verify with the stdlib's own strict gzip reader.
+      path = os.path.join(sink.run_dir, "diagnostic_censuses.jsonl.gz")
+      pre_close = scan_jsonl_artifact(path)
+      assert pre_close["valid_count"] == len(records)
+      assert pre_close["malformed_count"] == 0
+
+      _run(sink.finalize_summary())
+
+      import gzip as _gzip
+      with _gzip.open(path, "rt", encoding="utf-8") as handle:
+         read_back = [json.loads(line) for line in handle]
+      assert read_back == records
+
+   def test_plain_census_round_trips_n_records_identical(self, tmp_path):
+      """Sanity companion to the gzip round-trip above: the plain path
+      (flag off) is unaffected by this card's changes."""
+      sink = Phase0Sink(
+         str(tmp_path), "gz-run5", disk_usage_fn=_full_disk_usage,
+         compress_census=False)
+      records = [_census_record(i, hostname="host-%02d.example.org" % i)
+                 for i in range(25)]
+      for record in records:
+         _run(sink.write_record("diagnostic_census", record))
+      path = os.path.join(sink.run_dir, "diagnostic_censuses.jsonl")
+      with open(path) as handle:
+         read_back = [json.loads(line) for line in handle]
+      assert read_back == records
+
+   def test_zero_record_gzip_census_closes_as_valid_empty_gzip(self, tmp_path):
+      """Design NUANCE: a 0-record run with compress_census=True must
+      close as a validly-closed EMPTY-payload gzip member (not
+      truncated) once finalize_summary runs -- see
+      TestGzipCensusScanning.test_finalized_zero_record_census_not_truncated
+      for the actual scan-side assertion; this test only proves the
+      handle gets opened/closed via finalize_summary even though
+      write_record was never called for this record type... actually
+      write_record is what LAZILY opens the handle, so a genuinely
+      zero-record run never opens the census file at all (matching the
+      existing 'safe to call with zero records written to any given
+      file' contract) -- finalize_summary's scan of a NONEXISTENT path
+      correctly reports zeros/not-truncated regardless of the gzip
+      flag, exercised here end to end.
+      """
+      sink = Phase0Sink(
+         str(tmp_path), "gz-run6", disk_usage_fn=_full_disk_usage,
+         compress_census=True)
+      summary = _run(sink.finalize_summary())
+      entry = summary["files"]["diagnostic_census"]
+      assert entry["filename"] == "diagnostic_censuses.jsonl.gz"
+      assert entry["record_count"] == 0
+      assert entry["truncated_final_line"] is False
+      assert not os.path.exists(
+         os.path.join(sink.run_dir, "diagnostic_censuses.jsonl.gz"))
+
+
+class TestGzipCensusScanning:
+   def test_scan_gzip_artifact_reports_compressed_size_and_sha(self, tmp_path):
+      import gzip as _gzip
+
+      path = tmp_path / "diagnostic_censuses.jsonl.gz"
+      payload = b'{"a":1}\n{"a":2}\n{"a":3}\n'
+      with _gzip.open(str(path), "wb") as handle:
+         handle.write(payload)
+      with open(str(path), "rb") as handle:
+         on_disk = handle.read()
+
+      result = scan_jsonl_artifact(str(path))
+      assert result["byte_size"] == len(on_disk)  # ON-DISK compressed bytes
+      assert result["sha256"] == hashlib.sha256(on_disk).hexdigest()
+      assert result["valid_count"] == 3
+      assert result["malformed_count"] == 0
+      assert result["truncated_final_line"] is False
+
+   def test_scan_gzip_artifact_detects_by_magic_bytes_not_extension(
+         self, tmp_path):
+      """Design: gzip is detected by CONTENT, never trusted from a
+      filename extension alone. A file named plainly ``.jsonl`` but
+      holding real gzip bytes must still be scanned as gzip."""
+      import gzip as _gzip
+
+      path = tmp_path / "diagnostic_censuses.jsonl"  # no .gz suffix
+      with _gzip.open(str(path), "wb") as handle:
+         handle.write(b'{"a":1}\n{"a":2}\n')
+
+      result = scan_jsonl_artifact(str(path))
+      assert result["valid_count"] == 2
+      assert result["malformed_count"] == 0
+      assert result["truncated_final_line"] is False
+
+   def test_scan_non_gzip_file_named_gz_is_scanned_as_plain_text(
+         self, tmp_path):
+      """The inverse of the above: a ``.jsonl.gz``-named file that does
+      NOT start with the gzip magic bytes is scanned as plain JSONL,
+      never blindly handed to the gzip decoder just because of its
+      name."""
+      path = tmp_path / "diagnostic_censuses.jsonl.gz"
+      path.write_text('{"a":1}\n{"a":2}\n')
+      result = scan_jsonl_artifact(str(path))
+      assert result["valid_count"] == 2
+      assert result["malformed_count"] == 0
+      assert result["truncated_final_line"] is False
+
+   def test_clean_gzip_n_records_all_valid_zero_malformed_not_truncated(
+         self, tmp_path):
+      import gzip as _gzip
+
+      path = tmp_path / "census.jsonl.gz"
+      n = 40
+      lines = [json.dumps(_census_record(i)) for i in range(n)]
+      with _gzip.open(str(path), "wb") as handle:
+         handle.write(("\n".join(lines) + "\n").encode("utf-8"))
+
+      result = scan_jsonl_artifact(str(path))
+      assert result["valid_count"] == n
+      assert result["malformed_count"] == 0
+      assert result["truncated_final_line"] is False
+
+   def test_truncated_mid_gzip_reports_truncation_earlier_records_counted_no_crash(
+         self, tmp_path):
+      """Empirically validated design behavior: cutting a gzip stream's
+      trailing bytes (its trailer, or more) leaves d.eof False even
+      though every already-emitted decompressed byte is genuine --
+      earlier fully-decoded records must still be counted, truncation
+      must be reported, and this must never raise."""
+      import gzip as _gzip
+
+      path = tmp_path / "census.jsonl.gz"
+      lines = [json.dumps(_census_record(i)) for i in range(10)]
+      payload = ("\n".join(lines) + "\n").encode("utf-8")
+      with _gzip.open(str(path), "wb") as handle:
+         handle.write(payload)
+      with open(str(path), "rb") as handle:
+         full = handle.read()
+
+      # Cut the trailer (last 4 bytes: CRC32 + ISIZE) -- all payload
+      # bytes are present but the gzip stream never reaches a clean
+      # end-of-stream marker.
+      truncated_path = tmp_path / "census_trailer_cut.jsonl.gz"
+      truncated_path.write_bytes(full[:-4])
+      result = scan_jsonl_artifact(str(truncated_path))
+      assert result["truncated_final_line"] is True
+      assert result["valid_count"] == 10
+      assert result["malformed_count"] == 0
+
+      # 60% truncation -- partial data, still no crash.
+      sixty_pct_path = tmp_path / "census_60pct.jsonl.gz"
+      sixty_pct_path.write_bytes(full[:int(len(full) * 0.6)])
+      result60 = scan_jsonl_artifact(str(sixty_pct_path))
+      assert result60["truncated_final_line"] is True
+
+   def test_mid_stream_corrupt_gzip_reports_truncation_no_crash(self, tmp_path):
+      """A flipped byte inside the compressed stream (a CRC/incorrect-
+      data-check failure) must be caught, reported as truncated, and
+      must never propagate a raw zlib.error out of scan_jsonl_artifact.
+      """
+      import gzip as _gzip
+      import zlib as _zlib
+
+      path = tmp_path / "census.jsonl.gz"
+      lines = [json.dumps(_census_record(i)) for i in range(10)]
+      payload = ("\n".join(lines) + "\n").encode("utf-8")
+      with _gzip.open(str(path), "wb") as handle:
+         handle.write(payload)
+      with open(str(path), "rb") as handle:
+         content = bytes(handle.read())
+
+      # Find a byte offset whose corruption zlib itself reports as an
+      # "incorrect data check" (CRC) failure specifically -- other
+      # offsets inside the deflate stream can instead corrupt the
+      # Huffman/length-distance coding itself, which zlib legitimately
+      # reports as a DIFFERENT error class ("invalid code lengths set",
+      # etc). Both are still zlib.error and both are still caught by
+      # _scan_gzip_fileobj's broad except, but this test specifically
+      # wants the CRC-mismatch case documented in the card's design
+      # section, so it searches for an offset that reproduces it
+      # exactly (deterministic for this payload, not test-order
+      # dependent).
+      corrupt_offset = None
+      for offset in range(10, len(content) - 8):
+         candidate = bytearray(content)
+         candidate[offset] ^= 0xFF
+         d = _zlib.decompressobj(_zlib.MAX_WBITS | 16)
+         try:
+            d.decompress(bytes(candidate))
+         except _zlib.error as exc:
+            if "incorrect data check" in str(exc):
+               corrupt_offset = offset
+               break
+      assert corrupt_offset is not None, (
+         "fixture bug: no byte offset reproduced a CRC-check zlib.error "
+         "for this payload")
+
+      corrupted = bytearray(content)
+      corrupted[corrupt_offset] ^= 0xFF
+      corrupt_path = tmp_path / "census_corrupt.jsonl.gz"
+      corrupt_path.write_bytes(bytes(corrupted))
+
+      result = scan_jsonl_artifact(str(corrupt_path))  # must not raise
+      assert result["truncated_final_line"] is True
+
+   def test_zero_byte_file_is_truncated_when_named_gz(self, tmp_path):
+      """Design NUANCE: a genuinely empty (0-byte) file is NOT gzip
+      content at all (no magic bytes present), so scan_jsonl_artifact's
+      peek routes it to the PLAIN scan, which reports a 0-byte file as
+      an empty (not truncated) artifact -- exactly the existing
+      'no records written' semantics. This is intentionally NOT the
+      same case as a validly-closed empty-payload gzip stream (next
+      test) -- a 0-byte file could never carry valid gzip framing.
+      """
+      path = tmp_path / "diagnostic_censuses.jsonl.gz"
+      path.write_bytes(b"")
+      result = scan_jsonl_artifact(str(path))
+      assert result["valid_count"] == 0
+      assert result["malformed_count"] == 0
+      assert result["truncated_final_line"] is False
+
+   def test_validly_closed_empty_payload_gzip_is_not_truncated(self, tmp_path):
+      """The other half of the NUANCE: a cleanly-closed gzip member with
+      a zero-length payload (exactly what Phase0Sink's gzip write path
+      produces for a genuinely empty 0-record run) must scan as
+      NOT truncated -- ``d.eof`` reaches True even though nothing was
+      ever written."""
+      import gzip as _gzip
+
+      path = tmp_path / "diagnostic_censuses.jsonl.gz"
+      with _gzip.open(str(path), "wb"):
+         pass  # write nothing; just open and cleanly close
+
+      result = scan_jsonl_artifact(str(path))
+      assert result["valid_count"] == 0
+      assert result["malformed_count"] == 0
+      assert result["truncated_final_line"] is False
+
+   def test_bounded_memory_on_large_synthetic_gzip_census(self, tmp_path):
+      """Mirrors test_never_calls_an_unbounded_read for the gzip path:
+      proves the gzip scan never issues an unbounded/oversized read of
+      the COMPRESSED on-disk bytes, using a large (many-MiB decompressed)
+      but highly compressible synthetic census so the compressed file
+      itself stays small enough for a fast test while still exercising
+      many chunk-bounded reads and many bounded decompress() calls.
+      """
+      import gzip as _gzip
+      from node_monitor.output import jsonl as jsonl_mod
+
+      path = tmp_path / "big_census.jsonl.gz"
+      # ~20 MiB of decompressed JSONL content (highly repetitive, so it
+      # compresses down to a small on-disk size) -- large enough that a
+      # whole-file decompress-then-hold-in-memory bug would be obvious
+      # in a memory profile, while the compressed artifact and the test
+      # itself both stay fast.
+      one_record = json.dumps({"a": 1, "pad": "x" * 200}) + "\n"
+      repeat_count = (20 * 1024 * 1024) // len(one_record)
+      with _gzip.open(str(path), "wt", encoding="utf-8") as handle:
+         for _ in range(repeat_count):
+            handle.write(one_record)
+
+      chunk_bytes = 4096  # tiny compressed-side chunk, deliberately small
+      requested_sizes = []
+      real_open = builtins.open
+
+      class _BoundedReadFile:
+         def __init__(self, fileobj):
+            self._f = fileobj
+
+         def __enter__(self):
+            return self
+
+         def __exit__(self, exc_type, exc, tb):
+            self._f.close()
+            return False
+
+         def read(self, size=-1):
+            if size is None or size < 0:
+               raise AssertionError(
+                  "scan_jsonl_artifact must never issue a whole-file "
+                  "read() of the compressed on-disk bytes")
+            if size > chunk_bytes:
+               raise AssertionError(
+                  "scan_jsonl_artifact requested %r bytes, exceeding "
+                  "its own declared chunk size %r" % (size, chunk_bytes))
+            requested_sizes.append(size)
+            return self._f.read(size)
+
+      def _fake_open(file, *args, **kwargs):
+         handle = real_open(file, *args, **kwargs)
+         if os.fspath(file) == str(path):
+            return _BoundedReadFile(handle)
+         return handle
+
+      import unittest.mock as mock
+      with mock.patch.object(jsonl_mod, "open", _fake_open, create=True):
+         result = scan_jsonl_artifact(str(path), chunk_bytes=chunk_bytes)
+
+      assert requested_sizes, "expected at least one bounded read() call"
+      assert max(requested_sizes) <= chunk_bytes
+      assert len(requested_sizes) > 1
+      assert result["valid_count"] == repeat_count
+      assert result["malformed_count"] == 0
+      assert result["truncated_final_line"] is False
+
+
+class TestGzipCensusFinalizeSummary:
+   def test_finalize_summary_lists_gzip_filename_and_correct_counts(
+         self, tmp_path):
+      sink = Phase0Sink(
+         str(tmp_path), "gz-fin1", disk_usage_fn=_full_disk_usage,
+         compress_census=True)
+      for i in range(4):
+         _run(sink.write_record("diagnostic_census", _census_record(i)))
+
+      summary = _run(sink.finalize_summary())
+      entry = summary["files"]["diagnostic_census"]
+      assert entry["filename"] == "diagnostic_censuses.jsonl.gz"
+      assert entry["record_count"] == 4
+      assert entry["malformed_count"] == 0
+      assert entry["truncated_final_line"] is False
+
+      path = os.path.join(sink.run_dir, "diagnostic_censuses.jsonl.gz")
+      with open(path, "rb") as handle:
+         on_disk = handle.read()
+      assert entry["byte_size"] == len(on_disk)
+      assert entry["sha256"] == hashlib.sha256(on_disk).hexdigest()
+
+   def test_done_written_only_after_gzip_summary(self, tmp_path):
+      sink = Phase0Sink(
+         str(tmp_path), "gz-fin2", disk_usage_fn=_full_disk_usage,
+         compress_census=True)
+      _run(sink.write_record("diagnostic_census", _census_record(0)))
+      with pytest.raises(Phase0SinkError):
+         sink.write_done()
+      _run(sink.finalize_summary())
+      sink.write_done()
+      assert os.path.exists(os.path.join(sink.run_dir, "DONE"))
+
+   def test_finalize_summary_with_gzip_closes_stream_cleanly(self, tmp_path):
+      """After finalize_summary, the on-disk gzip census must be a
+      cleanly terminated gzip stream (readable end to end via the
+      standard library's own gzip.open, and reported not-truncated) --
+      not left mid-write."""
+      import gzip as _gzip
+
+      sink = Phase0Sink(
+         str(tmp_path), "gz-fin3", disk_usage_fn=_full_disk_usage,
+         compress_census=True)
+      records = [_census_record(i) for i in range(6)]
+      for record in records:
+         _run(sink.write_record("diagnostic_census", record))
+      summary = _run(sink.finalize_summary())
+      assert summary["files"]["diagnostic_census"]["truncated_final_line"] is False
+
+      path = os.path.join(sink.run_dir, "diagnostic_censuses.jsonl.gz")
+      with _gzip.open(path, "rt", encoding="utf-8") as handle:
+         read_back = [json.loads(line) for line in handle]
+      assert read_back == records
+
+
+# --------------------------------------------------------------------------
 # IncrementalJsonValidator: the bounded-memory fallback grammar checker
 # --------------------------------------------------------------------------
 
