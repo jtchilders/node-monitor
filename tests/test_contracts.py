@@ -332,6 +332,83 @@ class TestDiagnosticCensus:
 
 
 # --------------------------------------------------------------------------
+# Kanban task C1: reversed privacy posture -- keep_raw_args=True lets
+# cmdline (only) survive validate_diagnostic_census; the other five
+# forbidden keys stay banned in every mode; default/no-arg calls are
+# unchanged (back-compat).
+# --------------------------------------------------------------------------
+
+class TestDiagnosticCensusKeepRawArgs:
+   def _record(self, **overrides):
+      base = {
+         "system": "polaris",
+         "source_hostname": "polaris-login-04.example.org",
+         "timestamp_utc": "2026-09-09T00:00:00Z",
+         "probe_version": 4,
+         "processes": [
+            {"pid": 42, "username": "jchilders", "category": "shell/session"},
+         ],
+         "cpu_deltas": {"deltas": [], "unmeasured": [], "anomalies": []},
+      }
+      base.update(overrides)
+      return base
+
+   def test_cmdline_accepted_when_keep_raw_args_true(self):
+      record = self._record(processes=[
+         {"pid": 1, "username": "u", "category": "other",
+          "cmdline": "/usr/bin/python3 --secret-token abc123"},
+      ])
+      assert validate_diagnostic_census(record, keep_raw_args=True) == record
+
+   def test_cmdline_still_rejected_when_keep_raw_args_false(self):
+      record = self._record(processes=[
+         {"pid": 1, "username": "u", "category": "other",
+          "cmdline": "/usr/bin/python3 --secret-token abc123"},
+      ])
+      with pytest.raises(ContractError, match="cmdline"):
+         validate_diagnostic_census(record, keep_raw_args=False)
+
+   def test_cmdline_rejected_by_default_no_arg_call(self):
+      record = self._record(processes=[
+         {"pid": 1, "username": "u", "category": "other",
+          "cmdline": "/usr/bin/python3 --secret-token abc123"},
+      ])
+      with pytest.raises(ContractError, match="cmdline"):
+         validate_diagnostic_census(record)
+
+   def test_environ_still_rejected_even_when_keep_raw_args_true(self):
+      record = self._record(processes=[
+         {"pid": 1, "username": "u", "category": "other",
+          "cmdline": "/usr/bin/python3", "environ": {"SECRET": "x"}},
+      ])
+      with pytest.raises(ContractError, match="argv"):
+         validate_diagnostic_census(record, keep_raw_args=True)
+
+   def test_argv_still_rejected_even_when_keep_raw_args_true(self):
+      record = self._record(processes=[
+         {"pid": 1, "username": "u", "category": "other", "argv": ["a"]},
+      ])
+      with pytest.raises(ContractError, match="argv"):
+         validate_diagnostic_census(record, keep_raw_args=True)
+
+   def test_validate_record_threads_keep_raw_args_to_census_only(self):
+      record = self._record(processes=[
+         {"pid": 1, "username": "u", "category": "other",
+          "cmdline": "/usr/bin/python3"},
+      ])
+      assert validate_record(
+         "diagnostic_census", record, keep_raw_args=True) == record
+      with pytest.raises(ContractError, match="cmdline"):
+         validate_record("diagnostic_census", record, keep_raw_args=False)
+      with pytest.raises(ContractError, match="cmdline"):
+         validate_record("diagnostic_census", record)
+
+   def test_validate_record_no_keep_raw_args_arg_back_compat(self):
+      record = self._record()
+      assert validate_record("diagnostic_census", record) == record
+
+
+# --------------------------------------------------------------------------
 # Review round 1 regression: the raw-argv ban must be recursive across
 # EVERY record type and EVERY nesting level, not just diagnostic_census's
 # top level and immediate processes[] rows. detail/audit/end_of_window/

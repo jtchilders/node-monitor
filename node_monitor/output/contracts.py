@@ -41,12 +41,16 @@ def _check_type(record, key, expected_types, what):
             what, key, expected_types, type(value).__name__))
 
 
-def _validate_schema(record, required_keys, nullable_keys, what):
+def _validate_schema(record, required_keys, nullable_keys, what, allow_cmdline=False):
    """Shared unknown/missing-key enforcement for every record type.
 
    ``required_keys``: must be present (value may still be None if the
    key is also in ``nullable_keys``).
    ``nullable_keys``: subset of required_keys allowed to hold None.
+   ``allow_cmdline``: when True, ``cmdline`` is exempted from the
+   forbidden-argv-key ban for this one call (reversed privacy posture,
+   Kanban task C1); every other forbidden key stays banned. Only the
+   ``diagnostic_census`` validator ever passes True here.
 
    Also enforces the global "raw argv/environment never persists"
    invariant (design: "Raw argv, environment, file descriptors, and
@@ -73,7 +77,7 @@ def _validate_schema(record, required_keys, nullable_keys, what):
       if record[key] is None and key not in nullable_keys:
          raise ContractError(
             "%s record field %r may not be null" % (what, key))
-   _reject_forbidden_argv_keys(record, "%s record" % what)
+   _reject_forbidden_argv_keys(record, "%s record" % what, allow_cmdline=allow_cmdline)
 
 
 # --------------------------------------------------------------------------
@@ -331,10 +335,17 @@ _FORBIDDEN_ARGV_KEYS = frozenset((
 ))
 
 
-def _reject_forbidden_argv_keys(value, where):
+def _reject_forbidden_argv_keys(value, where, allow_cmdline=False):
    """Recursively scan ``value`` for any forbidden raw-argv/environment
    key, at any nesting depth, through dicts and every JSON-serializable
    sequence container alike.
+
+   ``allow_cmdline``: when True, ``cmdline`` is removed from the
+   effective forbidden set for THIS scan only (reversed privacy posture,
+   Kanban task C1 -- ``diagnostic_census`` writes it verbatim when
+   ``keep_raw_args=True``); the other five keys stay banned regardless.
+   The module-level ``_FORBIDDEN_ARGV_KEYS`` frozenset itself is never
+   mutated -- a per-call effective set is computed instead.
 
    Review round 1 finding: the original version only checked the
    diagnostic_census record root and its immediate ``processes[]`` rows.
@@ -354,21 +365,23 @@ def _reject_forbidden_argv_keys(value, where):
    here. Every sequence type accepted by the stdlib JSON encoder -- at
    minimum list and tuple -- must be traversed the same way.
    """
+   forbidden = _FORBIDDEN_ARGV_KEYS - {"cmdline"} if allow_cmdline else _FORBIDDEN_ARGV_KEYS
    if isinstance(value, dict):
-      present = _FORBIDDEN_ARGV_KEYS & set(value)
+      present = forbidden & set(value)
       if present:
          raise ContractError(
             "%s carries forbidden raw-argv key(s): %s"
             % (where, ", ".join(sorted(present))))
       for key, nested in value.items():
-         _reject_forbidden_argv_keys(nested, "%s.%s" % (where, key))
+         _reject_forbidden_argv_keys(nested, "%s.%s" % (where, key), allow_cmdline=allow_cmdline)
    elif isinstance(value, (list, tuple)):
       for index, item in enumerate(value):
-         _reject_forbidden_argv_keys(item, "%s[%d]" % (where, index))
+         _reject_forbidden_argv_keys(item, "%s[%d]" % (where, index), allow_cmdline=allow_cmdline)
 
 
-def validate_diagnostic_census(record):
-   _validate_schema(record, _CENSUS_REQUIRED, _CENSUS_NULLABLE, "diagnostic_census")
+def validate_diagnostic_census(record, keep_raw_args=False):
+   _validate_schema(record, _CENSUS_REQUIRED, _CENSUS_NULLABLE, "diagnostic_census",
+      allow_cmdline=keep_raw_args)
    for key, types in _CENSUS_TYPES.items():
       _check_type(record, key, types, "diagnostic_census")
    return record
@@ -388,16 +401,23 @@ _VALIDATORS = {
 }
 
 
-def validate_record(record_type, record):
+def validate_record(record_type, record, keep_raw_args=False):
    """Validate ``record`` against the schema named by ``record_type``.
 
    Raises ``ContractError`` for an unrecognized ``record_type`` itself,
    not just for a malformed record -- a caller passing a typo'd type
    string should fail loudly rather than silently skip validation.
+
+   ``keep_raw_args`` is threaded through to the ``diagnostic_census``
+   validator only (reversed privacy posture, Kanban task C1); every
+   other record type ignores it and keeps the full argv ban -- they
+   never legitimately carry ``cmdline``.
    """
    validator = _VALIDATORS.get(record_type)
    if validator is None:
       raise ContractError(
          "unknown record_type %r; must be one of %s"
          % (record_type, sorted(_VALIDATORS)))
+   if record_type == "diagnostic_census":
+      return validator(record, keep_raw_args=keep_raw_args)
    return validator(record)

@@ -944,7 +944,7 @@ class Daemon:
          cpu_deltas = compute_cpu_delta(previous_payload, payload)
       census_record = build_diagnostic_census(
          self._config.system, payload.get("hostname_fqdn"), payload,
-         cpu_deltas=cpu_deltas)
+         cpu_deltas=cpu_deltas, keep_raw_args=self._config.keep_raw_args)
       await self._sink.write_record("diagnostic_census", census_record)
 
       observations = build_usage_observations(payload, previous_payload)

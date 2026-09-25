@@ -656,7 +656,7 @@ class Phase0Sink:
                 flush_interval_sec=_DEFAULT_FLUSH_INTERVAL_SEC,
                 min_free_disk_pct=_DEFAULT_MIN_FREE_DISK_PCT,
                 clock=time.monotonic, disk_usage_fn=shutil.disk_usage,
-                compress_census=False):
+                compress_census=False, keep_raw_args=False):
       self.output_root = output_root
       self.run_id = run_id
       self.run_dir = os.path.join(output_root, "phase0-%s" % run_id)
@@ -664,6 +664,10 @@ class Phase0Sink:
       self._min_free_disk_pct = min_free_disk_pct
       self._clock = clock
       self._disk_usage_fn = disk_usage_fn
+      # Kanban task C1: reversed privacy posture -- threaded into
+      # validate_record() for diagnostic_census writes only (see
+      # write_record below); every other record type ignores it.
+      self._keep_raw_args = keep_raw_args
       # Kanban task B7: opt-in gzip compression for the diagnostic_census
       # artifact only -- see _filenames_for()'s own docstring. Resolved
       # ONCE at construction into self._filenames so every other method
@@ -779,7 +783,7 @@ class Phase0Sink:
       if record_type not in _FILENAMES:
          raise Phase0SinkError("unknown record_type %r" % (record_type,))
 
-      validated = validate_record(record_type, record)
+      validated = validate_record(record_type, record, keep_raw_args=self._keep_raw_args)
       # No `await` between validation and serialization: this line and
       # the one above run atomically with respect to every other
       # coroutine on this event loop, so `record` cannot be mutated in
