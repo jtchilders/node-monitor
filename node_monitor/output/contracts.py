@@ -381,7 +381,7 @@ def _reject_forbidden_argv_keys(value, where, allow_cmdline=False):
 
 def validate_diagnostic_census(record, keep_raw_args=False):
    _validate_schema(record, _CENSUS_REQUIRED, _CENSUS_NULLABLE, "diagnostic_census",
-                     allow_cmdline=keep_raw_args)
+      allow_cmdline=keep_raw_args)
    for key, types in _CENSUS_TYPES.items():
       _check_type(record, key, types, "diagnostic_census")
    return record

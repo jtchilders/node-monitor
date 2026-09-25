@@ -1683,7 +1683,7 @@ class TestRawArgvNeverPersistedEndToEnd:
       output_root = os.path.join(str(tmp_path), "phase0-runs")
       sink = Phase0Sink(
          output_root, "daemon-run-argv-1", metadata={"system": config.system},
-         disk_usage_fn=_full_disk_usage)
+         disk_usage_fn=_full_disk_usage, keep_raw_args=config.keep_raw_args)
       clock = FakeClock()
 
       async def transport_fn(node, loop):
@@ -1713,6 +1713,50 @@ class TestRawArgvNeverPersistedEndToEnd:
          raw_bytes = handle.read()
       assert b"secret-token" not in raw_bytes
       assert b"cmdline" not in raw_bytes
+
+   def test_daemon_persists_cmdline_when_keep_raw_args_true(self, tmp_path):
+      # Positive-path mirror of the test above (Kanban task C1 review
+      # fixup, item I2): drives the SAME full Daemon orchestration ->
+      # build_diagnostic_census -> Phase0Sink.write_record -> disk path,
+      # but with keep_raw_args=True threaded end to end, proving cmdline
+      # survives the real seam rather than just the sink or sanitizer in
+      # isolation. The still-banned keys (environ, argv) must remain
+      # absent regardless.
+      config = _config(tmp_path, duration_sec=5, keep_raw_args=True)
+      output_root = os.path.join(str(tmp_path), "phase0-runs")
+      sink = Phase0Sink(
+         output_root, "daemon-run-argv-2", metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage, keep_raw_args=config.keep_raw_args)
+      clock = FakeClock()
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         if loop == "census":
+            payload = _census_payload(uptime_sec=1.0)
+            payload["processes"][0]["cmdline"] = (
+               "/usr/bin/python3 --secret-token abc123")
+            return payload
+         return _counter_payload(uptime_sec=1.0)
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_OK
+      census_path = os.path.join(sink.run_dir, "diagnostic_censuses.jsonl")
+      assert os.path.exists(census_path)
+      with open(census_path, "rb") as handle:
+         raw_bytes = handle.read()
+      assert b"secret-token" in raw_bytes
+      assert b"environ" not in raw_bytes
+      assert b"argv" not in raw_bytes
 
 
 # --------------------------------------------------------------------------

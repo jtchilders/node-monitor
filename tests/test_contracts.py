@@ -365,7 +365,7 @@ class TestDiagnosticCensusKeepRawArgs:
          {"pid": 1, "username": "u", "category": "other",
           "cmdline": "/usr/bin/python3 --secret-token abc123"},
       ])
-      with pytest.raises(ContractError, match="argv"):
+      with pytest.raises(ContractError, match="cmdline"):
          validate_diagnostic_census(record, keep_raw_args=False)
 
    def test_cmdline_rejected_by_default_no_arg_call(self):
@@ -373,7 +373,7 @@ class TestDiagnosticCensusKeepRawArgs:
          {"pid": 1, "username": "u", "category": "other",
           "cmdline": "/usr/bin/python3 --secret-token abc123"},
       ])
-      with pytest.raises(ContractError, match="argv"):
+      with pytest.raises(ContractError, match="cmdline"):
          validate_diagnostic_census(record)
 
    def test_environ_still_rejected_even_when_keep_raw_args_true(self):
@@ -398,9 +398,9 @@ class TestDiagnosticCensusKeepRawArgs:
       ])
       assert validate_record(
          "diagnostic_census", record, keep_raw_args=True) == record
-      with pytest.raises(ContractError, match="argv"):
+      with pytest.raises(ContractError, match="cmdline"):
          validate_record("diagnostic_census", record, keep_raw_args=False)
-      with pytest.raises(ContractError, match="argv"):
+      with pytest.raises(ContractError, match="cmdline"):
          validate_record("diagnostic_census", record)
 
    def test_validate_record_no_keep_raw_args_arg_back_compat(self):
