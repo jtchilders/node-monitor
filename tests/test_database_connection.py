@@ -54,7 +54,9 @@ class TestEngineConstruction:
       config = _database_config()
       with mock.patch(
          "node_monitor.database.connection.create_engine"
-      ) as mock_create_engine:
+      ) as mock_create_engine, mock.patch(
+         "node_monitor.database.connection.event"
+      ):
          mock_create_engine.return_value = mock.Mock()
          NodeMonitorDB(config)
       assert mock_create_engine.call_count == 1
@@ -72,7 +74,9 @@ class TestEngineConstruction:
       config = _database_config()
       with mock.patch(
          "node_monitor.database.connection.create_engine"
-      ) as mock_create_engine:
+      ) as mock_create_engine, mock.patch(
+         "node_monitor.database.connection.event"
+      ):
          mock_create_engine.return_value = mock.Mock()
          NodeMonitorDB(config)
       _, kwargs = mock_create_engine.call_args
@@ -145,12 +149,14 @@ class TestSearchPathListener:
 class TestPing:
    def test_ping_success_returns_true(self):
       config = _database_config()
-      mock_engine = mock.Mock()
+      mock_engine = mock.MagicMock()
       mock_connection = mock.MagicMock()
       mock_engine.connect.return_value.__enter__.return_value = mock_connection
       with mock.patch(
          "node_monitor.database.connection.create_engine",
          return_value=mock_engine,
+      ), mock.patch(
+         "node_monitor.database.connection.event"
       ):
          db = NodeMonitorDB(config)
       assert db.ping() is True
@@ -165,6 +171,8 @@ class TestPing:
       with mock.patch(
          "node_monitor.database.connection.create_engine",
          return_value=mock_engine,
+      ), mock.patch(
+         "node_monitor.database.connection.event"
       ):
          db = NodeMonitorDB(config)
       assert db.ping() is False
@@ -181,6 +189,8 @@ class TestClose:
       with mock.patch(
          "node_monitor.database.connection.create_engine",
          return_value=mock_engine,
+      ), mock.patch(
+         "node_monitor.database.connection.event"
       ):
          db = NodeMonitorDB(config)
       db.close()
