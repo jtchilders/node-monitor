@@ -1,0 +1,125 @@
+# Phase 1 (nested) node-monitor configuration example.
+#
+# Copy to config.yaml (or one of the discovered paths -- see
+# node_monitor.config.discover_config_path) and edit. This file is
+# illustrative and intentionally contains no site-specific detail or
+# credentials: the strict nested loader rejects any unknown key, at any
+# level, and NO password belongs in this file -- inject the real
+# connection string via NODE_MONITOR_DB_URL in the deployment environment,
+# or in an untracked, permission-restricted config.yaml that is never
+# committed (config.yaml is gitignored; this file is the checked-in
+# template).
+#
+# Loaded through node_monitor.config.load_nested_config /
+# load_any_config -- NEVER wrapped in a Phase0Config; this is the
+# complete, independent Phase 1 shape (design:
+# "Tiered Storage, PostgreSQL, and Retention Design", "Configuration
+# contract").
+
+system: polaris
+
+nodes:
+  - hostname: polaris-login-04.hsn.cm.polaris.alcf.anl.gov
+    role: local
+  - hostname: polaris-login-01.hsn.cm.polaris.alcf.anl.gov
+    role: remote
+    # Polaris-only SSH fan-out alias -- see config.example.yaml's own
+    # comment on ssh_target for the full "transport identifier, never
+    # provenance" rationale. Omit ssh_target on systems that don't need
+    # it (e.g. Aurora); the daemon then dials `hostname` directly.
+    ssh_target: polaris-login-01.head
+
+# Explicit, versioned probe interpreter -- never a bare "python3".
+probe_python: /usr/bin/python3.11
+
+# --- output: where Phase 0 JSONL run artifacts land. ---
+output:
+  root: ~/phase0-runs
+  compress_census: false
+
+# --- collection: polling cadence and duration. ---
+collection:
+  counter_interval_sec: 10
+  census_interval_sec: 60
+  counter_rollup_interval_sec: 60
+  usage_interval_sec: 900
+  duration_sec: 86400
+  keep_raw_args: true
+
+# --- ssh: remote-poll transport timeouts and fan-out width. ---
+ssh:
+  connect_timeout_sec: 8
+  counter_timeout_sec: 15
+  census_timeout_sec: 20
+  max_parallel_polls: 4
+
+# --- safety: output filesystem free-space floor. ---
+safety:
+  min_free_disk_pct: 10
+
+# --- database: PostgreSQL connection only. Field names deliberately
+# --- mirror pbs-monitor's own YAML vocabulary (url, schema, pool_size,
+# --- max_overflow, echo_sql) where compatible.
+#
+# `schema` MUST be exactly "node_monitor" -- "public" and every other
+# schema name fail validation; the PostgreSQL server may be shared with
+# pbs-monitor and node-monitor must never touch pbs-monitor's own tables.
+#
+# `max_overflow` MUST be exactly 0: node-monitor is a single writer, so
+# unlike pbs-monitor's own default of 10 (which would allow eleven total
+# connections), node-monitor never opens a connection beyond its fixed
+# `pool_size`.
+#
+# `url` is validated PostgreSQL-only (postgresql:// or
+# postgresql+<driver>://) and is NEVER printed in full by `config check`,
+# logs, or a dataclass repr -- only a masked form
+# (`sqlalchemy.engine.make_url(...).render_as_string(hide_password=True)`).
+# Do not put a real password in a committed copy of this file; prefer
+# NODE_MONITOR_DB_URL in the actual deployment environment.
+database:
+  url: postgresql://localhost/pbs_monitor_dev
+  schema: node_monitor
+  pool_size: 1
+  max_overflow: 0
+  echo_sql: false
+  pool_pre_ping: true
+  pool_timeout_sec: 10
+  pool_recycle_sec: 3600
+  connect_args:
+    connect_timeout: 10
+    keepalives: 1
+    keepalives_idle: 30
+    keepalives_interval: 10
+    keepalives_count: 3
+    options: "-c statement_timeout=15000 -c lock_timeout=5000"
+
+# --- retention: horizons are approximate MINIMUM ages, not exact
+# --- expiration instants. One housekeeping pass runs at a fixed UTC time
+# --- each day and removes only data that has crossed its configured
+# --- horizon by then -- e.g. a 7-day horizon retains data for
+# --- approximately 7 to 8 days depending on when a record was created
+# --- relative to the daily pass. `0` means retain indefinitely.
+#
+# Deletion defaults OFF (`enabled: false`) and, even once enabled, starts
+# in `dry_run: true` -- this increment does not implement the retention
+# engine at all; these are the safe, inert Phase 1 defaults for a section
+# that exists in the schema but is not yet wired to anything that deletes
+# data.
+retention:
+  enabled: false
+  dry_run: true
+  diagnostic_census_days: 7
+  counter_diagnostics_days: 7
+  counter_minute_days: 30
+  usage_intervals_days: 180
+  usage_hourly_days: 730
+  counter_hourly_days: 730
+  daily_days: 0
+  poll_failures_days: 90
+  poll_failures_daily_days: 730
+  collection_log_days: 90
+  delete_batch_rows: 50000
+  max_batches_per_run: 20
+  lag_alert_after_runs: 3
+  housekeeping_utc: "04:00"
+  require_complete_rollup: true

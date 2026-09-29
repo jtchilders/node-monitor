@@ -674,3 +674,53 @@ class TestLoadConfigFileAny:
       cfg = load_config_file_any(str(path), home=str(tmp_path))
       assert isinstance(cfg, NodeMonitorConfig)
 
+
+
+# ==========================================================================
+# Task 3: complete nested example config.example.phase1.yaml
+# ==========================================================================
+
+class TestExamplePhase1Config:
+   def test_example_loads_under_strict_nested_schema(self):
+      path = os.path.join(_REPO_ROOT, "config.example.phase1.yaml")
+      with open(path, "r") as handle:
+         raw = yaml.safe_load(handle)
+      cfg = load_nested_config(
+         raw, home="/home/example-user",
+         database_url_env="postgresql://localhost/pbs_monitor_dev")
+      assert isinstance(cfg, NodeMonitorConfig)
+      assert cfg.output is not None
+      assert cfg.collection is not None
+      assert cfg.ssh is not None
+      assert cfg.safety is not None
+      assert cfg.database is not None
+      assert cfg.retention is not None
+
+   def test_example_retention_defaults_are_safe(self):
+      path = os.path.join(_REPO_ROOT, "config.example.phase1.yaml")
+      with open(path, "r") as handle:
+         raw = yaml.safe_load(handle)
+      cfg = load_nested_config(
+         raw, home="/home/example-user",
+         database_url_env="postgresql://localhost/pbs_monitor_dev")
+      assert cfg.retention.enabled is False
+      assert cfg.retention.dry_run is True
+
+   def test_example_database_schema_and_overflow(self):
+      path = os.path.join(_REPO_ROOT, "config.example.phase1.yaml")
+      with open(path, "r") as handle:
+         raw = yaml.safe_load(handle)
+      cfg = load_nested_config(
+         raw, home="/home/example-user",
+         database_url_env="postgresql://localhost/pbs_monitor_dev")
+      assert cfg.database.schema == "node_monitor"
+      assert cfg.database.max_overflow == 0
+
+   def test_example_housekeeping_utc(self):
+      path = os.path.join(_REPO_ROOT, "config.example.phase1.yaml")
+      with open(path, "r") as handle:
+         raw = yaml.safe_load(handle)
+      cfg = load_nested_config(
+         raw, home="/home/example-user",
+         database_url_env="postgresql://localhost/pbs_monitor_dev")
+      assert cfg.retention.housekeeping_utc == "04:00"
