@@ -23,6 +23,7 @@ import os
 import re
 import typing
 import warnings
+from urllib.parse import urlsplit
 
 import yaml
 from sqlalchemy.engine import make_url
@@ -619,8 +620,15 @@ def _validate_database_url(value):
       raise ConfigError(
          "database.url must be a non-empty PostgreSQL URL")
    try:
+      # ``make_url`` does not reject every malformed authority eagerly
+      # (notably unmatched IPv6 brackets), while malformed ports can escape
+      # from it as ``ValueError`` rather than ``ArgumentError``. Parse the
+      # authority independently and force port validation so every malformed
+      # form is converted at this trust boundary.
+      split = urlsplit(value)
+      split.port
       url = make_url(value)
-   except ArgumentError:
+   except (ArgumentError, ValueError):
       raise ConfigError("database.url is not a valid URL")
    backend = url.get_backend_name()
    if backend != "postgresql":

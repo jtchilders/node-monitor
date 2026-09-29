@@ -347,6 +347,18 @@ class TestDatabaseUrl:
       with pytest.raises(ConfigError):
          load_nested_config(raw, home=HOME)
 
+   @pytest.mark.parametrize("url", [
+      "postgresql://user@host:INVALID_PORT_TOKEN/db",
+      "postgresql://user@[INVALID_BRACKET_TOKEN/db",
+   ])
+   def test_malformed_authorities_raise_non_reflecting_config_error(self, url):
+      raw = _base_nested()
+      raw["database"] = dict(raw["database"])
+      raw["database"]["url"] = url
+      with pytest.raises(ConfigError) as raised:
+         load_nested_config(raw, home=HOME)
+      assert "INVALID_" not in str(raised.value)
+
 
 # --------------------------------------------------------------------------
 # Task 1, requirement 9: pool_size positive; max_overflow exactly zero.

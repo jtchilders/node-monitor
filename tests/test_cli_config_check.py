@@ -282,6 +282,26 @@ class TestFailureModes:
       assert "INVALID_DB_PASSWORD_TOKEN" not in result.output
       assert "INVALID_DB_PASSWORD_TOKEN" not in result.stderr
 
+   @pytest.mark.parametrize("url", [
+      "postgresql://user@host:INVALID_PORT_TOKEN/db",
+      "postgresql://user@[INVALID_BRACKET_TOKEN/db",
+   ])
+   def test_malformed_postgresql_authority_is_safely_rejected(
+         self, tmp_path, url):
+      home_dir = tmp_path / "home"
+      home_dir.mkdir()
+      (home_dir / "phase0-runs").mkdir()
+      raw = _nested_config()
+      raw["database"]["url"] = url
+      config_path = _write_yaml(tmp_path / "config.yaml", raw)
+      result = _invoke(
+         ["config", "check", "--config", config_path, "--home", str(home_dir)])
+      assert result.exit_code != 0
+      assert "INVALID_" not in result.output
+      assert "INVALID_" not in result.stderr
+      assert "Traceback" not in result.output
+      assert not isinstance(result.exception, ValueError)
+
    def test_invalid_schema_fails_nonzero(self, tmp_path):
       home_dir = tmp_path / "home"
       home_dir.mkdir()
