@@ -50,6 +50,7 @@ bounded-duration variant of the same run, not a different code path.
 
 import asyncio
 import os
+import re
 import subprocess
 import sys
 
@@ -57,8 +58,16 @@ import click
 import yaml
 
 from node_monitor.collector import transport
-from node_monitor.config import ConfigError, load_config
+from node_monitor.config import (
+   ConfigError,
+   NodeMonitorConfig,
+   Phase0Config,
+   discover_config_path,
+   load_config,
+   load_config_file_any,
+)
 from node_monitor.daemon import EXIT_OK, Daemon
+from node_monitor.database.connection import NodeMonitorDB
 from node_monitor.output.jsonl import (
    Phase0Sink,
    Phase0SinkDiskFullError,
@@ -100,6 +109,24 @@ def _exit(code, message=None, err=False):
    if message is not None:
       click.echo(message, err=err)
    sys.exit(code)
+
+
+# ``config check`` validates a candidate ``database.url``/
+# ``NODE_MONITOR_DB_URL`` BEFORE any masking exists to render it safely
+# (``NodeMonitorDB.mask_url`` only applies to an already-accepted URL) --
+# a rejected URL's own ``ConfigError`` message therefore embeds the raw,
+# credential-bearing value verbatim (e.g. "database.url must be
+# PostgreSQL-only, got backend 'sqlite' ('sqlite://user:PASSWORD@host/db')").
+# This regex redacts the password segment of any embedded
+# ``scheme://user:password@`` URL in a diagnostic string before it is ever
+# echoed, so a config/env validation failure can never leak the very
+# credential ``config check`` exists to keep off stdout/stderr.
+_URL_PASSWORD_RE = re.compile(
+   r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/@\s'\"]+):([^@/\s'\"]+)@")
+
+
+def _sanitize_config_error(exc):
+   return _URL_PASSWORD_RE.sub(r"\1:***@", str(exc))
 
 
 def _load_config_or_exit(config_path, home):
@@ -348,6 +375,103 @@ def daemon_smoke(config_path, home, run_id, duration_sec):
       run_id = _default_run_id()
    exit_code = _run_daemon(config, config_path, run_id, probe_version)
    sys.exit(exit_code)
+
+
+@cli.group()
+def config():
+   """Inspect and validate node-monitor configuration."""
+
+
+@config.command("check")
+@click.option("--config", "config_path", default=None,
+              type=click.Path(dir_okay=False),
+              help="Explicit path to the config file. When omitted, "
+                   "discovered pbs-monitor-style (--home dotfile, "
+                   "--home XDG path, --etc-path, then --cwd).")
+@click.option("--home", "home", default=None,
+              help="Override $HOME for discovery/output_root resolution "
+                   "(internal/test use; defaults to the real $HOME).")
+@click.option("--cwd", "cwd", default=None,
+              help="Override the current working directory for config "
+                   "discovery (internal/test use; defaults to the real cwd).")
+@click.option("--etc-path", "etc_path", default=None,
+              help="Override the system config path checked during "
+                   "discovery (internal/test use; defaults to "
+                   "/etc/node_monitor/config.yaml).")
+def config_check(config_path, home, cwd, etc_path):
+   """Validate the selected configuration and print a sanitized summary.
+
+   Never constructs a database engine or probes connectivity -- only
+   ``NodeMonitorDB.mask_url`` renders the database URL. Reads
+   ``NODE_MONITOR_DB_URL`` from the real environment exactly once, and
+   only as a fallback when the config file supplies no explicit
+   ``database.url``; an explicit file URL always wins.
+   """
+   home = home if home is not None else os.path.expanduser("~")
+   cwd = cwd if cwd is not None else os.getcwd()
+   etc_kwargs = {}
+   if etc_path is not None:
+      etc_kwargs["etc_path"] = etc_path
+
+   try:
+      resolved_path = discover_config_path(
+         explicit_path=config_path, home=home, cwd=cwd, **etc_kwargs)
+   except ConfigError as exc:
+      _exit(1, "invalid configuration: %s" % (_sanitize_config_error(exc),),
+            err=True)
+      return  # pragma: no cover -- _exit always raises SystemExit
+
+   database_url_env = os.environ.get("NODE_MONITOR_DB_URL")
+
+   try:
+      loaded = load_config_file_any(
+         resolved_path, home=home, database_url_env=database_url_env)
+   except ConfigError as exc:
+      _exit(1, "invalid configuration: %s" % (_sanitize_config_error(exc),),
+            err=True)
+      return  # pragma: no cover
+   except yaml.YAMLError as exc:
+      _exit(1, "config file is not valid YAML: %s" % (exc,), err=True)
+      return  # pragma: no cover
+
+   click.echo("config: %s" % resolved_path)
+   if isinstance(loaded, Phase0Config):
+      click.echo("layout: legacy-flat")
+      click.echo(
+         "warning: flat Phase-0 configuration is deprecated; migrate to "
+         "the nested output/collection/ssh/safety/database/retention "
+         "sections")
+      click.echo("system: %s" % loaded.system)
+      click.echo(
+         "nodes: %s" % ", ".join(node.hostname for node in loaded.nodes))
+      return
+
+   assert isinstance(loaded, NodeMonitorConfig)  # dispatch guarantee
+   click.echo("layout: nested")
+   click.echo("system: %s" % loaded.system)
+   click.echo("nodes: %d" % len(loaded.nodes))
+   click.echo("database_url: %s" % NodeMonitorDB.mask_url(loaded.database.url))
+   click.echo("schema: %s" % loaded.database.schema)
+   click.echo("pool_size: %s" % loaded.database.pool_size)
+   click.echo("max_overflow: %s" % loaded.database.max_overflow)
+   click.echo("retention_enabled: %s" % loaded.retention.enabled)
+   click.echo("retention_dry_run: %s" % loaded.retention.dry_run)
+   click.echo("housekeeping_utc: %s" % loaded.retention.housekeeping_utc)
+   click.echo(
+      "retention_horizons_days: diagnostic_census=%s "
+      "counter_diagnostics=%s counter_minute=%s usage_intervals=%s "
+      "usage_hourly=%s counter_hourly=%s daily=%s poll_failures=%s "
+      "poll_failures_daily=%s collection_log=%s"
+      % (loaded.retention.diagnostic_census_days,
+         loaded.retention.counter_diagnostics_days,
+         loaded.retention.counter_minute_days,
+         loaded.retention.usage_intervals_days,
+         loaded.retention.usage_hourly_days,
+         loaded.retention.counter_hourly_days,
+         loaded.retention.daily_days,
+         loaded.retention.poll_failures_days,
+         loaded.retention.poll_failures_daily_days,
+         loaded.retention.collection_log_days))
 
 
 @cli.command("validate-run")
