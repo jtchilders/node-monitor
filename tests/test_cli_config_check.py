@@ -259,7 +259,28 @@ class TestFailureModes:
       assert result.exit_code != 0
       assert sentinel not in result.output
       assert sentinel not in result.stderr
-      assert "***" in result.output
+      # Invalid URLs are omitted from diagnostics entirely rather than
+      # relying on best-effort masking of malformed authority syntax.
+      assert bad_env_url not in result.output
+
+   @pytest.mark.parametrize("authority", [
+      "INVALID_DB_PASSWORD_TOKEN@host",
+      ":INVALID_DB_PASSWORD_TOKEN@host",
+   ])
+   def test_invalid_env_url_never_echoes_password_without_username(
+         self, tmp_path, authority):
+      home_dir = tmp_path / "home"
+      home_dir.mkdir()
+      (home_dir / "phase0-runs").mkdir()
+      raw = _nested_config()
+      del raw["database"]["url"]
+      config_path = _write_yaml(tmp_path / "config.yaml", raw)
+      result = _invoke(
+         ["config", "check", "--config", config_path, "--home", str(home_dir)],
+         env={"NODE_MONITOR_DB_URL": "sqlite://%s/db" % authority})
+      assert result.exit_code != 0
+      assert "INVALID_DB_PASSWORD_TOKEN" not in result.output
+      assert "INVALID_DB_PASSWORD_TOKEN" not in result.stderr
 
    def test_invalid_schema_fails_nonzero(self, tmp_path):
       home_dir = tmp_path / "home"

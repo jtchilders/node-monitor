@@ -617,16 +617,15 @@ _DATABASE_CONNECT_ARGS_ALLOWED_KEYS = (
 def _validate_database_url(value):
    if not isinstance(value, str) or not value:
       raise ConfigError(
-         "database.url must be a non-empty PostgreSQL URL, got %r" % (value,))
+         "database.url must be a non-empty PostgreSQL URL")
    try:
       url = make_url(value)
    except ArgumentError:
-      raise ConfigError("database.url is not a valid URL: %r" % (value,))
+      raise ConfigError("database.url is not a valid URL")
    backend = url.get_backend_name()
    if backend != "postgresql":
       raise ConfigError(
-         "database.url must be PostgreSQL-only, got backend %r (%r)"
-         % (backend, value))
+         "database.url must be PostgreSQL-only, got backend %r" % (backend,))
    return value
 
 
