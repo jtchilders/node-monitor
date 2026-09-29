@@ -18,11 +18,14 @@ it mid-run.
 """
 
 import dataclasses
+import math
 import os
 import re
 import typing
 
 import yaml
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 
 class ConfigError(Exception):
@@ -367,3 +370,476 @@ def load_config_file(path, home=None):
    if raw is None:
       raise ConfigError("config file %r is empty" % (path,))
    return load_config(raw, home=home)
+
+
+# ==========================================================================
+# Phase 1: strict nested configuration.
+#
+# Design: node_monitor_planning "Tiered Storage, PostgreSQL, and Retention
+# Design" -- "Configuration contract". Plan: "Increment 1: Nested
+# Configuration and PostgreSQL Connection Foundation".
+#
+# This nested loader is entirely independent of Phase0Config/load_config
+# above: it owns its own top-level identity fields (``system``, ``nodes``,
+# ``probe_python``) plus six named sections (``output``, ``collection``,
+# ``ssh``, ``safety``, ``database``, ``retention``) directly -- it never
+# wraps or forwards to a Phase0Config. ``load_any_config``/
+# ``load_config_file_any`` dispatch between the two layouts and reject a
+# config file that mixes both representations of any migrated setting.
+# ==========================================================================
+
+
+def _validate_bool(value, key):
+   if not isinstance(value, bool):
+      raise ConfigError("%s must be a bool, got %r" % (key, value))
+   return value
+
+
+def _validate_finite_positive_number(value, key):
+   if isinstance(value, bool) or not isinstance(value, (int, float)):
+      raise ConfigError("%s must be a positive number, got %r" % (key, value))
+   if not math.isfinite(value):
+      raise ConfigError("%s must be finite, got %r" % (key, value))
+   if value <= 0:
+      raise ConfigError("%s must be positive, got %r" % (key, value))
+   return value
+
+
+def _validate_positive_int(value, key):
+   if isinstance(value, bool) or not isinstance(value, int):
+      raise ConfigError("%s must be a positive integer, got %r" % (key, value))
+   if value <= 0:
+      raise ConfigError("%s must be positive, got %r" % (key, value))
+   return value
+
+
+def _validate_nonneg_int(value, key):
+   if isinstance(value, bool) or not isinstance(value, int):
+      raise ConfigError(
+         "%s must be a nonnegative integer, got %r" % (key, value))
+   if value < 0:
+      raise ConfigError("%s must be nonnegative, got %r" % (key, value))
+   return value
+
+
+# --------------------------------------------------------------------------
+# output
+# --------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class OutputConfig:
+   root: str
+   compress_census: bool = False
+
+
+_OUTPUT_REQUIRED_KEYS = ("root",)
+_OUTPUT_DEFAULTS = {"compress_census": False}
+_OUTPUT_ALLOWED_KEYS = frozenset(_OUTPUT_REQUIRED_KEYS) | frozenset(_OUTPUT_DEFAULTS)
+
+
+def _validate_output_section(raw, home):
+   raw = _require_mapping(raw, "output")
+   _reject_unknown_keys(raw, _OUTPUT_ALLOWED_KEYS, "output")
+   _require_keys(raw, _OUTPUT_REQUIRED_KEYS, "output")
+   root = _validate_output_root(raw["root"], home)
+   compress_census = _validate_compress_census(
+      raw.get("compress_census", _OUTPUT_DEFAULTS["compress_census"]))
+   return OutputConfig(root=root, compress_census=compress_census)
+
+
+# --------------------------------------------------------------------------
+# collection
+# --------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class CollectionConfig:
+   counter_interval_sec: float
+   census_interval_sec: float
+   counter_rollup_interval_sec: float
+   usage_interval_sec: float
+   duration_sec: float
+   keep_raw_args: bool
+
+
+_COLLECTION_DEFAULTS = {
+   "counter_interval_sec": 10,
+   "census_interval_sec": 60,
+   "counter_rollup_interval_sec": 60,
+   "usage_interval_sec": 900,
+   "duration_sec": 86400,
+   "keep_raw_args": True,
+}
+_COLLECTION_POSITIVE_NUMBER_KEYS = (
+   "counter_interval_sec", "census_interval_sec",
+   "counter_rollup_interval_sec", "usage_interval_sec", "duration_sec",
+)
+_COLLECTION_ALLOWED_KEYS = frozenset(_COLLECTION_DEFAULTS)
+
+
+def _validate_collection_section(raw):
+   raw = _require_mapping(raw, "collection")
+   _reject_unknown_keys(raw, _COLLECTION_ALLOWED_KEYS, "collection")
+   values = {}
+   for key in _COLLECTION_POSITIVE_NUMBER_KEYS:
+      values[key] = _validate_finite_positive_number(
+         raw.get(key, _COLLECTION_DEFAULTS[key]), "collection.%s" % key)
+   values["keep_raw_args"] = _validate_bool(
+      raw.get("keep_raw_args", _COLLECTION_DEFAULTS["keep_raw_args"]),
+      "collection.keep_raw_args")
+   return CollectionConfig(**values)
+
+
+# --------------------------------------------------------------------------
+# ssh
+# --------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class SshConfig:
+   connect_timeout_sec: float
+   counter_timeout_sec: float
+   census_timeout_sec: float
+   max_parallel_polls: int
+
+
+_SSH_DEFAULTS = {
+   "connect_timeout_sec": 8,
+   "counter_timeout_sec": 4,
+   "census_timeout_sec": 20,
+   "max_parallel_polls": 8,
+}
+_SSH_POSITIVE_NUMBER_KEYS = (
+   "connect_timeout_sec", "counter_timeout_sec", "census_timeout_sec",
+)
+_SSH_ALLOWED_KEYS = frozenset(_SSH_DEFAULTS)
+
+
+def _validate_ssh_section(raw):
+   raw = _require_mapping(raw, "ssh")
+   _reject_unknown_keys(raw, _SSH_ALLOWED_KEYS, "ssh")
+   values = {}
+   for key in _SSH_POSITIVE_NUMBER_KEYS:
+      values[key] = _validate_finite_positive_number(
+         raw.get(key, _SSH_DEFAULTS[key]), "ssh.%s" % key)
+   values["max_parallel_polls"] = _validate_positive_int(
+      raw.get("max_parallel_polls", _SSH_DEFAULTS["max_parallel_polls"]),
+      "ssh.max_parallel_polls")
+   return SshConfig(**values)
+
+
+# --------------------------------------------------------------------------
+# safety
+# --------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class SafetyConfig:
+   min_free_disk_pct: float
+
+
+_SAFETY_DEFAULTS = {"min_free_disk_pct": 10}
+_SAFETY_ALLOWED_KEYS = frozenset(_SAFETY_DEFAULTS)
+
+
+def _validate_safety_section(raw):
+   raw = _require_mapping(raw, "safety")
+   _reject_unknown_keys(raw, _SAFETY_ALLOWED_KEYS, "safety")
+   min_free_disk_pct = _validate_finite_positive_number(
+      raw.get("min_free_disk_pct", _SAFETY_DEFAULTS["min_free_disk_pct"]),
+      "safety.min_free_disk_pct")
+   return SafetyConfig(min_free_disk_pct=min_free_disk_pct)
+
+
+# --------------------------------------------------------------------------
+# database
+#
+# Design: "node-monitor owns only schema `node_monitor`; it must never use
+# `public`". ``url`` is deliberately excluded from the dataclass repr
+# (``dataclasses.field(repr=False)``) so an accidental ``repr()``/log of a
+# DatabaseConfig -- or of the NodeMonitorConfig that contains it -- never
+# prints a credential-bearing URL. Validated with SQLAlchemy's own
+# ``make_url``, never a hand-rolled regex.
+# --------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class DatabaseConfig:
+   url: str = dataclasses.field(repr=False)
+   schema: str
+   pool_size: int
+   max_overflow: int
+   echo_sql: bool
+   pool_pre_ping: bool
+   pool_timeout_sec: float
+   pool_recycle_sec: float
+   connect_args: tuple
+
+
+_DATABASE_REQUIRED_SCHEMA = "node_monitor"
+_DATABASE_DEFAULTS = {
+   "schema": _DATABASE_REQUIRED_SCHEMA,
+   "pool_size": 1,
+   "max_overflow": 0,
+   "echo_sql": False,
+   "pool_pre_ping": True,
+   "pool_timeout_sec": 10,
+   "pool_recycle_sec": 3600,
+}
+_DATABASE_ALLOWED_KEYS = frozenset(
+   {"url", "connect_args"} | frozenset(_DATABASE_DEFAULTS))
+
+_DATABASE_CONNECT_ARGS_INT_KEYS = (
+   "connect_timeout", "keepalives", "keepalives_idle",
+   "keepalives_interval", "keepalives_count",
+)
+_DATABASE_CONNECT_ARGS_STR_KEYS = ("options",)
+_DATABASE_CONNECT_ARGS_ALLOWED_KEYS = (
+   frozenset(_DATABASE_CONNECT_ARGS_INT_KEYS)
+   | frozenset(_DATABASE_CONNECT_ARGS_STR_KEYS))
+
+
+def _validate_database_url(value):
+   if not isinstance(value, str) or not value:
+      raise ConfigError(
+         "database.url must be a non-empty PostgreSQL URL, got %r" % (value,))
+   try:
+      url = make_url(value)
+   except ArgumentError:
+      raise ConfigError("database.url is not a valid URL: %r" % (value,))
+   backend = url.get_backend_name()
+   if backend != "postgresql":
+      raise ConfigError(
+         "database.url must be PostgreSQL-only, got backend %r (%r)"
+         % (backend, value))
+   return value
+
+
+def _validate_database_schema(value):
+   if value != _DATABASE_REQUIRED_SCHEMA:
+      raise ConfigError(
+         "database.schema must be exactly %r, got %r"
+         % (_DATABASE_REQUIRED_SCHEMA, value))
+   return value
+
+
+def _validate_database_max_overflow(value):
+   if isinstance(value, bool) or not isinstance(value, int):
+      raise ConfigError(
+         "database.max_overflow must be an integer, got %r" % (value,))
+   if value != 0:
+      raise ConfigError(
+         "database.max_overflow must be exactly 0 (single-writer "
+         "node-monitor never opens extra pool connections), got %r"
+         % (value,))
+   return value
+
+
+def _validate_database_connect_args(raw):
+   raw = _require_mapping(raw, "database.connect_args")
+   _reject_unknown_keys(
+      raw, _DATABASE_CONNECT_ARGS_ALLOWED_KEYS, "database.connect_args")
+   pairs = []
+   for key, value in raw.items():
+      if key in _DATABASE_CONNECT_ARGS_INT_KEYS:
+         if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(
+               "database.connect_args.%s must be an integer, got %r"
+               % (key, value))
+      else:
+         if not isinstance(value, str):
+            raise ConfigError(
+               "database.connect_args.%s must be a string, got %r"
+               % (key, value))
+      pairs.append((key, value))
+   return tuple(sorted(pairs, key=lambda pair: pair[0]))
+
+
+def _validate_database_section(raw, resolved_url):
+   raw = _require_mapping(raw, "database")
+   _reject_unknown_keys(raw, _DATABASE_ALLOWED_KEYS, "database")
+   url = _validate_database_url(resolved_url)
+   schema = _validate_database_schema(
+      raw.get("schema", _DATABASE_DEFAULTS["schema"]))
+   pool_size = _validate_positive_int(
+      raw.get("pool_size", _DATABASE_DEFAULTS["pool_size"]),
+      "database.pool_size")
+   max_overflow = _validate_database_max_overflow(
+      raw.get("max_overflow", _DATABASE_DEFAULTS["max_overflow"]))
+   echo_sql = _validate_bool(
+      raw.get("echo_sql", _DATABASE_DEFAULTS["echo_sql"]), "database.echo_sql")
+   pool_pre_ping = _validate_bool(
+      raw.get("pool_pre_ping", _DATABASE_DEFAULTS["pool_pre_ping"]),
+      "database.pool_pre_ping")
+   pool_timeout_sec = _validate_finite_positive_number(
+      raw.get("pool_timeout_sec", _DATABASE_DEFAULTS["pool_timeout_sec"]),
+      "database.pool_timeout_sec")
+   pool_recycle_sec = _validate_finite_positive_number(
+      raw.get("pool_recycle_sec", _DATABASE_DEFAULTS["pool_recycle_sec"]),
+      "database.pool_recycle_sec")
+   connect_args = _validate_database_connect_args(raw.get("connect_args", {}))
+   return DatabaseConfig(
+      url=url, schema=schema, pool_size=pool_size, max_overflow=max_overflow,
+      echo_sql=echo_sql, pool_pre_ping=pool_pre_ping,
+      pool_timeout_sec=pool_timeout_sec, pool_recycle_sec=pool_recycle_sec,
+      connect_args=connect_args)
+
+
+# --------------------------------------------------------------------------
+# retention
+# --------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class RetentionConfig:
+   enabled: bool
+   dry_run: bool
+   diagnostic_census_days: int
+   counter_diagnostics_days: int
+   counter_minute_days: int
+   usage_intervals_days: int
+   usage_hourly_days: int
+   counter_hourly_days: int
+   daily_days: int
+   poll_failures_days: int
+   poll_failures_daily_days: int
+   collection_log_days: int
+   delete_batch_rows: int
+   max_batches_per_run: int
+   lag_alert_after_runs: int
+   housekeeping_utc: str
+   require_complete_rollup: bool
+
+
+_RETENTION_DEFAULTS = {
+   "enabled": False,
+   "dry_run": True,
+   "diagnostic_census_days": 7,
+   "counter_diagnostics_days": 7,
+   "counter_minute_days": 30,
+   "usage_intervals_days": 180,
+   "usage_hourly_days": 730,
+   "counter_hourly_days": 730,
+   "daily_days": 0,
+   "poll_failures_days": 90,
+   "poll_failures_daily_days": 730,
+   "collection_log_days": 90,
+   "delete_batch_rows": 50000,
+   "max_batches_per_run": 20,
+   "lag_alert_after_runs": 3,
+   "housekeeping_utc": "04:00",
+   "require_complete_rollup": True,
+}
+_RETENTION_BOOL_KEYS = ("enabled", "dry_run", "require_complete_rollup")
+_RETENTION_DAY_KEYS = (
+   "diagnostic_census_days", "counter_diagnostics_days",
+   "counter_minute_days", "usage_intervals_days", "usage_hourly_days",
+   "counter_hourly_days", "daily_days", "poll_failures_days",
+   "poll_failures_daily_days", "collection_log_days",
+)
+_RETENTION_POSITIVE_INT_KEYS = (
+   "delete_batch_rows", "max_batches_per_run", "lag_alert_after_runs",
+)
+_RETENTION_ALLOWED_KEYS = frozenset(_RETENTION_DEFAULTS)
+
+# HH:MM, 00-23 hours, 00-59 minutes, always zero-padded (design: "housekeeping_utc").
+_HOUSEKEEPING_UTC_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def _validate_housekeeping_utc(value):
+   if not isinstance(value, str) or not _HOUSEKEEPING_UTC_RE.match(value):
+      raise ConfigError(
+         "retention.housekeeping_utc must be a zero-padded 'HH:MM' UTC "
+         "time (00:00-23:59), got %r" % (value,))
+   return value
+
+
+def _validate_retention_section(raw):
+   raw = _require_mapping(raw, "retention")
+   _reject_unknown_keys(raw, _RETENTION_ALLOWED_KEYS, "retention")
+   values = {}
+   for key in _RETENTION_BOOL_KEYS:
+      values[key] = _validate_bool(
+         raw.get(key, _RETENTION_DEFAULTS[key]), "retention.%s" % key)
+   for key in _RETENTION_DAY_KEYS:
+      values[key] = _validate_nonneg_int(
+         raw.get(key, _RETENTION_DEFAULTS[key]), "retention.%s" % key)
+   for key in _RETENTION_POSITIVE_INT_KEYS:
+      values[key] = _validate_positive_int(
+         raw.get(key, _RETENTION_DEFAULTS[key]), "retention.%s" % key)
+   values["housekeeping_utc"] = _validate_housekeeping_utc(
+      raw.get("housekeeping_utc", _RETENTION_DEFAULTS["housekeeping_utc"]))
+   return RetentionConfig(**values)
+
+
+# --------------------------------------------------------------------------
+# NodeMonitorConfig: the nested top-level configuration object.
+# --------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class NodeMonitorConfig:
+   system: str
+   nodes: tuple
+   probe_python: str
+   output: OutputConfig
+   collection: CollectionConfig
+   ssh: SshConfig
+   safety: SafetyConfig
+   database: DatabaseConfig
+   retention: RetentionConfig
+
+
+_NESTED_TOP_REQUIRED_KEYS = ("system", "nodes", "probe_python")
+_NESTED_TOP_SECTION_KEYS = (
+   "output", "collection", "ssh", "safety", "database", "retention")
+_NESTED_TOP_ALLOWED_KEYS = (
+   frozenset(_NESTED_TOP_REQUIRED_KEYS) | frozenset(_NESTED_TOP_SECTION_KEYS))
+
+
+def load_nested_config(raw, home, database_url_env=None):
+   """Load and strictly validate a nested Phase-1 configuration mapping.
+
+   ``raw`` is never mutated: every section validator reads values out of
+   ``raw``/its sub-mappings with ``.get(...)`` and builds brand-new
+   dataclass instances, never writing a resolved default back into the
+   caller's own mapping.
+
+   ``database_url_env`` is the (already read by the caller -- this
+   function never touches ``os.environ`` itself) value of
+   ``NODE_MONITOR_DB_URL``, used only when the config does not supply an
+   explicit ``database.url``. An explicit ``database.url`` always wins.
+   """
+   raw = _require_mapping(raw, "config")
+   _reject_unknown_keys(raw, _NESTED_TOP_ALLOWED_KEYS, "config")
+   _require_keys(raw, _NESTED_TOP_REQUIRED_KEYS, "config")
+
+   system = _validate_system(raw["system"])
+   nodes = _validate_nodes(raw["nodes"])
+   probe_python = _validate_probe_python(raw["probe_python"])
+
+   output = _validate_output_section(raw.get("output", {}), home)
+   collection = _validate_collection_section(raw.get("collection", {}))
+   ssh = _validate_ssh_section(raw.get("ssh", {}))
+   safety = _validate_safety_section(raw.get("safety", {}))
+
+   database_raw = raw.get("database", {})
+   database_raw_mapping = _require_mapping(database_raw, "database")
+   explicit_url = database_raw_mapping.get("url")
+   if explicit_url is not None:
+      resolved_url = explicit_url
+   elif database_url_env is not None:
+      resolved_url = database_url_env
+   else:
+      raise ConfigError(
+         "database.url is required: set database.url in the config or "
+         "inject NODE_MONITOR_DB_URL")
+   database = _validate_database_section(database_raw_mapping, resolved_url)
+
+   retention = _validate_retention_section(raw.get("retention", {}))
+
+   return NodeMonitorConfig(
+      system=system,
+      nodes=nodes,
+      probe_python=probe_python,
+      output=output,
+      collection=collection,
+      ssh=ssh,
+      safety=safety,
+      database=database,
+      retention=retention,
+   )
