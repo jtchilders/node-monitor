@@ -22,6 +22,7 @@ import math
 import os
 import re
 import typing
+import warnings
 
 import yaml
 from sqlalchemy.engine import make_url
@@ -30,6 +31,24 @@ from sqlalchemy.exc import ArgumentError
 
 class ConfigError(Exception):
    """Raised for any malformed, incomplete, or unsafe configuration."""
+
+
+# --------------------------------------------------------------------------
+# Migrated flat Phase-0 keys, by nested section (design: "Configuration
+# contract" -- "A file that supplies both representations of any migrated
+# setting fails with a migration-specific ConfigError"). ``system``,
+# ``nodes``, and ``probe_python`` stay shared top-level identity fields in
+# both layouts and are therefore never "migrated" -- they never conflict.
+# --------------------------------------------------------------------------
+
+_MIGRATED_FLAT_KEYS = frozenset((
+   "output_root", "compress_census",
+   "counter_interval_sec", "census_interval_sec", "rollup_interval_sec",
+   "usage_interval_sec", "duration_sec", "keep_raw_args",
+   "counter_timeout_sec", "census_timeout_sec", "ssh_connect_timeout_sec",
+   "max_parallel_polls",
+   "min_free_disk_pct",
+))
 
 
 # --------------------------------------------------------------------------
@@ -843,3 +862,73 @@ def load_nested_config(raw, home, database_url_env=None):
       database=database,
       retention=retention,
    )
+
+
+def load_any_config(raw, home, database_url_env=None):
+   """Dispatch to the legacy flat loader or the strict nested loader.
+
+   Design: "The loader accepts exactly one representation: 1. legacy flat
+   Phase-0 configuration, or 2. nested Phase-1 configuration. A file that
+   supplies both representations of any migrated setting fails with a
+   migration-specific ConfigError; it is never silently merged."
+   """
+   raw = _require_mapping(raw, "config")
+   present_flat = set(raw) & _MIGRATED_FLAT_KEYS
+   present_nested = set(raw) & frozenset(_NESTED_TOP_SECTION_KEYS)
+   if present_flat and present_nested:
+      raise ConfigError(
+         "config has a mixed layout: legacy flat key(s) %s cannot be "
+         "combined with nested section(s) %s -- migrate the flat "
+         "setting(s) into their nested replacement section instead of "
+         "supplying both"
+         % (", ".join(sorted(present_flat)), ", ".join(sorted(present_nested))))
+   if present_nested:
+      return load_nested_config(raw, home=home, database_url_env=database_url_env)
+   warnings.warn(
+      "flat Phase-0 configuration is deprecated; migrate to the nested "
+      "output/collection/ssh/safety/database/retention sections",
+      DeprecationWarning, stacklevel=2)
+   return load_config(raw, home=home)
+
+
+def discover_config_path(explicit_path=None, home=None, cwd=None,
+                          etc_path="/etc/node_monitor/config.yaml"):
+   """Resolve the config file path to load, pbs-monitor-style.
+
+   Priority order: an explicit CLI path (fails clearly if it does not
+   exist), then ``~/.node_monitor.yaml``, then
+   ``~/.config/node_monitor/config.yaml``, then ``etc_path``
+   (``/etc/node_monitor/config.yaml`` by default), then
+   ``node_monitor.yaml`` in the current directory.
+   """
+   if home is None:
+      home = os.path.expanduser("~")
+   if cwd is None:
+      cwd = os.getcwd()
+   if explicit_path is not None:
+      if os.path.exists(explicit_path):
+         return explicit_path
+      raise ConfigError("config file not found: %r" % (explicit_path,))
+
+   candidates = (
+      os.path.join(home, ".node_monitor.yaml"),
+      os.path.join(home, ".config", "node_monitor", "config.yaml"),
+      etc_path,
+      os.path.join(cwd, "node_monitor.yaml"),
+   )
+   for candidate in candidates:
+      if os.path.exists(candidate):
+         return candidate
+   raise ConfigError(
+      "no configuration file found (checked: %s)" % ", ".join(candidates))
+
+
+def load_config_file_any(path, home=None, database_url_env=None):
+   """Read a YAML config file and dispatch it through ``load_any_config``."""
+   if home is None:
+      home = os.path.expanduser("~")
+   with open(path, "r") as handle:
+      raw = yaml.safe_load(handle)
+   if raw is None:
+      raise ConfigError("config file %r is empty" % (path,))
+   return load_any_config(raw, home=home, database_url_env=database_url_env)

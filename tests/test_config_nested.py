@@ -27,6 +27,9 @@ from node_monitor.config import (
    RetentionConfig,
    SafetyConfig,
    SshConfig,
+   discover_config_path,
+   load_any_config,
+   load_config_file_any,
    load_nested_config,
 )
 
@@ -499,4 +502,175 @@ class TestNoCredentialLeakage:
    def test_database_url_field_has_repr_false(self):
       field = DatabaseConfig.__dataclass_fields__["url"]
       assert field.repr is False
+
+
+
+# ==========================================================================
+# Task 2: Layout dispatch, environment priority, and discovery
+# ==========================================================================
+
+def _base_flat(**overrides):
+   config = {
+      "system": "polaris",
+      "nodes": [
+         {"hostname": "polaris-login-04.example.org", "role": "local"},
+         {"hostname": "polaris-login-01.example.org", "role": "remote"},
+      ],
+      "output_root": "~/phase0-runs",
+      "probe_python": "/usr/bin/python3.11",
+   }
+   config.update(overrides)
+   return config
+
+
+class TestLayoutDispatch:
+   def test_flat_returns_phase0config_unchanged(self):
+      raw = _base_flat()
+      cfg = load_any_config(raw, home=HOME)
+      assert isinstance(cfg, Phase0Config)
+      assert cfg.system == "polaris"
+
+   def test_nested_returns_nodemonitorconfig(self):
+      raw = _base_nested()
+      cfg = load_any_config(raw, home=HOME)
+      assert isinstance(cfg, NodeMonitorConfig)
+
+   @pytest.mark.parametrize("flat_key,flat_value", [
+      ("output_root", "~/phase0-runs"),
+      ("counter_interval_sec", 10),
+      ("census_interval_sec", 60),
+      ("rollup_interval_sec", 60),
+      ("usage_interval_sec", 900),
+      ("duration_sec", 86400),
+      ("counter_timeout_sec", 4),
+      ("census_timeout_sec", 20),
+      ("ssh_connect_timeout_sec", 8),
+      ("max_parallel_polls", 8),
+      ("min_free_disk_pct", 10),
+      ("keep_raw_args", True),
+      ("compress_census", False),
+   ])
+   def test_mixed_flat_and_nested_rejected(self, flat_key, flat_value):
+      raw = _base_nested()
+      raw[flat_key] = flat_value
+      with pytest.raises(ConfigError, match="mixed"):
+         load_any_config(raw, home=HOME)
+
+   def test_missing_database_url_uses_injected_env(self):
+      raw = _base_nested()
+      del raw["database"]
+      cfg = load_any_config(
+         raw, home=HOME, database_url_env="postgresql://localhost/db")
+      assert cfg.database.url == "postgresql://localhost/db"
+
+   def test_explicit_file_url_wins_over_env(self):
+      raw = _base_nested()
+      cfg = load_any_config(
+         raw, home=HOME, database_url_env="postgresql://other/db")
+      assert cfg.database.url == "postgresql://localhost/pbs_monitor_dev"
+
+   def test_injected_sqlite_url_fails_before_connection(self):
+      raw = _base_nested()
+      del raw["database"]
+      with pytest.raises(ConfigError):
+         load_any_config(
+            raw, home=HOME, database_url_env="sqlite:///tmp/db.sqlite")
+
+
+class TestDiscoverConfigPath:
+   def test_explicit_existing_path_wins(self, tmp_path):
+      explicit = tmp_path / "explicit.yaml"
+      explicit.write_text("system: polaris\n")
+      home_dotfile = tmp_path / "home" / ".node_monitor.yaml"
+      home_dotfile.parent.mkdir(parents=True)
+      home_dotfile.write_text("system: other\n")
+      found = discover_config_path(
+         explicit_path=str(explicit), home=str(tmp_path / "home"),
+         cwd=str(tmp_path), etc_path=str(tmp_path / "etc.yaml"))
+      assert found == str(explicit)
+
+   def test_explicit_missing_path_fails_clearly(self, tmp_path):
+      with pytest.raises(ConfigError, match="not found"):
+         discover_config_path(
+            explicit_path=str(tmp_path / "missing.yaml"),
+            home=str(tmp_path / "home"), cwd=str(tmp_path),
+            etc_path=str(tmp_path / "etc.yaml"))
+
+   def test_automatic_order_home_dotfile_first(self, tmp_path):
+      home = tmp_path / "home"
+      home.mkdir()
+      dotfile = home / ".node_monitor.yaml"
+      dotfile.write_text("system: polaris\n")
+      xdg = home / ".config" / "node_monitor" / "config.yaml"
+      xdg.parent.mkdir(parents=True)
+      xdg.write_text("system: other\n")
+      found = discover_config_path(
+         home=str(home), cwd=str(tmp_path), etc_path=str(tmp_path / "etc.yaml"))
+      assert found == str(dotfile)
+
+   def test_automatic_order_xdg_second(self, tmp_path):
+      home = tmp_path / "home"
+      home.mkdir()
+      xdg = home / ".config" / "node_monitor" / "config.yaml"
+      xdg.parent.mkdir(parents=True)
+      xdg.write_text("system: polaris\n")
+      etc = tmp_path / "etc" / "config.yaml"
+      etc.parent.mkdir(parents=True)
+      etc.write_text("system: other\n")
+      found = discover_config_path(
+         home=str(home), cwd=str(tmp_path), etc_path=str(etc))
+      assert found == str(xdg)
+
+   def test_automatic_order_etc_third(self, tmp_path):
+      home = tmp_path / "home"
+      home.mkdir()
+      etc = tmp_path / "etc" / "config.yaml"
+      etc.parent.mkdir(parents=True)
+      etc.write_text("system: polaris\n")
+      cwd = tmp_path / "cwd"
+      cwd.mkdir()
+      cwd_config = cwd / "node_monitor.yaml"
+      cwd_config.write_text("system: other\n")
+      found = discover_config_path(home=str(home), cwd=str(cwd), etc_path=str(etc))
+      assert found == str(etc)
+
+   def test_automatic_order_cwd_last(self, tmp_path):
+      home = tmp_path / "home"
+      home.mkdir()
+      cwd = tmp_path / "cwd"
+      cwd.mkdir()
+      cwd_config = cwd / "node_monitor.yaml"
+      cwd_config.write_text("system: polaris\n")
+      found = discover_config_path(
+         home=str(home), cwd=str(cwd), etc_path=str(tmp_path / "no-etc.yaml"))
+      assert found == str(cwd_config)
+
+   def test_no_config_found_anywhere_fails(self, tmp_path):
+      home = tmp_path / "home"
+      home.mkdir()
+      cwd = tmp_path / "cwd"
+      cwd.mkdir()
+      with pytest.raises(ConfigError):
+         discover_config_path(
+            home=str(home), cwd=str(cwd), etc_path=str(tmp_path / "no-etc.yaml"))
+
+
+class TestLoadConfigFileAny:
+   def test_empty_yaml_rejected(self, tmp_path):
+      path = tmp_path / "config.yaml"
+      path.write_text("")
+      with pytest.raises(ConfigError, match="empty"):
+         load_config_file_any(str(path), home=str(tmp_path))
+
+   def test_dispatches_flat_layout(self, tmp_path):
+      path = tmp_path / "config.yaml"
+      path.write_text(yaml.safe_dump(_base_flat()))
+      cfg = load_config_file_any(str(path), home=str(tmp_path))
+      assert isinstance(cfg, Phase0Config)
+
+   def test_dispatches_nested_layout(self, tmp_path):
+      path = tmp_path / "config.yaml"
+      path.write_text(yaml.safe_dump(_base_nested()))
+      cfg = load_config_file_any(str(path), home=str(tmp_path))
+      assert isinstance(cfg, NodeMonitorConfig)
 
