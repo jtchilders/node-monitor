@@ -751,7 +751,10 @@ class Daemon:
          if event_type == "scheduler_miss":
             try:
                await self._record_scheduler_miss(event)
-            except (Phase0SinkDiskFullError, Phase0SinkError, PostgresDaemonSinkError, OSError) as sink_exc:
+            except (
+               Phase0SinkDiskFullError, Phase0SinkError,
+               PostgresDaemonSinkError, OSError,
+            ) as sink_exc:
                # Same fatal contract as every other sink write in this
                # module. Deliberately NOT re-raised past this point:
                # Scheduler itself is agnostic to sink exception types
@@ -971,7 +974,10 @@ class Daemon:
       except Exception as exc:
          try:
             await self._record_ordinary_poll_failure(node, loop, exc)
-         except (Phase0SinkDiskFullError, Phase0SinkError, PostgresDaemonSinkError, OSError) as sink_exc:
+         except (
+            Phase0SinkDiskFullError, Phase0SinkError,
+            PostgresDaemonSinkError, OSError,
+         ) as sink_exc:
             # Same fatal contract as every other sink write in this
             # module: a write/flush failure recording the poll failure
             # ITSELF is still a sink failure, and design's "Output
@@ -998,7 +1004,10 @@ class Daemon:
          # side of the collision).
          try:
             await self._record_ordinary_poll_failure(node, loop, exc)
-         except (Phase0SinkDiskFullError, Phase0SinkError, PostgresDaemonSinkError, OSError) as sink_exc:
+         except (
+            Phase0SinkDiskFullError, Phase0SinkError,
+            PostgresDaemonSinkError, OSError,
+         ) as sink_exc:
             self._fatal_error = sink_exc
             self._scheduler.request_stop()
             raise

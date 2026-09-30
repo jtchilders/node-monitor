@@ -62,6 +62,7 @@ from node_monitor.output.contracts import (  # noqa: E402
    validate_node_usage_intervals,
 )
 from node_monitor.output.jsonl import Phase0Sink  # noqa: E402
+from node_monitor.output.postgres import PostgresDaemonSinkError  # noqa: E402
 from fake_clock import FakeClock  # noqa: E402
 
 
@@ -3154,41 +3155,6 @@ class TestNoDatabaseImports:
 # PostgresDaemonSinkError from node_monitor.output.postgres only -- never
 # from node_monitor.database, node_monitor.db, sqlalchemy, or psycopg2.
 # --------------------------------------------------------------------------
-
-from node_monitor.output.postgres import PostgresDaemonSinkError  # noqa: E402
-
-
-class _PostgresSinkErrorOnWrite:
-   """Sink stub: raises PostgresDaemonSinkError on every write_record()
-   call, but never on finalize_summary()/write_done() (those paths are
-   covered by separate stubs below).  Exposes a real run_dir so callers
-   can assert no summary.json/DONE was created there.
-   """
-
-   def __init__(self, run_dir):
-      self.run_dir = run_dir
-      self.write_record_called = False
-      self.finalize_called = False
-      self.write_done_called = False
-
-   async def write_record(self, record_type, record):
-      self.write_record_called = True
-      raise PostgresDaemonSinkError(
-         "PostgresDaemonSinkError: simulated PostgreSQL write failure for %s"
-         % record_type)
-
-   async def finalize_summary(self, acceptance_fn=None):
-      self.finalize_called = True
-      raise AssertionError(
-         "finalize_summary() must never be called after a fatal "
-         "PostgresDaemonSinkError from write_record()")
-
-   def write_done(self):
-      self.write_done_called = True
-      raise AssertionError(
-         "write_done() must never be called after a fatal "
-         "PostgresDaemonSinkError from write_record()")
-
 
 class _PostgresSinkErrorOnSelectiveWrite:
    """Wraps a real Phase0Sink and raises PostgresDaemonSinkError for one
