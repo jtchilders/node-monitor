@@ -195,3 +195,120 @@ class TestPackagedMigrationSurvivesInstall:
       installed_location = Path(result.stdout.strip()).resolve()
       assert str(REPO_ROOT) not in str(installed_location)
       assert str(venv_dir.resolve()) in str(installed_location)
+
+
+@pytest.mark.slow
+class TestPackagedModeSidecarSurvivesInstall:
+   """discover_migrations() reads ``<file>.sql.mode`` sidecars via the
+   same importlib.resources traversable as the .sql files themselves
+   (see ``_read_mode_marker``). setup.py's package_data must therefore
+   include ``*.sql.mode`` alongside ``*.sql``, or a mode override
+   authored by a migration writer would silently vanish from a real
+   wheel/sdist install. These tests add a temporary 0002 migration with
+   an explicit sidecar directly into the packaged source tree, build
+   real distributions, install into a fresh venv, and prove the
+   sidecar's effect is visible post-install -- for both an accepted
+   ("transactional") and a rejected (unsupported) mode value.
+   """
+
+   def _with_temporary_migration(self, sql_name, mode_text):
+      """Context manager-free helper: writes a temporary 0002 migration
+      (and its .sql.mode sidecar) into the real packaged source tree,
+      returning a cleanup callable. Task 1 ships no runner/CLI to do
+      this through public API, so the packaging proof must place the
+      fixture where setup.py's package_data glob will actually find it.
+      """
+      sql_path = MIGRATIONS_DIR / sql_name
+      mode_path = MIGRATIONS_DIR / (sql_name + ".mode")
+      assert not sql_path.exists(), "fixture collision: %s" % sql_path
+      assert not mode_path.exists(), "fixture collision: %s" % mode_path
+      sql_path.write_bytes(b"-- packaging-test placeholder migration\n")
+      mode_path.write_text(mode_text)
+
+      def cleanup():
+         sql_path.unlink(missing_ok=True)
+         mode_path.unlink(missing_ok=True)
+
+      return cleanup
+
+   def test_transactional_sidecar_survives_wheel_install(self, tmp_path):
+      # "transactional" happens to equal discover_migrations()'s default
+      # when no sidecar is present at all, so asserting on the resulting
+      # Migration.mode alone would pass even if the sidecar file were
+      # silently dropped by packaging -- a false-negative risk. Assert
+      # directly, via the installed package's own importlib.resources
+      # traversable, that the ``.sql.mode`` sidecar file itself exists
+      # and its packaged content matches what we wrote, so this proves
+      # packaging rather than coincidence.
+      cleanup = self._with_temporary_migration(
+         "0002_packaging_sidecar.sql", "transactional")
+      try:
+         build_dir = tmp_path / "dist"
+         build_dir.mkdir()
+         wheel_path, _sdist_path = _build_distributions(build_dir)
+
+         venv_dir = tmp_path / "venv-wheel-sidecar"
+         venv_python = _fresh_venv(venv_dir)
+         _install_runtime_dependencies(venv_python, tmp_path)
+         _install(venv_python, wheel_path, tmp_path)
+
+         probe = textwrap.dedent(
+            """
+            import json
+            import importlib.resources as resources
+            from node_monitor.database.migration import discover_migrations
+
+            versions_pkg = resources.files(
+               "node_monitor.database.migrations.versions"
+            )
+            sidecar = versions_pkg.joinpath(
+               "0002_packaging_sidecar.sql.mode")
+
+            migrations = discover_migrations()
+            second = migrations[1]
+            print(json.dumps({
+               "version": second.version,
+               "mode": second.mode,
+               "sidecar_is_file": sidecar.is_file(),
+               "sidecar_text": sidecar.read_text().strip(),
+            }))
+            """
+         )
+         result = _run([str(venv_python), "-c", probe], cwd=tmp_path)
+         report = json.loads(result.stdout.strip().splitlines()[-1])
+         assert report["version"] == 2
+         assert report["mode"] == "transactional"
+         assert report["sidecar_is_file"] is True
+         assert report["sidecar_text"] == "transactional"
+      finally:
+         cleanup()
+
+   def test_unsupported_sidecar_fails_closed_after_sdist_install(
+         self, tmp_path):
+      cleanup = self._with_temporary_migration(
+         "0002_packaging_sidecar.sql", "concurrent")
+      try:
+         build_dir = tmp_path / "dist"
+         build_dir.mkdir()
+         _wheel_path, sdist_path = _build_distributions(build_dir)
+
+         venv_dir = tmp_path / "venv-sdist-sidecar"
+         venv_python = _fresh_venv(venv_dir)
+         _install_runtime_dependencies(venv_python, tmp_path)
+         _install(venv_python, sdist_path, tmp_path)
+
+         probe = (
+            "from node_monitor.database.migration import "
+            "discover_migrations\n"
+            "discover_migrations()\n"
+         )
+         result = subprocess.run(
+            [str(venv_python), "-c", probe],
+            cwd=tmp_path, capture_output=True, text=True,
+         )
+         assert result.returncode != 0, (
+            "expected discover_migrations() to fail closed on an "
+            "unsupported packaged mode sidecar, but it exited 0")
+         assert "ValueError" in result.stderr
+      finally:
+         cleanup()

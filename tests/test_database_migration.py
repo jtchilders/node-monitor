@@ -220,6 +220,14 @@ class TestVersionContiguity:
       with pytest.raises(ValueError):
          migration_module._migrations_from_directory(tmp_path)
 
+   def test_empty_migration_set_is_rejected(self, tmp_path):
+      # An empty migrations source is a packaging/authoring failure --
+      # every installation must ship at least migration 1. Fail closed
+      # instead of silently returning an empty tuple.
+      import node_monitor.database.migration as migration_module
+      with pytest.raises(ValueError):
+         migration_module._migrations_from_directory(tmp_path)
+
 
 # --------------------------------------------------------------------------
 # Requirement 5: unsupported migration mode metadata is rejected, never
