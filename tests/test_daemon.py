@@ -3445,6 +3445,148 @@ class TestPostgresDaemonSinkErrorFatalBoundary:
       assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
       assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
 
+   def test_postgres_sink_error_during_scheduler_miss_node_collection_log_write_is_fatal(
+         self, tmp_path):
+      """scheduler_miss persistence boundary: a scheduler_miss event
+      writes a structured record via the sink.  If that write raises
+      PostgresDaemonSinkError the daemon must:
+
+        - return EXIT_SINK_FATAL
+        - never call finalize_summary() or write_done()
+        - produce no DONE artifact
+
+      This is the specific boundary the reviewer's Important finding 1
+      targets: the existing test_scheduler_miss_sink_write_failure_is_
+      fatal_and_never_writes_done uses an OSError via
+      _SelectiveWriteFailsSink on node_poll_failures (post-FQDN path);
+      this test drives the same scheduler_miss path with the actual
+      PostgresDaemonSinkError type the PostgresDaemonSink raises,
+      proving the except clause at _observe_scheduler_event catches both.
+
+      Scenario: hwinfo succeeds (FQDN is established), counter succeeds,
+      census never completes (always a scheduler_miss) -- so the miss
+      always takes the post-FQDN path and writes to node_poll_failures.
+      The sink raises PostgresDaemonSinkError for node_poll_failures,
+      which must propagate as EXIT_SINK_FATAL through the scheduler_miss
+      catch in _observe_scheduler_event.
+      """
+      config = _config(tmp_path, duration_sec=100000)
+      real_sink = Phase0Sink(
+         os.path.join(str(tmp_path), "phase0-runs"),
+         "daemon-task2-schedmiss-postgres-err",
+         metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      # Raise PostgresDaemonSinkError on node_poll_failures writes --
+      # which is exactly what a scheduler_miss writes once FQDN is known.
+      # finalize_summary()/write_done() raise AssertionError (must not
+      # be called after a fatal write_record failure).
+      sink = _PostgresSinkErrorOnSelectiveWrite(real_sink, "node_poll_failures")
+      clock = FakeClock()
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload(hostname="canonical.example.org")
+         if loop == "counter":
+            return _counter_payload(uptime_sec=1.0,
+                                    hostname="canonical.example.org")
+         # census never completes -- always cancelled/reaped as a
+         # scheduler_miss at the following deadline.  After hwinfo and
+         # a counter success, FQDN is established, so the miss writes
+         # to node_poll_failures (which raises PostgresDaemonSinkError).
+         await clock.sleep(1000)
+         return _census_payload(uptime_sec=1.0, hostname="canonical.example.org")
+
+      daemon = Daemon(config, sink, transport_fn,
+                      clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         # Dispatch counter+census at 0; first scheduler_miss (cancel +
+         # reap) at deadline 1 -- FQDN is established via hwinfo/counter
+         # success at t=0, so the miss writes to node_poll_failures and
+         # raises PostgresDaemonSinkError → EXIT_SINK_FATAL.
+         await clock.advance(1)
+         # Let the fatal handler and request_stop() settle.
+         await clock.advance(10)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
+
+   def test_postgres_sink_error_during_write_done_is_fatal_finalize_was_called(
+         self, tmp_path):
+      """write_done() raises PostgresDaemonSinkError (finalize_summary
+      succeeds): the daemon must:
+
+        - return EXIT_SINK_FATAL
+        - have called finalize_summary() exactly once (the summary
+          artifact was committed)
+        - have attempted write_done() exactly once
+        - produce no DONE artifact / false-success state
+
+      This is the specific boundary the reviewer's Important finding 2
+      targets: test_raw_oserror_from_write_done_stops_daemon_nonzero
+      covers the OSError case; this test covers the PostgresDaemonSinkError
+      case at the same write_done() boundary, proving the final
+      try-except in Daemon.run() catches both.
+      """
+      config = _config(tmp_path, duration_sec=5)
+      real_sink = Phase0Sink(
+         os.path.join(str(tmp_path), "phase0-runs"),
+         "daemon-task2-write-done-postgres-err",
+         metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+
+      # Track calls precisely.
+      finalize_call_count = [0]
+      write_done_call_count = [0]
+
+      class _FinalizeOkWriteDonePostgresErr:
+         """write_record() and finalize_summary() both succeed; only
+         write_done() raises PostgresDaemonSinkError -- the boundary
+         the reviewer's finding 2 targets.
+         """
+         run_dir = real_sink.run_dir
+
+         async def write_record(self, record_type, record):
+            return None
+
+         async def finalize_summary(self, acceptance_fn=None):
+            finalize_call_count[0] += 1
+
+         def write_done(self):
+            write_done_call_count[0] += 1
+            raise PostgresDaemonSinkError(
+               "PostgresDaemonSinkError: simulated write_done failure")
+
+      clock = FakeClock()
+
+      daemon = Daemon(config, _FinalizeOkWriteDonePostgresErr(),
+                      _make_transport_fn(),
+                      clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_SINK_FATAL
+      # finalize_summary() must have been called exactly once --
+      # the summary artifact was committed before write_done() failed.
+      assert finalize_call_count[0] == 1
+      # write_done() must have been attempted exactly once -- not
+      # silently skipped, and not retried.
+      assert write_done_call_count[0] == 1
+      # No DONE flag: a summary without DONE is the correct
+      # \"partial, not complete\" state.
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
    def test_daemon_module_imports_postgres_error_from_output_not_database(self):
       """Static AST check: daemon.py must import PostgresDaemonSinkError
       from node_monitor.output.postgres only -- NEVER from
