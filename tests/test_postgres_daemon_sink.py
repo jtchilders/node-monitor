@@ -286,15 +286,30 @@ def test_diagnostic_write_after_db_failure_raises():
    The design says stop accepting new polls/producers after DB failure.
    The stored-error check must fire before the diagnostic routing branch,
    not only for relational types.
+
+   Uses an explicit writer_failed Event so the test waits only as long as
+   needed, with no arbitrary sleep(0.1) to establish writer-error state.
    """
    async def _go():
-      failing_writer = _FakeWriter(failure=RuntimeError("db exploded"))
-      sink, _, diagnostic = _make_sink(writer=failing_writer)
+      writer_failed = asyncio.Event()
+
+      class _SignallingFailWriter:
+         """Fails on first call and signals writer_failed before raising."""
+         def write_records(self, records):
+            writer_failed.set()
+            raise RuntimeError("db exploded")
+
+      sink = PostgresDaemonSink(
+         writer=_SignallingFailWriter(),
+         diagnostic_sink=_FakeDiagnosticSink(),
+      )
       await sink.start()
       # Trigger the writer failure
       await sink.write_record("node_collection_log", _collection_log())
-      # Let the worker process and record the failure
-      await asyncio.sleep(0.1)
+      # Wait for the worker to process the record and record the failure
+      await asyncio.wait_for(writer_failed.wait(), timeout=3.0)
+      # Give the event loop one turn to propagate _error assignment
+      await asyncio.sleep(0)
       # Diagnostic write must also be rejected after DB failure
       with pytest.raises(PostgresDaemonSinkError):
          await sink.write_record("diagnostic_census", _diagnostic_census())
@@ -829,14 +844,21 @@ def test_producer_cancel_while_blocked_does_not_enqueue():
 
    Contract: asyncio.CancelledError propagates out; sink's queue and error
    state are unchanged; the sink remains usable (no poison).
+
+   Synchronization: uses worker_entered Event so the test knows the worker
+   has dequeued record A before filling B and launching C.  No fixed sleep
+   to establish this state.
    """
    async def _go():
-      # Worker gate: keep worker busy so queue fills
+      # worker_entered: fires when write_records starts (worker holds A)
+      worker_entered = asyncio.Event()
+      # worker_gate: keep the worker gated inside write_records
       worker_gate = asyncio.Event()
 
       class _GatedWriter:
          def write_records(self, records):
             import time
+            worker_entered.set()
             deadline = time.monotonic() + 5.0
             while not worker_gate.is_set():
                if time.monotonic() > deadline:
@@ -851,12 +873,15 @@ def test_producer_cancel_while_blocked_does_not_enqueue():
       )
       await sink.start()
 
-      # Fill the queue: worker dequeues A (gated), then B fills the slot
+      # Enqueue record A -- worker dequeues it immediately and enters write_records
       await sink.write_record("node_collection_log", _collection_log(detail={"n": 0}))
-      await asyncio.sleep(0.05)   # let worker dequeue A
+      # Wait deterministically for the worker to be inside write_records holding A
+      await asyncio.wait_for(worker_entered.wait(), timeout=3.0)
+
+      # Queue is now empty (worker holds A gated).  Fill the slot with B.
       await sink.write_record("node_collection_log", _collection_log(detail={"n": 1}))
 
-      # Producer C blocks on queue.put
+      # Producer C blocks on queue.put (queue full, worker still gated)
       producer_task = asyncio.ensure_future(
          sink.write_record("node_collection_log", _collection_log(detail={"n": 2}))
       )
@@ -944,9 +969,104 @@ def test_finalize_cancel_leaves_finalized_false_and_no_orphan():
 
    _run(_go(), timeout=15.0)
 
+def test_finalize_cancel_at_queue_put_stop_leaves_worker_done():
+   """Cancellation at queue.put(_STOP) must leave worker done, not orphaned.
 
-# ---------------------------------------------------------------------------
-# Queue capacity is private / not a public parameter
+   This is the Critical path: queue capacity 1, worker is gated inside
+   write_records holding record A, queue contains record B (full).
+   finalize_summary() is called -- it sets _finalize_attempted then blocks
+   at ``await queue.put(_STOP)`` because the queue is full.  The finalize
+   task is cancelled.  CancelledError must propagate, _finalized must remain
+   False (write_done forbidden), and -- critically -- the worker task must be
+   done and awaited (no orphan).
+
+   Without the fix, _STOP never enters the queue, the worker waits forever,
+   and worker_task.done() is False (orphan).
+   """
+   async def _go():
+      # writer_entered: fired once write_records starts (worker holds A)
+      writer_entered = asyncio.Event()
+      # release_writer: open this to let the writer thread finish
+      release_writer = asyncio.Event()
+
+      class _GatedWriter:
+         """Blocks inside write_records until release_writer is set."""
+         def write_records(self, records):
+            import time
+            writer_entered.set()
+            deadline = time.monotonic() + 10.0
+            while not release_writer.is_set():
+               if time.monotonic() > deadline:
+                  raise RuntimeError("release_writer never opened")
+               time.sleep(0.005)
+            return len(records)
+
+      # Queue capacity 1: record A dequeued by worker, B sits in queue.
+      sink = PostgresDaemonSink(
+         writer=_GatedWriter(),
+         diagnostic_sink=_FakeDiagnosticSink(),
+         _queue_size=1,
+      )
+      await sink.start()
+
+      # Enqueue A -- worker dequeues it and enters write_records (gated)
+      await sink.write_record("node_collection_log", _collection_log(detail={"n": 0}))
+      # Wait deterministically for worker to be inside write_records holding A
+      await asyncio.wait_for(writer_entered.wait(), timeout=3.0)
+
+      # Enqueue B -- fills the capacity-1 queue
+      await sink.write_record("node_collection_log", _collection_log(detail={"n": 1}))
+
+      # Verify queue is full (qsize == capacity) and worker is still pending
+      assert sink._queue.full(), "Queue must be full before starting finalize"
+      assert not sink._worker_task.done(), "Worker must still be running"
+
+      # Start finalize in background.  It sets _finalize_attempted=True, then
+      # blocks at await queue.put(_STOP) because the queue is full.
+      finalize_task = asyncio.ensure_future(sink.finalize_summary())
+
+      # Give the event loop time to reach queue.put(_STOP) and block
+      await asyncio.sleep(0.05)
+      assert not finalize_task.done(), (
+         "finalize_summary must be blocked at queue.put(_STOP)"
+      )
+      # Queue still full: _STOP has not been inserted yet
+      assert sink._queue.full(), "Queue must still be full; _STOP is pending"
+
+      # Cancel finalize while it is blocked at queue.put(_STOP)
+      finalize_task.cancel()
+      with pytest.raises(asyncio.CancelledError):
+         await finalize_task
+
+      # --- Post-cancellation invariants ---
+
+      # 1. _finalized must remain False: write_done must raise
+      with pytest.raises(PostgresDaemonSinkError):
+         sink.write_done()
+
+      # 2. Worker must be done (cancelled and awaited): no orphan task.
+      #    Release the writer thread so the executor can terminate cleanly
+      #    (asyncio.to_thread cannot stop an already-running thread, so the
+      #    test must unblock it to prevent executor leakage).
+      release_writer.set()
+
+      # Give the event loop time to propagate cancellation to the worker
+      worker = sink._worker_task
+      assert worker is not None, "worker task must exist after start()"
+      try:
+         await asyncio.wait_for(asyncio.shield(worker), timeout=3.0)
+      except (asyncio.CancelledError, Exception):
+         pass  # either outcome is acceptable; we only need done()
+
+      assert worker.done(), (
+         "Worker task must be done after finalize cancellation (no orphan). "
+         "CURRENT CODE FAILS HERE: _STOP never entered the queue so the worker "
+         "is waiting for _STOP indefinitely."
+      )
+
+   _run(_go(), timeout=15.0)
+
+
 # ---------------------------------------------------------------------------
 
 def test_queue_size_not_a_public_parameter():

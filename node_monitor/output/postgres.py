@@ -111,6 +111,31 @@ class PostgresDaemonSink:
       self._started = True
       self._worker_task = asyncio.ensure_future(self._worker())
 
+   async def _cancel_worker(self):
+      """Cancel and await the worker task, tolerating its CancelledError.
+
+      Called from finalize_summary() cleanup when the finalize task itself
+      is cancelled (e.g. because queue.put(_STOP) was interrupted before
+      _STOP could be inserted).  The caller must have already called
+      current_task().uncancel() to suppress the pending cancellation
+      for the duration of this await; otherwise the await would be
+      immediately cancelled again before the worker has a chance to stop.
+
+      asyncio.to_thread cannot stop an already-running thread.  The worker
+      task wrapper will be cancelled and will raise CancelledError once the
+      thread returns.  Tests must release any controlled blocking thread to
+      avoid executor leakage; production threads are expected to be short.
+      """
+      if self._worker_task is None or self._worker_task.done():
+         return
+      self._worker_task.cancel()
+      try:
+         await self._worker_task
+      except (asyncio.CancelledError, Exception):
+         # CancelledError: worker was cancelled (expected).
+         # Any other exception: worker raised before being cancelled; ignore.
+         pass
+
    async def finalize_summary(self, acceptance_fn=None):
       """Drain the queue, stop the worker, then finalize the diagnostic sink.
 
@@ -136,7 +161,21 @@ class PostgresDaemonSink:
 
       # Send the stop sentinel and wait for the worker to drain everything
       # that was queued before this point.
-      await self._queue.put(_STOP)
+      #
+      # If this coroutine is cancelled while awaiting queue.put(_STOP) (e.g.
+      # the queue is full and a caller cancels us before a slot opens), _STOP
+      # never enters the queue and the worker would wait forever (orphan).
+      # We catch CancelledError here, call uncancel() to suppress the pending
+      # cancel so _cancel_worker() can await the worker task without being
+      # immediately re-cancelled, then re-raise CancelledError explicitly.
+      try:
+         await self._queue.put(_STOP)
+      except asyncio.CancelledError:
+         current = asyncio.current_task()
+         if current is not None:
+            current.uncancel()
+         await self._cancel_worker()
+         raise asyncio.CancelledError()
       if self._worker_task is not None:
          await self._worker_task
 
