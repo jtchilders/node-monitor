@@ -4,13 +4,12 @@ Login-node observability for ALCF systems. A resident daemon that SSH fans out
 to a configured set of login nodes, samples process and node-level state, and
 writes aggregates to PostgreSQL.
 
-**Status: Phase 0 implemented.** The JSONL-only Phase 0 daemon (config,
-transport, metrics/usage transforms, scheduler, sink, CLI, and deployment
-scripts) is built and unit/integration tested. It has not yet been proven by a
-real 24-hour Polaris canary run; see `PHASE0_DAEMON_IMPLEMENTATION_PLAN.md`
-(maintained outside this repository) for the remaining empirical-verification
-task. Phase 0 writes JSONL artifacts under `$HOME` only -- no PostgreSQL
-access; the PostgreSQL-backed collector described below is a later phase.
+**Status: Phase 0 and the initial PostgreSQL runtime are implemented.** The
+JSONL-only `daemon dry-run` and `daemon smoke` commands remain available for
+canaries. The production-shaped `daemon run` command writes five compact record
+types to PostgreSQL through a bounded asynchronous queue while retaining
+`diagnostic_census` as JSONL only. It requires an operator-migrated, current
+schema and never runs DDL itself.
 
 The detailed design document is maintained outside this repository. It records
 site-specific operational detail -- database topology, measured fleet state,
@@ -71,14 +70,27 @@ database, because argv routinely carries credentials.
     pip install -e .
     pytest
 
-## PostgreSQL schema operations
+## PostgreSQL daemon
 
-The Phase 1 migration and compact-writer infrastructure is operator-controlled;
-it does not change the Phase 0 daemon's JSONL-only behavior. Before using it,
-create the database and role administratively, take a verified backup, then use:
+Create a dedicated node-monitor database and role administratively. A development
+deployment may share the PostgreSQL server used by another application, but must
+use its own database (for example `node_monitor_dev`) and the schema must be
+exactly `node_monitor`. Node-monitor never manages the PostgreSQL server or
+another application's database.
+
+After configuring the database URL, apply migrations explicitly and start the
+database-writing daemon:
 
     node-monitor database status --config config.example.phase1.yaml
     node-monitor database migrate --config config.example.phase1.yaml
+    node-monitor database status --config config.example.phase1.yaml
+    node-monitor daemon run --config config.example.phase1.yaml
+
+`daemon run` performs a read-only schema gate and refuses uninitialized,
+pending, or drifted schemas. It writes `node_hardware`, compact counter-minute
+records, usage intervals, poll failures, and collection-log events relationally.
+Diagnostic censuses remain in the run directory as JSONL and have no relational
+table. Sustained writer failures are fatal and cannot produce a `DONE` marker.
 
 See [`docs/database.md`](docs/database.md) for prerequisites, advisory locking,
 fail-closed drift handling, backup/restore policy, and the strict prohibition on

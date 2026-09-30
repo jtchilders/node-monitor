@@ -5,9 +5,10 @@ a server with other applications, but it does not read, join, migrate, or
 otherwise manage their schemas. It also never starts, stops, restarts, or
 configures the PostgreSQL server.
 
-Phase 0 daemon commands remain JSONL-only. The database migration and writer
-components are Phase 1 infrastructure; enabling a future PostgreSQL sink is a
-separate operational decision.
+`daemon dry-run` and `daemon smoke` remain JSONL-only. `daemon run` enables the
+PostgreSQL runtime: five production record types are written relationally while
+diagnostic censuses remain JSONL-only. The runtime uses one bounded queue and one
+worker so synchronous database I/O does not block the scheduler.
 
 ## Prerequisites
 
@@ -29,8 +30,8 @@ responsibilities.
 
 1. Take and verify a database backup according to site policy. Node-monitor
    does not create or validate backups.
-2. Stop or quiesce any future database-writing node-monitor daemon before a
-   schema change. Phase 0 JSONL collection is independent and may continue.
+2. Stop or quiesce the database-writing `daemon run` process before a schema
+   change. Phase 0 JSONL collection is independent and may continue.
 3. Inspect the migration state without changing it:
 
    ```console
@@ -46,7 +47,16 @@ responsibilities.
    ```
 
 6. Run `database status` again and verify that no versions are pending and no
-   drift is reported before enabling a database-writing service.
+   drift is reported.
+7. Start the PostgreSQL-backed runtime:
+
+   ```console
+   node-monitor daemon run --config /path/to/config.yaml
+   ```
+
+   Startup performs the same migration-status check read-only and refuses an
+   uninitialized, pending, version-mismatched, or drifted schema. It never
+   invokes `migrate()`.
 
 Both commands emit bounded diagnostics and do not print the connection URL or
 raw database-driver exception. The configured SQLAlchemy pool is one connection
@@ -86,6 +96,28 @@ The daemon must never invoke migrations or issue schema DDL. Only the explicit
 operator command `database migrate` may apply DDL. `database status` is
 read-only. The compact writer performs DML only against an already-migrated
 schema and fails if required objects are absent.
+
+The relational targets are `node_hardware`, `node_counter_minute`,
+`node_usage_intervals`, `node_poll_failures`, and `node_collection_log` under
+the `node_monitor` schema. `diagnostic_census` deliberately has no relational
+target and remains in the run directory as JSONL. A sustained writer or database
+failure exits nonzero; finalization must succeed before `DONE` is written.
+
+## Isolated development database
+
+During active debugging, use a dedicated database such as `node_monitor_dev` on
+the existing PostgreSQL server. It is acceptable to discard and recreate only
+that development database after stopping node-monitor. Never drop, migrate,
+query, or otherwise alter the database used by `pbs-monitor` or another
+application, and never start, stop, restart, or reconfigure the shared server.
+
+A development reset is therefore narrowly scoped:
+
+1. Stop the node-monitor daemon.
+2. Drop and recreate only `node_monitor_dev` using administrator tooling.
+3. Run `node-monitor database migrate` against its configuration.
+4. Confirm `database status` is current.
+5. Restart `node-monitor daemon run`.
 
 Node-monitor must never manage PostgreSQL lifecycle operations. Do not add
 `pg_ctl`, service-manager, container-runtime, `CREATE DATABASE`, or role-management
