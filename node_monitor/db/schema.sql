@@ -2,8 +2,8 @@
 --
 -- Runtime database ownership (connections, migrations, and writers) belongs to
 -- node_monitor.database. This file is retained for legacy provisioning only;
--- it intentionally defines no migration ledger. Keep it byte-for-byte aligned
--- with migration 0001's source-table DDL after the migration header.
+-- it intentionally defines no migration ledger. Keep it semantically aligned
+-- with migration 0001's source-table DDL.
 
 CREATE SCHEMA IF NOT EXISTS node_monitor;
 
