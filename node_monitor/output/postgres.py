@@ -18,14 +18,22 @@ Design rules
   in the public signature).
 * Producers await a full queue and never drop records.
 * Unknown record types are rejected before queueing.
+* Writes after ``finalize_summary()`` are rejected.
 * The first ``DatabaseWriter.write_records`` failure is captured, wrapped in
-  a fixed bounded ``PostgresDaemonSinkError`` message (never driver detail),
-  and stored; subsequent producers re-raise it immediately; ``finalize()``
+  a fixed bounded ``PostgresDaemonSinkError`` message (never driver detail,
+  and no ``__cause__`` or ``__context__`` leaking driver exceptions), and
+  stored; subsequent producers re-raise it immediately; ``finalize_summary()``
   re-raises it after draining whichever records the worker already committed.
-* ``finalize()`` sends a sentinel to drain and stop the worker, awaits it,
-  then calls ``diagnostic_sink.finalize_summary()``.
-* ``write_done()`` is allowed only after ``finalize()`` and delegates to the
-  diagnostic sink.
+* After a writer failure, ALL subsequent producers raise -- including producers
+  that were blocked on a full queue and wake after the worker fails.
+* ``finalize_summary(acceptance_fn=None)`` sends a sentinel to drain and stop
+  the worker, awaits it, then calls
+  ``diagnostic_sink.finalize_summary(acceptance_fn=acceptance_fn)``.  The
+  finalized-success flag is only set after the diagnostic finalize completes
+  without error.
+* ``write_done()`` is allowed only after ``finalize_summary()`` succeeds and
+  delegates to the diagnostic sink.  A failed finalization leaves write_done()
+  forbidden.
 * No DDL, no database-server lifecycle, no pbs-monitor references.
 """
 
@@ -70,8 +78,8 @@ class PostgresDaemonSink:
    diagnostic_sink :
       A Phase0Sink-like collaborator that owns the ``diagnostic_census``
       JSONL artifact.  Must expose an async ``write_record(record_type,
-      record)`` coroutine, an async ``finalize_summary()`` coroutine, and
-      a synchronous ``write_done()`` method.
+      record)`` coroutine, an async ``finalize_summary(acceptance_fn=None)``
+      coroutine, and a synchronous ``write_done()`` method.
    _queue_size :
       Internal escape hatch for tests ONLY; must not be called
       ``queue_size`` so the public signature stays unambiguous.
@@ -83,7 +91,8 @@ class PostgresDaemonSink:
       self._queue = asyncio.Queue(_queue_size)
       self._worker_task = None
       self._error = None        # PostgresDaemonSinkError once set, immutable
-      self._finalized = False
+      self._finalized = False   # True only after successful finalize_summary()
+      self._finalize_attempted = False  # True after finalize_summary() is called
 
    # ------------------------------------------------------------------
    # Lifecycle
@@ -95,15 +104,22 @@ class PostgresDaemonSink:
          raise PostgresDaemonSinkError("start() called more than once")
       self._worker_task = asyncio.ensure_future(self._worker())
 
-   async def finalize(self):
+   async def finalize_summary(self, acceptance_fn=None):
       """Drain the queue, stop the worker, then finalize the diagnostic sink.
+
+      Matches the contract the daemon calls:
+      ``await self._sink.finalize_summary(acceptance_fn=self._build_acceptance)``
+
+      The finalized-success state (which permits write_done) is only recorded
+      after the diagnostic sink's own finalize_summary() completes without
+      raising.  If anything fails, write_done() remains forbidden.
 
       If a writer failure was recorded by the worker, re-raises it after
       the worker is fully stopped and the diagnostic sink is finalized.
       """
-      if self._finalized:
-         raise PostgresDaemonSinkError("finalize() called more than once")
-      self._finalized = True
+      if self._finalize_attempted:
+         raise PostgresDaemonSinkError("finalize_summary() called more than once")
+      self._finalize_attempted = True
 
       # Send the stop sentinel and wait for the worker to drain everything
       # that was queued before this point.
@@ -111,7 +127,12 @@ class PostgresDaemonSink:
       if self._worker_task is not None:
          await self._worker_task
 
-      await self._diagnostic_sink.finalize_summary()
+      # Delegate to the diagnostic sink; only mark success after this returns.
+      await self._diagnostic_sink.finalize_summary(acceptance_fn=acceptance_fn)
+
+      # Mark success only here -- after the diagnostic finalize_summary()
+      # returned without raising.
+      self._finalized = True
 
       if self._error is not None:
          raise self._error
@@ -119,11 +140,12 @@ class PostgresDaemonSink:
    def write_done(self):
       """Write the DONE flag via the diagnostic sink.
 
-      Must be called only after ``finalize()``.
+      Must be called only after ``finalize_summary()`` succeeds.
+      A failed finalization leaves this forbidden.
       """
       if not self._finalized:
          raise PostgresDaemonSinkError(
-            "write_done() called before finalize()")
+            "write_done() called before successful finalize_summary()")
       self._diagnostic_sink.write_done()
 
    # ------------------------------------------------------------------
@@ -134,12 +156,20 @@ class PostgresDaemonSink:
       """Route one record to the database queue or the diagnostic sink.
 
       Raises ``PostgresDaemonSinkError`` immediately for:
+      * Calls after finalize_summary() (attempted or succeeded).
       * An unknown record type.
       * A previously recorded writer failure (so producers see it promptly).
 
       For relational types the coroutine awaits ``self._queue.put(...)``
       which will block (not spin, never drop) when the queue is full.
+      After unblocking from a full queue, re-checks for writer failure
+      so a producer that was waiting cannot silently succeed after the
+      worker has failed.
       """
+      if self._finalize_attempted:
+         raise PostgresDaemonSinkError(
+            "write_record() called after finalize_summary()")
+
       if record_type == _DIAGNOSTIC_TYPE:
          await self._diagnostic_sink.write_record(record_type, record)
          return
@@ -150,12 +180,19 @@ class PostgresDaemonSink:
             % (record_type, sorted(_RELATIONAL_TYPES), _DIAGNOSTIC_TYPE))
 
       # Re-raise a previously recorded writer failure before queueing so
-      # callers learn about it promptly (design: "first writer failure is
-      # re-raised by producers").
+      # callers learn about it promptly.
       if self._error is not None:
          raise self._error
 
       await self._queue.put((record_type, record))
+
+      # Re-check after unblocking from a potentially full queue: a producer
+      # that was blocked may have woken up because the worker drained the
+      # queue after failing -- in that case the record was just enqueued
+      # but the worker will discard it.  Raise here so the producer does
+      # not return a silent success.
+      if self._error is not None:
+         raise self._error
 
    # ------------------------------------------------------------------
    # Internal worker
@@ -166,10 +203,11 @@ class PostgresDaemonSink:
 
       Runs until it dequeues the ``_STOP`` sentinel.  Any exception from
       ``writer.write_records`` is captured as a ``PostgresDaemonSinkError``
-      (bounded message, no driver detail).  Once an error is recorded the
-      worker drains the queue without writing (so ``finalize()``'s join
-      completes) and sets ``self._error`` for producers and ``finalize()``
-      to discover.
+      (bounded message, no driver detail, and no __cause__/__context__
+      pointing back to the original exception).  Once an error is recorded
+      the worker drains the queue without writing (so ``finalize_summary()``'s
+      join completes) and sets ``self._error`` for producers and
+      ``finalize_summary()`` to discover.
       """
       while True:
          item = await self._queue.get()
@@ -185,7 +223,12 @@ class PostgresDaemonSink:
                   [(record_type, record)],
                )
             except Exception:
-               # Capture a fixed bounded error; never interpolate
-               # any exception message or type name.
-               self._error = PostgresDaemonSinkError(_WRITER_FAILURE_MSG)
+               # Capture a fixed bounded error.  Use "raise ... from None"
+               # semantics by constructing a fresh exception with no
+               # __cause__ or __context__ so no driver detail escapes.
+               err = PostgresDaemonSinkError(_WRITER_FAILURE_MSG)
+               err.__cause__ = None
+               err.__context__ = None
+               err.__suppress_context__ = True
+               self._error = err
          self._queue.task_done()
