@@ -11,7 +11,11 @@ from node_monitor.database.migration import (
    MigrationStatus,
 )
 
+from node_monitor.database.writer import DatabaseWriteError, DatabaseWriter
+
 __all__ = [
+   "DatabaseWriteError",
+   "DatabaseWriter",
    "MigrationApplyError",
    "MigrationDriftError",
    "MigrationError",

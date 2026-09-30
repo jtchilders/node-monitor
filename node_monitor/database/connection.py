@@ -64,6 +64,14 @@ class NodeMonitorDB:
       except SQLAlchemyError:
          return False
 
+   def begin(self):
+      """Return the injected engine's transaction context manager.
+
+      The caller owns the context lifetime. This is the only engine
+      boundary exposed to writers; it performs no DDL or implicit work.
+      """
+      return self._engine.begin()
+
    def close(self):
       self._engine.dispose()
 

@@ -1,6 +1,7 @@
 """Real-PostgreSQL acceptance tests for the compact database writer."""
 
 import os
+from datetime import datetime, timezone
 
 import pytest
 
@@ -49,8 +50,9 @@ def test_hardware_retry_preserves_first_seen_and_known_boot_values(postgres_engi
          "SELECT first_seen, last_verified, boot_id, btime, cpu_model, "
          "net_ifaces, gpus FROM node_monitor.node_hardware"
       ).mappings().one()
-   assert row["first_seen"].isoformat() == "2026-09-29T12:00:00+00:00"
-   assert row["last_verified"] == NOW
+   assert row["first_seen"].astimezone(timezone.utc) == datetime(
+      2026, 9, 29, 12, 0, tzinfo=timezone.utc)
+   assert row["last_verified"].astimezone(timezone.utc) == NOW
    assert row["boot_id"] == "boot-a"
    assert row["btime"] == 100
    assert row["cpu_model"] == "Zen 2"
