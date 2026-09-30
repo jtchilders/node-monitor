@@ -1,11 +1,19 @@
 """Real-PostgreSQL acceptance tests for the compact database writer."""
 
+import hashlib
 import os
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.pool import NullPool
 
-from node_monitor.database.migration import MigrationRunner
+from node_monitor.database.migration import (
+   Migration,
+   MigrationDriftError,
+   MigrationRunner,
+   discover_migrations,
+)
 from node_monitor.database.writer import DatabaseWriter
 from tests.test_database_migration_postgres import postgres_engine
 from tests.test_database_writer import (
@@ -115,3 +123,57 @@ def test_event_records_append_and_round_trip_json(postgres_engine):
       ).scalars().all()
    assert poll_rows == ["probe timed out", "probe timed out"]
    assert log_rows == [{"version": "0.2.0"}, {"version": "0.2.0"}]
+
+
+def test_end_to_end_migrate_write_retry_fresh_read_noop_and_drift(postgres_engine):
+   packaged = discover_migrations()
+   runner = MigrationRunner(postgres_engine, "acceptance", migrations=packaged)
+   assert runner.migrate().applied_versions == (1,)
+
+   writer = DatabaseWriter(_InjectedDB(postgres_engine), clock=lambda: NOW)
+   writer.write_records([
+      ("node_hardware", _hardware()),
+      ("node_counter_samples", _counter()),
+      ("node_usage_intervals", _usage(None)),
+      ("node_poll_failures", _poll_failure()),
+      ("node_collection_log", _collection_log()),
+   ])
+   writer.write_records([
+      ("node_hardware", _hardware(cpu_model="Zen 2")),
+      ("node_counter_samples", _counter(coverage=0.5)),
+      ("node_usage_intervals", _usage(None, cpu_seconds=2.5)),
+      ("node_poll_failures", _poll_failure()),
+      ("node_collection_log", _collection_log()),
+   ])
+
+   fresh_engine = create_engine(postgres_engine.url, poolclass=NullPool)
+   try:
+      with fresh_engine.connect() as connection:
+         counts = {
+            table: connection.exec_driver_sql(
+               "SELECT count(*) FROM node_monitor.%s" % table).scalar_one()
+            for table in (
+               "node_hardware", "node_counter_minute", "node_usage_intervals",
+               "node_poll_failures", "node_collection_log",
+            )
+         }
+      assert counts == {
+         "node_hardware": 1, "node_counter_minute": 1,
+         "node_usage_intervals": 1, "node_poll_failures": 2,
+         "node_collection_log": 2,
+      }
+      assert MigrationRunner(
+         fresh_engine, "acceptance", migrations=packaged
+      ).migrate().applied_versions == ()
+
+      original = packaged[0]
+      changed_sql = original.sql + b"\n-- drift injected by acceptance test\n"
+      changed = Migration(
+         version=original.version, name=original.name, sql=changed_sql,
+         checksum=hashlib.sha256(changed_sql).hexdigest(), mode=original.mode)
+      with pytest.raises(MigrationDriftError):
+         MigrationRunner(
+            fresh_engine, "acceptance", migrations=(changed,)
+         ).migrate()
+   finally:
+      fresh_engine.dispose()
