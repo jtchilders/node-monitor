@@ -94,7 +94,7 @@ def _looks_like_intended_migration(filename):
    filename fails closed with a clear error instead of being silently
    skipped.
    """
-   if filename.startswith("__") :
+   if filename.startswith("__"):
       return False
    return filename.endswith(".sql")
 
@@ -115,9 +115,11 @@ def _build_migration(directory_or_traversable, filename, version, name,
 
 def _read_mode_marker(directory_or_traversable, marker_name):
    """Return the stripped text content of a ``<file>.sql.mode`` sidecar
-   if present, else None. Presence of this file means the migration
-   author explicitly declared a mode; only "transactional" is accepted
-   here, anything else is rejected rather than guessed.
+   if present, else None. This function only reads and strips whatever
+   text is present -- it does not itself validate or reject the mode
+   value; that check happens in ``Migration.__post_init__`` when the
+   returned string is used to construct the ``Migration``, so an
+   unsupported mode fails closed there rather than being guessed here.
    """
    try:
       marker = directory_or_traversable / marker_name
@@ -168,6 +170,10 @@ def _migrations_from_entries(entries, read_bytes, container):
       version, name = parsed
       migrations.append(
          _build_migration(container, filename, version, name, read_bytes))
+   if not migrations:
+      raise ValueError(
+         "no migrations found; every installation must ship at least "
+         "migration 1 (expected files matching NNNN_name.sql)")
    migrations.sort(key=lambda m: m.version)
    _validate_contiguous(migrations)
    return migrations

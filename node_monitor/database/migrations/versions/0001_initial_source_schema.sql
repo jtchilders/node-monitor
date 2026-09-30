@@ -5,8 +5,10 @@
 -- discover_migrations()) -- not a migration runner, not schema DDL.
 -- Task 3 replaces this comment with the reviewed source-table DDL
 -- (node_hardware, node_counter_minute, node_usage_intervals,
--- node_poll_failures, node_collection_log, schema_migrations) per
--- node_monitor_planning increment2-schema-migrations-writer.md.
+-- node_poll_failures, node_collection_log) per
+-- node_monitor_planning increment2-schema-migrations-writer.md. The
+-- runner's own bookkeeping table (schema_migrations) is bootstrapped
+-- by the runner itself, not by this migration.
 --
 -- This file's exact bytes are hashed with SHA-256 by
 -- discover_migrations(); do not edit trailing whitespace or line
