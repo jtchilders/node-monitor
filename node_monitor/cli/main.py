@@ -56,7 +56,7 @@ import sys
 
 import click
 import yaml
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, text
 
 from node_monitor import __version__
 from node_monitor.collector import transport
@@ -71,6 +71,7 @@ from node_monitor.config import (
 from node_monitor.daemon import EXIT_OK, Daemon
 from node_monitor.database.connection import NodeMonitorDB
 from node_monitor.database.migration import MigrationError, MigrationRunner
+from node_monitor.database.writer import DatabaseWriter
 from node_monitor.output.jsonl import (
    Phase0Sink,
    Phase0SinkDiskFullError,
@@ -79,6 +80,7 @@ from node_monitor.output.jsonl import (
    finalize_orphaned_run,
    validate_jsonl_artifact,
 )
+from node_monitor.output.postgres import PostgresDaemonSink
 
 # node_monitor/collector/remote_probe.py -- the ONLY probe binary this CLI
 # ever invokes, for both local nodes (by path, see _make_transport_fn) and
@@ -377,6 +379,86 @@ def daemon_smoke(config_path, home, run_id, duration_sec):
    if run_id is None:
       run_id = _default_run_id()
    exit_code = _run_daemon(config, config_path, run_id, probe_version)
+   sys.exit(exit_code)
+
+
+@daemon.command("run")
+@click.option("--config", "config_path", required=True,
+              type=click.Path(dir_okay=False),
+              help="Path to the strict nested Phase 1 YAML config file.")
+@click.option("--home", "home", default=None,
+              help="Override $HOME for output_root resolution "
+                   "(internal/test use; defaults to the real $HOME).")
+@click.option("--run-id", "run_id", default=None,
+              help="Explicit run id (defaults to a UTC timestamp).")
+@click.option("--duration-sec", "duration_sec", default=None, type=float,
+              help="Override the loaded config's duration_sec for this "
+                   "invocation only (optional; must be positive).")
+def daemon_run(config_path, home, run_id, duration_sec):
+   """Run the Phase 1 daemon: PostgreSQL sink + diagnostic JSONL.
+
+   Requires the strict NESTED configuration layout (nested
+   output/collection/ssh/safety/database/retention sections).
+   Performs a READ-ONLY schema gate via ``database status`` before
+   starting -- rejects unless the schema is fully current.  Never
+   calls ``database migrate``; run that operator command explicitly
+   first.
+   """
+   if duration_sec is not None and duration_sec <= 0:
+      _exit(1, "--duration-sec must be positive, got %r" % (duration_sec,),
+            err=True)
+
+   resolved_home = home if home is not None else os.path.expanduser("~")
+   database_url_env = os.environ.get("NODE_MONITOR_DB_URL")
+
+   try:
+      loaded = load_config_file_any(
+         config_path, home=resolved_home,
+         database_url_env=database_url_env)
+   except ConfigError as exc:
+      _exit(1, "invalid configuration: %s" % (_sanitize_config_error(exc),),
+            err=True)
+      return  # pragma: no cover
+   except yaml.YAMLError:
+      _exit(1, "config file is not valid YAML", err=True)
+      return  # pragma: no cover
+   except OSError:
+      _exit(1, "could not read configuration file", err=True)
+      return  # pragma: no cover
+
+   if not isinstance(loaded, NodeMonitorConfig):
+      _exit(1, "daemon run requires the nested configuration layout",
+            err=True)
+      return  # pragma: no cover
+
+   # Probe version resolved BEFORE engine creation: a bad interpreter
+   # fails here rather than after the pool is open.
+   probe_version = _resolve_probe_version(loaded.probe_python)
+
+   if run_id is None:
+      run_id = _default_run_id()
+
+   if duration_sec is not None:
+      nested_with_override = loaded
+      duration_sec_override = duration_sec
+   else:
+      nested_with_override = loaded
+      duration_sec_override = None
+
+   # Build a Phase0Config that incorporates the duration override (if any)
+   # for the nested-to-flat conversion -- done before engine creation so
+   # a bad override value fails before any pool is opened.
+   raw_flat = _nested_to_phase0_raw(
+      nested_with_override, duration_sec_override=duration_sec_override)
+   try:
+      phase0_config = load_config(raw_flat, home=resolved_home)
+   except ConfigError as exc:
+      _exit(1, "invalid configuration: %s" % (exc,), err=True)
+      return  # pragma: no cover
+
+   exit_code = _run_daemon_postgres(
+      loaded, config_path, run_id, probe_version, resolved_home,
+      phase0_config=phase0_config)
    sys.exit(exit_code)
 
 
@@ -762,6 +844,198 @@ def _config_to_raw(config):
 def _default_run_id():
    import time
    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+
+def _nested_to_phase0_raw(nested, duration_sec_override=None):
+   """Convert a validated ``NodeMonitorConfig`` into the flat raw mapping
+   that ``node_monitor.config.load_config`` accepts.
+
+   This is the ONLY authorised conversion path from the nested layout
+   to Phase0Config.  Every field is read from the appropriate nested
+   section so no information is lost or silently defaulted:
+
+   * ``collection.counter_rollup_interval_sec`` → ``rollup_interval_sec``
+   * ``ssh.connect_timeout_sec`` → ``ssh_connect_timeout_sec``
+   * ``ssh.counter_timeout_sec`` → ``counter_timeout_sec``
+   * ``ssh.census_timeout_sec`` → ``census_timeout_sec``
+   * node ``ssh_target`` is preserved exactly (present iff non-None)
+
+   ``duration_sec_override``, when given, replaces the collection value
+   for this invocation only (positive enforcement is the caller's
+   responsibility before calling this helper).
+   """
+   nodes_raw = []
+   for node in nested.nodes:
+      entry = {"hostname": node.hostname, "role": node.role}
+      if node.ssh_target is not None:
+         entry["ssh_target"] = node.ssh_target
+      nodes_raw.append(entry)
+
+   col = nested.collection
+   ssh = nested.ssh
+   safety = nested.safety
+   out = nested.output
+
+   return {
+      "system": nested.system,
+      "nodes": nodes_raw,
+      "probe_python": nested.probe_python,
+      "output_root": out.root,
+      "compress_census": out.compress_census,
+      "counter_interval_sec": col.counter_interval_sec,
+      "census_interval_sec": col.census_interval_sec,
+      "rollup_interval_sec": col.counter_rollup_interval_sec,
+      "usage_interval_sec": col.usage_interval_sec,
+      "duration_sec": (duration_sec_override
+                       if duration_sec_override is not None
+                       else col.duration_sec),
+      "keep_raw_args": col.keep_raw_args,
+      "counter_timeout_sec": ssh.counter_timeout_sec,
+      "census_timeout_sec": ssh.census_timeout_sec,
+      "ssh_connect_timeout_sec": ssh.connect_timeout_sec,
+      "max_parallel_polls": ssh.max_parallel_polls,
+      "min_free_disk_pct": safety.min_free_disk_pct,
+   }
+
+
+class _EngineAdapter:
+   """Minimal database adapter for ``DatabaseWriter``.
+
+   Wraps the migration engine's ``begin()`` after registering the
+   ``node_monitor`` search-path listener exactly once.  DatabaseWriter
+   only calls ``self._database.begin()``; this class exposes exactly
+   that.  The engine itself (and its pool) is owned by the caller and
+   disposed there -- this adapter holds no independent reference that
+   could create a second pool.
+   """
+
+   def __init__(self, engine):
+      self._engine = engine
+      event.listen(engine, "connect", self._set_search_path)
+
+   @staticmethod
+   def _set_search_path(dbapi_connection, connection_record):
+      cursor = dbapi_connection.cursor()
+      try:
+         cursor.execute('SET search_path TO "node_monitor"')
+      finally:
+         cursor.close()
+
+   def begin(self):
+      return self._engine.begin()
+
+
+def _schema_gate_or_exit(engine, app_version):
+   """Run ``MigrationRunner.status()`` read-only.
+
+   Returns normally when the schema is fully current:
+     initialized=True, pending_versions=(), drift=False,
+     current_version == latest_version.
+
+   Calls ``_exit(1, ...)`` for any rejection.  Never calls migrate().
+   The engine is NOT disposed here; the caller disposes it in a
+   ``finally`` block so disposal is guaranteed on every path.
+   """
+   try:
+      runner = MigrationRunner(engine, app_version)
+      status = runner.status()
+   except MigrationError:
+      _exit(1, "schema gate: database migration error; inspect operator logs",
+            err=True)
+      return  # pragma: no cover
+   except Exception:
+      _exit(1, "schema gate: database operation failed", err=True)
+      return  # pragma: no cover
+
+   if not status.initialized:
+      _exit(1, "schema gate: database schema not initialized; "
+               "run 'database migrate' first", err=True)
+      return  # pragma: no cover
+   if status.pending_versions:
+      _exit(1, "schema gate: pending migrations: %s; "
+               "run 'database migrate' first"
+               % ", ".join(str(v) for v in status.pending_versions),
+            err=True)
+      return  # pragma: no cover
+   if status.drift:
+      _exit(1, "schema gate: applied migration checksum drift detected; "
+               "inspect database before restarting", err=True)
+      return  # pragma: no cover
+   if status.current_version != status.latest_version:
+      _exit(1, "schema gate: schema at version %d but latest is %d; "
+               "run 'database migrate' first"
+               % (status.current_version, status.latest_version),
+            err=True)
+      return  # pragma: no cover
+
+
+def _run_daemon_postgres(nested, config_path, run_id, probe_version, home,
+                         phase0_config=None):
+   """Wire the PostgreSQL sink and run the daemon.
+
+   Order:
+   1. Create engine (one pool, shared with writer adapter).
+   2. Schema gate (status read-only; dispose engine and exit on failure).
+   3. Create Phase0Sink (diagnostic JSONL only; no artifacts on gate fail).
+   4. Create EngineAdapter + DatabaseWriter + PostgresDaemonSink.
+   5. Await sink.start().
+   6. Run Daemon; propagate exit code.
+   7. Dispose engine unconditionally in finally.
+
+   ``phase0_config`` is the already-validated Phase0Config derived from
+   ``nested`` (with any duration override applied); it is built by the
+   caller before this function is entered so that conversion errors fail
+   before any pool is opened.
+   """
+   database = nested.database
+   if phase0_config is None:
+      raw = _nested_to_phase0_raw(nested)
+      phase0_config = load_config(raw, home=home)
+
+   # Step 1 -- one engine for both gate and writer
+   engine = _create_migration_engine(database)
+   try:
+      # Step 2 -- read-only gate; _schema_gate_or_exit disposes nothing
+      _schema_gate_or_exit(engine, __version__)
+
+      # Step 3 -- Phase0Sink created AFTER successful gate so no run
+      # artifacts exist if the gate rejected the start
+      output_root = phase0_config.output_root
+      os.makedirs(output_root, exist_ok=True)
+      diagnostic_sink = Phase0Sink(
+         output_root, run_id,
+         metadata={"system": phase0_config.system},
+         min_free_disk_pct=phase0_config.min_free_disk_pct,
+         compress_census=phase0_config.compress_census,
+         keep_raw_args=phase0_config.keep_raw_args,
+      )
+      run_dir = diagnostic_sink.run_dir
+      click.echo("run_dir: %s" % run_dir)
+
+      # Step 4 -- one engine adapter; writer uses engine.begin() only
+      adapter = _EngineAdapter(engine)
+      writer = DatabaseWriter(adapter)
+      sink = PostgresDaemonSink(writer, diagnostic_sink)
+
+      # Step 5 -- start the sink worker before the daemon touches it
+      transport_fn = _make_transport_fn(phase0_config, probe_version)
+      daemon = Daemon(phase0_config, sink, transport_fn)
+
+      async def _run():
+         await sink.start()
+         return await daemon.run()
+
+      exit_code = asyncio.run(_run())
+
+   finally:
+      engine.dispose()
+
+   if exit_code == EXIT_OK:
+      click.echo("run complete")
+   else:
+      click.echo(
+         "run ended with a fatal condition (exit %d)" % exit_code, err=True)
+   return exit_code
 
 
 def main():

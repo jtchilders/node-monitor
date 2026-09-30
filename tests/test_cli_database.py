@@ -208,12 +208,25 @@ def test_database_lock_and_drift_fail_nonzero(tmp_path, monkeypatch, error):
    assert result.exit_code != 0
 
 
-def test_daemon_group_has_no_migration_command_or_runner_construction(monkeypatch):
+def test_daemon_dry_run_and_smoke_never_construct_migration_runner(monkeypatch):
+   """dry-run, smoke, and daemon --help never construct MigrationRunner.
+
+   ``daemon run`` legitimately constructs MigrationRunner read-only (the
+   schema gate); this test verifies only that the JSONL-only subcommands
+   (``dry-run``, ``smoke``) and the group-level ``--help`` remain isolated
+   from the database path, as required by the Phase 0 design.\n   """
    class ForbiddenRunner:
       def __init__(self, *args, **kwargs):
-         raise AssertionError("daemon path constructed MigrationRunner")
+         raise AssertionError("JSONL-only path constructed MigrationRunner")
 
    monkeypatch.setattr(cli_module, "MigrationRunner", ForbiddenRunner)
-   result = _invoke(["daemon", "--help"])
-   assert result.exit_code == 0
-   assert "migrate" not in result.output.lower()
+
+   result_help = _invoke(["daemon", "--help"])
+   assert result_help.exit_code == 0
+
+   result_dry_run_help = _invoke(["daemon", "dry-run", "--help"])
+   assert result_dry_run_help.exit_code == 0
+   assert "migrate" not in result_dry_run_help.output.lower()
+
+   result_smoke_help = _invoke(["daemon", "smoke", "--help"])
+   assert result_smoke_help.exit_code == 0
