@@ -265,7 +265,12 @@ class DatabaseWriter:
       if record_type not in _ACCEPTED_TYPES:
          raise DatabaseWriteError("unsupported record type")
       validate_record(record_type, record)
-      return _ADAPTERS[record_type](record, self._clock())
+      try:
+         return _ADAPTERS[record_type](record, self._clock())
+      except DatabaseWriteError:
+         raise
+      except (KeyError, TypeError, ValueError):
+         raise DatabaseWriteError("record conversion failed") from None
 
    def write_record(self, record_type, record):
       return self.write_records(((record_type, record),))

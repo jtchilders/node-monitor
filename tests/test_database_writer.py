@@ -261,8 +261,19 @@ def test_batch_validation_failure_executes_nothing():
 
 def test_database_failure_is_sanitized_and_chainless():
    secret = "DATABASE_PASSWORD_MUST_NOT_LEAK"
-   writer, db = _writer(_DB(RuntimeError("postgresql://user:%s@host/db" % secret)))
+   writer, db = _writer(_DB(RuntimeError("driver failure: " + secret)))
    with pytest.raises(DatabaseWriteError, match="database write failed") as caught:
       writer.write_record("node_collection_log", _collection_log())
    assert secret not in str(caught.value)
    assert caught.value.__cause__ is None
+
+
+def test_malformed_nested_record_conversion_is_sanitized_before_transaction():
+   writer, db = _writer()
+   malformed = _counter()
+   malformed["audit"] = {}
+   with pytest.raises(DatabaseWriteError, match="record conversion failed") as caught:
+      writer.write_record("node_counter_samples", malformed)
+   assert caught.value.__cause__ is None
+   assert db.begin_count == 0
+   assert db.connection.calls == []
