@@ -1075,3 +1075,141 @@ def test_queue_size_not_a_public_parameter():
    assert "queue_size" not in sig.parameters, (
       "queue_size must not be a public parameter; use _queue_size for tests only"
    )
+
+
+# ---------------------------------------------------------------------------
+# Task 3 corrective: abort() method -- worker cleanup on unexpected failure
+# ---------------------------------------------------------------------------
+#
+# When daemon.run() raises an unexpected exception (not a controlled daemon
+# exit), the caller must be able to cancel/await the worker task so it is
+# not orphaned.  PostgresDaemonSink.abort() must:
+# * Cancel and await the worker (if started, not already done).
+# * Be idempotent (callable when worker is None or already done).
+# * Leave _finalized False and write_done() forbidden.
+# * NOT call diagnostic_sink.finalize_summary or write_done (caller handles
+#   cleanup independently).
+# ---------------------------------------------------------------------------
+
+class _CapturingSink:
+   """Minimal diagnostic sink that records which lifecycle calls were made."""
+   def __init__(self):
+      self.calls = []
+
+   async def write_record(self, record_type, record):
+      self.calls.append(("write_record", record_type))
+
+   async def finalize_summary(self, acceptance_fn=None):
+      self.calls.append("finalize_summary")
+
+   def write_done(self):
+      self.calls.append("write_done")
+
+
+class _BlockingWriter:
+   """Writer that blocks until released; lets tests control timing."""
+   def __init__(self, release_event=None):
+      self._event = release_event or threading.Event()
+
+   def write_records(self, records):
+      self._event.wait()
+      return len(list(records))
+
+   def release(self):
+      self._event.set()
+
+
+def test_abort_before_start_is_idempotent():
+   """abort() before start() must not raise and must be a no-op."""
+   sink = PostgresDaemonSink(
+      writer=_BlockingWriter(), diagnostic_sink=_CapturingSink())
+
+   async def _go():
+      # abort() on unstarted sink must not raise; use short timeout
+      await asyncio.wait_for(sink.abort(), timeout=2.0)
+
+   _run(_go())
+   assert sink._finalized is False
+
+
+def test_abort_after_start_cancels_and_awaits_worker():
+   """abort() after start() must cancel the worker and leave it done."""
+   release = threading.Event()
+   writer = _BlockingWriter(release)
+   diag = _CapturingSink()
+   sink = PostgresDaemonSink(writer=writer, diagnostic_sink=diag,
+                             _queue_size=4)
+
+   async def _go():
+      await sink.start()
+      # Queue one record so worker may try to pick it up
+      await sink._queue.put(("node_hardware", {"dummy": True}))
+      # Give worker a moment to pick up the item
+      await asyncio.sleep(0.05)
+
+      # Release the blocking writer BEFORE abort so it can exit
+      release.set()
+
+      # abort() must cancel and await the worker within a short time
+      await asyncio.wait_for(sink.abort(), timeout=5.0)
+
+      worker = sink._worker_task
+      assert worker is not None
+      assert worker.done(), "worker must be done after abort()"
+
+   _run(_go())
+   # finalize_summary and write_done must NOT have been called
+   assert "finalize_summary" not in diag.calls
+   assert "write_done" not in diag.calls
+   assert sink._finalized is False
+
+
+def test_abort_after_done_worker_is_idempotent():
+   """abort() when worker already done must not raise."""
+   diag = _CapturingSink()
+   records_written = []
+
+   class QuickWriter:
+      def write_records(self, records):
+         records_written.extend(records)
+         return len(records_written)
+
+   sink = PostgresDaemonSink(writer=QuickWriter(), diagnostic_sink=diag,
+                             _queue_size=4)
+
+   async def _go():
+      await sink.start()
+      # Send sentinel directly to stop worker cleanly
+      from node_monitor.output.postgres import _STOP
+      await sink._queue.put(_STOP)
+      # Wait for worker to finish
+      await asyncio.wait_for(sink._worker_task, timeout=3.0)
+      assert sink._worker_task.done()
+
+      # Now abort should be a no-op
+      await asyncio.wait_for(sink.abort(), timeout=2.0)  # must not raise
+
+   _run(_go())
+   assert sink._finalized is False
+
+
+def test_abort_does_not_call_diagnostic_finalize():
+   """abort() must never call diagnostic_sink.finalize_summary."""
+   diag = _CapturingSink()
+
+   class QuickWriter:
+      def write_records(self, records):
+         return len(list(records))
+
+   sink = PostgresDaemonSink(writer=QuickWriter(), diagnostic_sink=diag,
+                             _queue_size=4)
+
+   async def _go():
+      await sink.start()
+      await asyncio.wait_for(sink.abort(), timeout=5.0)
+
+   _run(_go())
+   assert "finalize_summary" not in diag.calls, (
+      "abort() must not call diagnostic_sink.finalize_summary"
+   )
+   assert sink._finalized is False

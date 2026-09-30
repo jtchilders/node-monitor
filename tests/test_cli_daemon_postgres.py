@@ -904,3 +904,413 @@ def test_engine_disposed_after_normal_daemon_exit(tmp_path, monkeypatch):
    ])
 
    assert captures["engine"].disposed, "engine must be disposed after normal exit"
+
+
+# ---------------------------------------------------------------------------
+# 18. create_engine failure: sanitized exit, no URL/password/traceback
+# ---------------------------------------------------------------------------
+
+def test_create_engine_failure_sanitized_no_traceback_no_url(
+      tmp_path, monkeypatch):
+   """If create_engine raises, the error must be caught, engine disposed
+   not assumed, and the output must contain no raw exception/URL/password."""
+   secret = "CREATE_ENGINE_SECRET_MUST_NOT_APPEAR"
+   config_path = _write(tmp_path / "config.yaml", _nested_raw(
+      url="postgresql://baduser:%s@badhost/db" % secret))
+
+   monkeypatch.setattr(cli_module, "_resolve_probe_version",
+                       lambda probe_python: 42)
+   monkeypatch.setattr(
+      cli_module, "_create_migration_engine",
+      lambda database: (_ for _ in ()).throw(
+         Exception("driver failure: %s" % secret)))
+
+   result = _invoke([
+      "daemon", "run",
+      "--config", config_path,
+      "--home", str(tmp_path),
+   ])
+
+   assert result.exit_code != 0
+   assert secret not in result.output, (
+      "engine creation secret must not appear in output; got: %r" % result.output)
+   assert "Traceback" not in result.output
+   assert "driver failure" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# 19. Phase0Sink construction failure: sanitized, engine disposed, no daemon
+# ---------------------------------------------------------------------------
+
+def test_phase0sink_construction_failure_sanitized(tmp_path, monkeypatch):
+   """OSError/Phase0SinkError during Phase0Sink construction: fixed output,
+   engine disposed, no Daemon constructed."""
+   secret = "PHASE0SINK_SECRET_MUST_NOT_APPEAR"
+   config_path = _write(tmp_path / "config.yaml", _nested_raw())
+   captures = _patch_daemon_run(monkeypatch, tmp_path)
+
+   def _bad_sink_factory(*args, **kwargs):
+      raise OSError("disk %s" % secret)
+
+   monkeypatch.setattr(cli_module, "Phase0Sink", _bad_sink_factory)
+
+   result = _invoke([
+      "daemon", "run",
+      "--config", config_path,
+      "--home", str(tmp_path),
+   ])
+
+   assert result.exit_code != 0
+   assert secret not in result.output, (
+      "Phase0Sink error detail must not appear; got: %r" % result.output)
+   assert "Traceback" not in result.output
+   assert captures["engine"].disposed, "engine must be disposed on Phase0Sink failure"
+   assert captures["daemon_instances"] == [], "Daemon must not be constructed"
+
+
+def test_phase0sink_error_construction_failure_sanitized(tmp_path, monkeypatch):
+   """Phase0SinkError during Phase0Sink construction is also sanitized."""
+   secret = "SINK_ERROR_SECRET_MUST_NOT_APPEAR"
+   config_path = _write(tmp_path / "config.yaml", _nested_raw())
+   captures = _patch_daemon_run(monkeypatch, tmp_path)
+
+   def _bad_sink_factory(*args, **kwargs):
+      from node_monitor.output.jsonl import Phase0SinkError
+      raise Phase0SinkError("sink error %s" % secret)
+
+   monkeypatch.setattr(cli_module, "Phase0Sink", _bad_sink_factory)
+
+   result = _invoke([
+      "daemon", "run",
+      "--config", config_path,
+      "--home", str(tmp_path),
+   ])
+
+   assert result.exit_code != 0
+   assert secret not in result.output
+   assert "Traceback" not in result.output
+   assert captures["engine"].disposed
+
+
+# ---------------------------------------------------------------------------
+# 20. PostgresDaemonSink / DatabaseWriter / _EngineAdapter construction failure
+# ---------------------------------------------------------------------------
+
+def test_postgres_sink_construction_failure_sanitized(tmp_path, monkeypatch):
+   """Exception in PostgresDaemonSink constructor: sanitized, engine disposed."""
+   secret = "PG_SINK_CONSTRUCT_SECRET"
+   config_path = _write(tmp_path / "config.yaml", _nested_raw())
+   captures = _patch_daemon_run(monkeypatch, tmp_path)
+
+   def _bad_pg_sink(writer, diagnostic_sink):
+      raise RuntimeError("pg_sink error %s" % secret)
+
+   monkeypatch.setattr(cli_module, "PostgresDaemonSink", _bad_pg_sink)
+
+   result = _invoke([
+      "daemon", "run",
+      "--config", config_path,
+      "--home", str(tmp_path),
+   ])
+
+   assert result.exit_code != 0
+   assert secret not in result.output
+   assert "Traceback" not in result.output
+   assert captures["engine"].disposed
+
+
+def test_engine_adapter_construction_failure_sanitized(tmp_path, monkeypatch):
+   """Exception in _EngineAdapter constructor: sanitized, engine disposed."""
+   secret = "ADAPTER_CONSTRUCT_SECRET"
+   config_path = _write(tmp_path / "config.yaml", _nested_raw())
+   captures = _patch_daemon_run(monkeypatch, tmp_path)
+
+   class BadAdapter:
+      def __init__(self, eng):
+         raise RuntimeError("adapter error %s" % secret)
+
+   monkeypatch.setattr(cli_module, "_EngineAdapter", BadAdapter)
+
+   result = _invoke([
+      "daemon", "run",
+      "--config", config_path,
+      "--home", str(tmp_path),
+   ])
+
+   assert result.exit_code != 0
+   assert secret not in result.output
+   assert "Traceback" not in result.output
+   assert captures["engine"].disposed
+
+
+# ---------------------------------------------------------------------------
+# 21. sink.start() failure: sanitized, engine disposed, no daemon run
+# ---------------------------------------------------------------------------
+
+def test_sink_start_failure_sanitized(tmp_path, monkeypatch):
+   """Exception in sink.start(): sanitized output, engine disposed."""
+   secret = "SINK_START_SECRET_MUST_NOT_APPEAR"
+   config_path = _write(tmp_path / "config.yaml", _nested_raw())
+
+   call_order = []
+
+   class FailingSink(_PostgresSink):
+      async def start(self):
+         raise RuntimeError("start error %s" % secret)
+
+   pg_sink = FailingSink()
+   captures = _patch_daemon_run(monkeypatch, tmp_path, pg_sink=pg_sink)
+
+   result = _invoke([
+      "daemon", "run",
+      "--config", config_path,
+      "--home", str(tmp_path),
+   ])
+
+   assert result.exit_code != 0
+   assert secret not in result.output, (
+      "sink.start() error must not appear; got: %r" % result.output)
+   assert "Traceback" not in result.output
+   assert captures["engine"].disposed
+
+
+# ---------------------------------------------------------------------------
+# 22. Unexpected daemon.run() exception: worker abort + engine disposed
+# ---------------------------------------------------------------------------
+
+def test_unexpected_daemon_run_exception_aborts_worker_and_disposes_engine(
+      tmp_path, monkeypatch):
+   """When daemon.run() raises an unexpected exception (not a normal integer
+   exit), the worker task must be aborted and awaited (not orphaned), and
+   the engine must be disposed.  Fixed output only, no exception detail."""
+   secret = "DAEMON_RUN_EXCEPTION_SECRET"
+   config_path = _write(tmp_path / "config.yaml", _nested_raw())
+
+   abort_calls = []
+   start_calls = []
+
+   class TrackingSink(_PostgresSink):
+      async def start(self):
+         start_calls.append(1)
+
+      async def abort(self):
+         abort_calls.append(1)
+
+   pg_sink = TrackingSink()
+   captures = _patch_daemon_run(monkeypatch, tmp_path, pg_sink=pg_sink)
+
+   class ExplodingDaemon:
+      def __init__(self, config, sink, transport_fn):
+         pass
+
+      async def run(self):
+         raise RuntimeError("daemon exploded: %s" % secret)
+
+   monkeypatch.setattr(cli_module, "Daemon", ExplodingDaemon)
+
+   result = _invoke([
+      "daemon", "run",
+      "--config", config_path,
+      "--home", str(tmp_path),
+   ])
+
+   assert result.exit_code != 0
+   assert secret not in result.output, (
+      "daemon.run() exception detail must not appear; got: %r" % result.output)
+   assert "Traceback" not in result.output
+   assert captures["engine"].disposed
+   assert start_calls == [1], "sink.start() must have been called"
+   assert abort_calls == [1], (
+      "sink.abort() must have been called to clean up the worker; "
+      "got abort_calls=%r" % abort_calls)
+
+
+# ---------------------------------------------------------------------------
+# 23. dead if/else (duration_sec_override) removed -- both branches identical
+# ---------------------------------------------------------------------------
+
+def test_no_dead_nested_with_override_branches(monkeypatch):
+   """The dead if/else block in daemon_run that assigned nested_with_override=loaded
+   in both branches must be gone.  Verify that daemon_run no longer has the
+   dead no-op if/else at all."""
+   import inspect
+   import node_monitor.cli.main as m
+   # daemon_run is a Click Command; the real function is .callback
+   fn = m.daemon_run.callback if hasattr(m.daemon_run, "callback") else m.daemon_run
+   src = inspect.getsource(fn)
+   assert "nested_with_override" not in src, (
+      "Dead 'nested_with_override' variable must be removed from "
+      "daemon_run; got: %r" % src[:300]
+   )
+
+
+# ---------------------------------------------------------------------------
+# 24. _EngineAdapter: no search_path / event listener in production code
+# ---------------------------------------------------------------------------
+
+def test_engine_adapter_has_no_search_path_or_event_listener():
+   """_EngineAdapter must not register a connect listener or execute
+   search_path SQL.  It only wraps engine.begin()."""
+   import inspect
+   import node_monitor.cli.main as m
+   src = inspect.getsource(m._EngineAdapter)
+   assert "search_path" not in src, (
+      "_EngineAdapter must not contain search_path; got: %r" % src)
+   assert "event.listen" not in src, (
+      "_EngineAdapter must not call event.listen; got: %r" % src)
+   assert "_set_search_path" not in src
+
+
+def test_sqlalchemy_event_not_imported_if_unused():
+   """sqlalchemy.event must not be imported in cli.main if the
+   _EngineAdapter no longer uses it."""
+   import node_monitor.cli.main as m
+   # Check that 'event' from sqlalchemy is not bound in the module namespace
+   # as a standalone name (it was only used for the dead search_path listener).
+   # We allow 'event' to appear only as part of 'create_engine, event, text'
+   # import IF it is actually used elsewhere.  The simplest check is that
+   # the dead _set_search_path method does not exist on _EngineAdapter.
+   assert not hasattr(m._EngineAdapter, "_set_search_path"), (
+      "_EngineAdapter._set_search_path must be removed"
+   )
+
+
+# ---------------------------------------------------------------------------
+# 25. Strengthened JSONL isolation: dry-run and smoke real invocations
+#     with fake proc env, asserting database constructors are NEVER called.
+#     (task: "not only --help" -- real short runs that prove isolation)
+# ---------------------------------------------------------------------------
+
+import sys as _sys
+import os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "fixtures"))
+import fake_proc as _fake_proc  # noqa: E402
+
+
+@pytest.fixture
+def _fake_proc_env_for_isolation(tmp_path, monkeypatch):
+   """Synthetic /proc + /sys that lets the real probe run in tests."""
+   proc_root = str(tmp_path / "fakeproc")
+   _fake_proc.write_proc(proc_root, [
+      {"pid": 100, "comm": "bash", "cmdline": "-bash", "tty_nr": 34816},
+   ])
+   _fake_proc.write_proc_hwinfo(proc_root)
+   sys_root = str(tmp_path / "fakesys")
+   _fake_proc.write_sys_hwinfo(sys_root)
+   monkeypatch.setenv("NODE_MONITOR_PROC_ROOT", proc_root)
+   monkeypatch.setenv("NODE_MONITOR_SYS_ROOT", sys_root)
+   return proc_root
+
+
+def _probe_python_for_isolation():
+   import sys
+   versioned = _os.path.join(
+      _os.path.dirname(sys.executable),
+      "python%d.%d" % (sys.version_info[0], sys.version_info[1]))
+   if _os.path.exists(versioned):
+      return versioned
+   return sys.executable
+
+
+def _write_flat_config(tmp_path, home_dir, **overrides):
+   import yaml
+   raw = {
+      "system": "polaris",
+      "nodes": [{"hostname": "iso-test.example.org", "role": "local"}],
+      "output_root": "~/phase0-runs",
+      "probe_python": _probe_python_for_isolation(),
+      "counter_interval_sec": 1,
+      "census_interval_sec": 1,
+      "rollup_interval_sec": 1,
+      "usage_interval_sec": 1,
+      "duration_sec": 2,
+   }
+   raw.update(overrides)
+   _os.makedirs(_os.path.join(home_dir, "phase0-runs"), exist_ok=True)
+   config_path = str(tmp_path / "flat_config.yaml")
+   with open(config_path, "w") as handle:
+      yaml.safe_dump(raw, handle)
+   return config_path
+
+
+def _invoke_isolation(args, env=None):
+   from click.testing import CliRunner
+   from node_monitor.cli.main import cli
+   return CliRunner().invoke(cli, args, env=env, catch_exceptions=False)
+
+
+def test_dry_run_real_invocation_never_creates_engine_or_runner(
+      tmp_path, monkeypatch, _fake_proc_env_for_isolation):
+   """daemon dry-run must run a real short JSONL-only run without ever
+   constructing a migration engine or runner.  Database constructors are
+   forbidden in the dry-run path -- this is a real run, not just --help."""
+   home_dir = str(tmp_path / "home")
+   _os.makedirs(home_dir, exist_ok=True)
+   config_path = _write_flat_config(tmp_path, home_dir)
+
+   engine_created = []
+   runner_constructed = []
+
+   monkeypatch.setattr(cli_module, "_create_migration_engine",
+                       lambda database: engine_created.append(1) or _Engine())
+
+   class ForbiddenRunner:
+      def __init__(self, *args, **kwargs):
+         runner_constructed.append(1)
+         raise AssertionError("daemon dry-run must never construct MigrationRunner")
+
+   monkeypatch.setattr(cli_module, "MigrationRunner", ForbiddenRunner)
+
+   result = _invoke_isolation([
+      "daemon", "dry-run",
+      "--config", config_path,
+      "--home", home_dir,
+      "--run-id", "isolation-dry-run-1",
+   ])
+
+   assert result.exit_code == 0, (
+      "dry-run with fake proc env must succeed; output: %r" % result.output)
+   assert engine_created == [], "daemon dry-run must never create a migration engine"
+   assert runner_constructed == [], "daemon dry-run must never construct MigrationRunner"
+   # Verify JSONL artifacts were produced
+   run_dir = _os.path.join(home_dir, "phase0-runs", "phase0-isolation-dry-run-1")
+   assert _os.path.exists(_os.path.join(run_dir, "DONE")), (
+      "dry-run must produce DONE flag; run_dir=%r" % run_dir)
+
+
+def test_smoke_real_invocation_never_creates_engine_or_runner(
+      tmp_path, monkeypatch, _fake_proc_env_for_isolation):
+   """daemon smoke must run a real short JSONL-only run without ever
+   constructing a migration engine or runner."""
+   home_dir = str(tmp_path / "home")
+   _os.makedirs(home_dir, exist_ok=True)
+   config_path = _write_flat_config(tmp_path, home_dir, duration_sec=3600)
+
+   engine_created = []
+   runner_constructed = []
+
+   monkeypatch.setattr(cli_module, "_create_migration_engine",
+                       lambda database: engine_created.append(1) or _Engine())
+
+   class ForbiddenRunner:
+      def __init__(self, *args, **kwargs):
+         runner_constructed.append(1)
+         raise AssertionError("daemon smoke must never construct MigrationRunner")
+
+   monkeypatch.setattr(cli_module, "MigrationRunner", ForbiddenRunner)
+
+   result = _invoke_isolation([
+      "daemon", "smoke",
+      "--config", config_path,
+      "--home", home_dir,
+      "--run-id", "isolation-smoke-1",
+      "--duration-sec", "2",
+   ])
+
+   assert result.exit_code == 0, (
+      "smoke with fake proc env must succeed; output: %r" % result.output)
+   assert engine_created == [], "daemon smoke must never create a migration engine"
+   assert runner_constructed == [], "daemon smoke must never construct MigrationRunner"
+   run_dir = _os.path.join(home_dir, "phase0-runs", "phase0-isolation-smoke-1")
+   assert _os.path.exists(_os.path.join(run_dir, "DONE")), (
+      "smoke must produce DONE flag; run_dir=%r" % run_dir)

@@ -111,6 +111,17 @@ class PostgresDaemonSink:
       self._started = True
       self._worker_task = asyncio.ensure_future(self._worker())
 
+   async def abort(self):
+      """Cancel and await the worker task without finalizing anything.
+
+      Called when daemon.run() raises an unexpected exception after
+      start() has been called, to ensure the worker task is not orphaned.
+      Idempotent: safe to call before start(), or when worker is already done.
+      Does NOT call diagnostic_sink.finalize_summary or write_done -- the
+      caller is responsible for any diagnostic cleanup it needs.
+      """
+      await self._cancel_worker()
+
    async def _cancel_worker(self):
       """Cancel and await the worker task, tolerating its CancelledError.
 

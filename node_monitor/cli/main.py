@@ -56,7 +56,7 @@ import sys
 
 import click
 import yaml
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, text
 
 from node_monitor import __version__
 from node_monitor.collector import transport
@@ -438,18 +438,13 @@ def daemon_run(config_path, home, run_id, duration_sec):
    if run_id is None:
       run_id = _default_run_id()
 
-   if duration_sec is not None:
-      nested_with_override = loaded
-      duration_sec_override = duration_sec
-   else:
-      nested_with_override = loaded
-      duration_sec_override = None
+   duration_sec_override = duration_sec  # None if not given; positive if given
 
    # Build a Phase0Config that incorporates the duration override (if any)
    # for the nested-to-flat conversion -- done before engine creation so
    # a bad override value fails before any pool is opened.
    raw_flat = _nested_to_phase0_raw(
-      nested_with_override, duration_sec_override=duration_sec_override)
+      loaded, duration_sec_override=duration_sec_override)
    try:
       phase0_config = load_config(raw_flat, home=resolved_home)
    except ConfigError as exc:
@@ -901,25 +896,14 @@ def _nested_to_phase0_raw(nested, duration_sec_override=None):
 class _EngineAdapter:
    """Minimal database adapter for ``DatabaseWriter``.
 
-   Wraps the migration engine's ``begin()`` after registering the
-   ``node_monitor`` search-path listener exactly once.  DatabaseWriter
-   only calls ``self._database.begin()``; this class exposes exactly
-   that.  The engine itself (and its pool) is owned by the caller and
-   disposed there -- this adapter holds no independent reference that
-   could create a second pool.
+   Exposes ``begin()`` over the shared migration engine so
+   ``DatabaseWriter`` can open transactions without holding an
+   independent engine reference or creating a second pool.
+   The engine (and its pool) is owned and disposed by the caller.
    """
 
    def __init__(self, engine):
       self._engine = engine
-      event.listen(engine, "connect", self._set_search_path)
-
-   @staticmethod
-   def _set_search_path(dbapi_connection, connection_record):
-      cursor = dbapi_connection.cursor()
-      try:
-         cursor.execute('SET search_path TO "node_monitor"')
-      finally:
-         cursor.close()
 
    def begin(self):
       return self._engine.begin()
@@ -992,43 +976,78 @@ def _run_daemon_postgres(nested, config_path, run_id, probe_version, home,
       raw = _nested_to_phase0_raw(nested)
       phase0_config = load_config(raw, home=home)
 
-   # Step 1 -- one engine for both gate and writer
-   engine = _create_migration_engine(database)
+   # Step 1 -- one engine for both gate and writer.
+   # create_engine failure is sanitized: no URL/driver detail in output.
+   engine = None
    try:
-      # Step 2 -- read-only gate; _schema_gate_or_exit disposes nothing
+      engine = _create_migration_engine(database)
+   except Exception:
+      _exit(1, "daemon run: could not initialize database connection",
+            err=True)
+      return  # pragma: no cover -- _exit always raises SystemExit
+
+   try:
+      # Step 2 -- read-only gate; _schema_gate_or_exit calls _exit on failure
+      # which raises SystemExit.  Catch Exception (not BaseException) so
+      # SystemExit from _exit propagates through the finally for disposal.
       _schema_gate_or_exit(engine, __version__)
 
       # Step 3 -- Phase0Sink created AFTER successful gate so no run
-      # artifacts exist if the gate rejected the start
-      output_root = phase0_config.output_root
-      os.makedirs(output_root, exist_ok=True)
-      diagnostic_sink = Phase0Sink(
-         output_root, run_id,
-         metadata={"system": phase0_config.system},
-         min_free_disk_pct=phase0_config.min_free_disk_pct,
-         compress_census=phase0_config.compress_census,
-         keep_raw_args=phase0_config.keep_raw_args,
-      )
+      # artifacts exist if the gate rejected the start.
+      # OSError/Phase0SinkError during construction: sanitized, engine disposed.
+      try:
+         output_root = phase0_config.output_root
+         os.makedirs(output_root, exist_ok=True)
+         diagnostic_sink = Phase0Sink(
+            output_root, run_id,
+            metadata={"system": phase0_config.system},
+            min_free_disk_pct=phase0_config.min_free_disk_pct,
+            compress_census=phase0_config.compress_census,
+            keep_raw_args=phase0_config.keep_raw_args,
+         )
+      except (OSError, Phase0SinkError):
+         _exit(1, "daemon run: could not create diagnostic output directory",
+               err=True)
+         return  # pragma: no cover
+
       run_dir = diagnostic_sink.run_dir
       click.echo("run_dir: %s" % run_dir)
 
-      # Step 4 -- one engine adapter; writer uses engine.begin() only
-      adapter = _EngineAdapter(engine)
-      writer = DatabaseWriter(adapter)
-      sink = PostgresDaemonSink(writer, diagnostic_sink)
+      # Step 4 -- one engine adapter; writer uses engine.begin() only.
+      # Any construction exception here is sanitized.
+      try:
+         adapter = _EngineAdapter(engine)
+         writer = DatabaseWriter(adapter)
+         sink = PostgresDaemonSink(writer, diagnostic_sink)
+         transport_fn = _make_transport_fn(phase0_config, probe_version)
+         daemon = Daemon(phase0_config, sink, transport_fn)
+      except Exception:
+         _exit(1, "daemon run: could not initialize daemon components",
+               err=True)
+         return  # pragma: no cover
 
-      # Step 5 -- start the sink worker before the daemon touches it
-      transport_fn = _make_transport_fn(phase0_config, probe_version)
-      daemon = Daemon(phase0_config, sink, transport_fn)
-
+      # Step 5+6 -- start the sink worker, run the daemon.
+      # Unexpected exceptions from sink.start() or daemon.run() are
+      # sanitized.  If daemon.run() raises after sink.start() succeeded,
+      # abort() cancels and awaits the worker so it is not orphaned.
       async def _run():
          await sink.start()
-         return await daemon.run()
+         try:
+            return await daemon.run()
+         except Exception:
+            # daemon.run() raised unexpectedly; abort the worker task.
+            await sink.abort()
+            raise
 
-      exit_code = asyncio.run(_run())
+      try:
+         exit_code = asyncio.run(_run())
+      except Exception:
+         _exit(1, "daemon run: unexpected runtime failure", err=True)
+         return  # pragma: no cover
 
    finally:
-      engine.dispose()
+      if engine is not None:
+         engine.dispose()
 
    if exit_code == EXIT_OK:
       click.echo("run complete")
