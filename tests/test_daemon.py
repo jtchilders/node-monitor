@@ -3126,3 +3126,359 @@ class TestNoDatabaseImports:
       assert result.returncode == 0, (
          "daemon import pulled in a database module: stdout=%r stderr=%r"
          % (result.stdout, result.stderr))
+
+
+# --------------------------------------------------------------------------
+# Task 2: PostgresDaemonSinkError fatal-boundary compatibility.
+#
+# ``PostgresDaemonSinkError`` (from ``node_monitor.output.postgres``) is the
+# sink-layer exception the PostgresDaemonSink raises for ANY write or
+# finalize failure.  Design: the daemon's own fatal-sink contract --
+# \"Output write/flush failure or low disk is fatal\" -- must treat
+# PostgresDaemonSinkError exactly like Phase0SinkError, Phase0SinkDiskFullError,
+# and OSError at EVERY catch boundary in daemon.py:
+#
+#   * hardware initial write (run() pre-scheduler try-except)
+#   * scheduler-miss write (_observe_scheduler_event)
+#   * ordinary poll failure write (_poll_fn, both hostname-mismatch and
+#     transport-failure branches)
+#   * counter/census data write (_poll_fn's inner try-except)
+#   * trailing-window flush (_flush_trailing_counter/usage_windows via run())
+#   * finalize_summary() / write_done() (run()'s final try-except)
+#
+# Each test drives a sink stub that raises PostgresDaemonSinkError at
+# exactly one boundary, then asserts EXIT_SINK_FATAL, no summary.json,
+# no DONE file, and (where applicable) that the scheduler never started.
+#
+# A companion static-AST test asserts that daemon.py imports
+# PostgresDaemonSinkError from node_monitor.output.postgres only -- never
+# from node_monitor.database, node_monitor.db, sqlalchemy, or psycopg2.
+# --------------------------------------------------------------------------
+
+from node_monitor.output.postgres import PostgresDaemonSinkError  # noqa: E402
+
+
+class _PostgresSinkErrorOnWrite:
+   """Sink stub: raises PostgresDaemonSinkError on every write_record()
+   call, but never on finalize_summary()/write_done() (those paths are
+   covered by separate stubs below).  Exposes a real run_dir so callers
+   can assert no summary.json/DONE was created there.
+   """
+
+   def __init__(self, run_dir):
+      self.run_dir = run_dir
+      self.write_record_called = False
+      self.finalize_called = False
+      self.write_done_called = False
+
+   async def write_record(self, record_type, record):
+      self.write_record_called = True
+      raise PostgresDaemonSinkError(
+         "PostgresDaemonSinkError: simulated PostgreSQL write failure for %s"
+         % record_type)
+
+   async def finalize_summary(self, acceptance_fn=None):
+      self.finalize_called = True
+      raise AssertionError(
+         "finalize_summary() must never be called after a fatal "
+         "PostgresDaemonSinkError from write_record()")
+
+   def write_done(self):
+      self.write_done_called = True
+      raise AssertionError(
+         "write_done() must never be called after a fatal "
+         "PostgresDaemonSinkError from write_record()")
+
+
+class _PostgresSinkErrorOnSelectiveWrite:
+   """Wraps a real Phase0Sink and raises PostgresDaemonSinkError for one
+   specific record_type, delegates to the real sink for all others.
+   finalize_summary()/write_done() both raise AssertionError (must never
+   be reached after a fatal write failure).
+   """
+
+   def __init__(self, real_sink, failing_record_type):
+      self._real_sink = real_sink
+      self._failing_record_type = failing_record_type
+      self.run_dir = real_sink.run_dir
+
+   async def write_record(self, record_type, record):
+      if record_type == self._failing_record_type:
+         raise PostgresDaemonSinkError(
+            "PostgresDaemonSinkError: simulated PostgreSQL write failure for %s"
+            % record_type)
+      await self._real_sink.write_record(record_type, record)
+
+   async def finalize_summary(self, acceptance_fn=None):
+      raise AssertionError(
+         "finalize_summary() must never be called after a fatal "
+         "PostgresDaemonSinkError from write_record()")
+
+   def write_done(self):
+      raise AssertionError(
+         "write_done() must never be called after a fatal "
+         "PostgresDaemonSinkError from write_record()")
+
+
+class _PostgresSinkErrorOnFinalize:
+   """Sink stub: write_record() always succeeds (no-op), but
+   finalize_summary() raises PostgresDaemonSinkError.
+   write_done() raises AssertionError -- must never be reached after a
+   failed finalize.
+   """
+
+   def __init__(self, run_dir):
+      self.run_dir = run_dir
+      self.write_done_called = False
+
+   async def write_record(self, record_type, record):
+      return None
+
+   async def finalize_summary(self, acceptance_fn=None):
+      raise PostgresDaemonSinkError(
+         "PostgresDaemonSinkError: simulated PostgreSQL finalize failure")
+
+   def write_done(self):
+      self.write_done_called = True
+      raise AssertionError(
+         "write_done() must never be called when finalize_summary() raised "
+         "PostgresDaemonSinkError")
+
+
+class TestPostgresDaemonSinkErrorFatalBoundary:
+   """PostgresDaemonSinkError is treated exactly like Phase0SinkError/
+   Phase0SinkDiskFullError/OSError at every fatal-sink boundary in daemon.py.
+   """
+
+   def test_postgres_sink_error_during_hardware_write_is_fatal(
+         self, tmp_path):
+      """PostgresDaemonSinkError raised during the initial hardware write
+      (before the scheduler starts) must:
+        - return EXIT_SINK_FATAL
+        - never call finalize_summary() or write_done()
+        - never start the scheduler (no node_counter_samples artifact)
+
+      This is the primary Task 2 acceptance criterion.
+      """
+      config = _config(tmp_path, duration_sec=20)
+      real_sink = Phase0Sink(
+         os.path.join(str(tmp_path), "phase0-runs"),
+         "daemon-task2-hw-postgres-err",
+         metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      sink = _PostgresSinkErrorOnSelectiveWrite(real_sink, "node_hardware")
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+      # Scheduler must never have started -- no counter samples produced.
+      assert not os.path.exists(
+         os.path.join(real_sink.run_dir, "node_counter_samples.jsonl"))
+
+   def test_postgres_sink_error_during_counter_poll_write_is_fatal(
+         self, tmp_path):
+      """PostgresDaemonSinkError raised during a scheduled counter-poll
+      write (node_counter_samples) inside the running scheduler must
+      map to EXIT_SINK_FATAL and never call finalize/DONE.
+      """
+      config = _config(tmp_path, duration_sec=20)
+      real_sink = Phase0Sink(
+         os.path.join(str(tmp_path), "phase0-runs"),
+         "daemon-task2-counter-postgres-err",
+         metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      sink = _PostgresSinkErrorOnSelectiveWrite(real_sink, "node_counter_samples")
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
+   def test_postgres_sink_error_during_census_poll_write_is_fatal(
+         self, tmp_path):
+      """PostgresDaemonSinkError raised during a scheduled census-poll
+      write (diagnostic_census) inside the running scheduler must
+      map to EXIT_SINK_FATAL and never call finalize/DONE.
+      """
+      config = _config(tmp_path, duration_sec=20)
+      real_sink = Phase0Sink(
+         os.path.join(str(tmp_path), "phase0-runs"),
+         "daemon-task2-census-postgres-err",
+         metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      sink = _PostgresSinkErrorOnSelectiveWrite(real_sink, "diagnostic_census")
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
+   def test_postgres_sink_error_during_finalize_summary_is_fatal_no_done(
+         self, tmp_path):
+      """PostgresDaemonSinkError raised inside finalize_summary() must:
+        - return EXIT_SINK_FATAL
+        - never call write_done()
+
+      Mirrors the existing test_raw_oserror_from_finalize_summary_stops_daemon_
+      nonzero test, but for PostgresDaemonSinkError specifically.
+      """
+      config = _config(tmp_path, duration_sec=5)
+      real_sink = Phase0Sink(
+         os.path.join(str(tmp_path), "phase0-runs"),
+         "daemon-task2-finalize-postgres-err",
+         metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      stub = _PostgresSinkErrorOnFinalize(real_sink.run_dir)
+      clock = FakeClock()
+
+      daemon = Daemon(config, stub, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_SINK_FATAL
+      assert not stub.write_done_called
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
+   def test_postgres_sink_error_during_poll_failure_record_write_is_fatal(
+         self, tmp_path):
+      """PostgresDaemonSinkError raised while writing a node_poll_failures
+      record (the record for an ordinary counter/census probe failure) must
+      map to EXIT_SINK_FATAL -- same contract as an OSError at that boundary.
+      """
+      config = _config(tmp_path, duration_sec=10)
+      real_sink = Phase0Sink(
+         os.path.join(str(tmp_path), "phase0-runs"),
+         "daemon-task2-pollfail-postgres-err",
+         metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      sink = _PostgresSinkErrorOnSelectiveWrite(real_sink, "node_poll_failures")
+      clock = FakeClock()
+      call_counts = {"counter": 0}
+
+      async def transport_fn(node, loop):
+         if loop == "hwinfo":
+            return _hwinfo_payload()
+         if loop == "counter":
+            call_counts["counter"] += 1
+            return _counter_payload(uptime_sec=float(call_counts["counter"]))
+         raise RuntimeError("ordinary census failure")
+
+      daemon = Daemon(config, sink, transport_fn,
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
+   def test_postgres_sink_error_during_trailing_flush_is_fatal(
+         self, tmp_path):
+      """PostgresDaemonSinkError raised during the trailing-window flush
+      (after orderly stop, before finalize) must map to EXIT_SINK_FATAL
+      and never call finalize/DONE.
+      """
+      config = _config(
+         tmp_path, rollup_interval_sec=100, usage_interval_sec=3,
+         duration_sec=3)
+      real_sink = Phase0Sink(
+         os.path.join(str(tmp_path), "phase0-runs"),
+         "daemon-task2-trailing-postgres-err",
+         metadata={"system": config.system},
+         disk_usage_fn=_full_disk_usage)
+      sink = _PostgresSinkErrorOnSelectiveWrite(real_sink, "node_counter_samples")
+      clock = FakeClock()
+
+      daemon = Daemon(config, sink, _make_transport_fn(),
+                       clock=clock.time, sleep=clock.sleep)
+
+      async def scenario():
+         run_task = asyncio.ensure_future(daemon.run())
+         await clock.advance(config.duration_sec)
+         return await run_task
+
+      exit_code = _run(scenario())
+
+      assert exit_code == EXIT_SINK_FATAL
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "summary.json"))
+      assert not os.path.exists(os.path.join(real_sink.run_dir, "DONE"))
+
+   def test_daemon_module_imports_postgres_error_from_output_not_database(self):
+      """Static AST check: daemon.py must import PostgresDaemonSinkError
+      from node_monitor.output.postgres only -- NEVER from
+      node_monitor.database, node_monitor.db, sqlalchemy, or psycopg2.
+      Mirrors the existing TestNoDatabaseImports static checks.
+      """
+      import node_monitor.daemon as daemon_mod
+
+      source = open(daemon_mod.__file__).read()
+      tree = ast.parse(source)
+
+      # Must be importable from output.postgres.
+      imports_postgres_error = False
+      for node in ast.walk(tree):
+         if isinstance(node, ast.ImportFrom):
+            if (node.module == "node_monitor.output.postgres"
+                  and any(alias.name == "PostgresDaemonSinkError"
+                          for alias in node.names)):
+               imports_postgres_error = True
+      assert imports_postgres_error, (
+         "daemon.py must import PostgresDaemonSinkError from "
+         "node_monitor.output.postgres")
+
+      # Must NOT come from any database/driver module.
+      forbidden_sources = (
+         "node_monitor.database", "node_monitor.db",
+         "sqlalchemy", "psycopg2",
+      )
+      for node in ast.walk(tree):
+         if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for src in forbidden_sources:
+               if module == src or module.startswith(src + "."):
+                  for alias in node.names:
+                     assert alias.name != "PostgresDaemonSinkError", (
+                        "PostgresDaemonSinkError imported from forbidden "
+                        "module %s" % module)

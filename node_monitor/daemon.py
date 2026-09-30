@@ -160,13 +160,17 @@ Nothing in this module imports a database driver, an ORM, or
 database imports/connections" (Task 7 write-up). Only
 ``node_monitor.collector.cpu_delta``, ``node_monitor.collector.
 metrics``, ``node_monitor.collector.scheduler``, ``node_monitor.
-collector.usage``, and ``node_monitor.output.jsonl`` are imported,
-none of which touch PostgreSQL either (unlike ``node_monitor.
-collector.hardware``, which is deliberately NOT imported here -- that
-module's ``upsert_hardware``/SQLAlchemy-based upsert is a future
-production-database concern, not this Phase 0 JSONL-only daemon's;
-this module builds its own minimal, pure ``node_hardware`` contract
-record straight from a raw hwinfo probe payload instead).
+collector.usage``, ``node_monitor.output.jsonl``, and
+``node_monitor.output.postgres`` (solely for its
+``PostgresDaemonSinkError`` exception class -- no database driver,
+writer, or connection is pulled in through this import) are imported,
+none of which touch PostgreSQL directly either (unlike
+``node_monitor.collector.hardware``, which is deliberately NOT
+imported here -- that module's ``upsert_hardware``/SQLAlchemy-based
+upsert is a future production-database concern, not this Phase 0
+JSONL-only daemon's; this module builds its own minimal, pure
+``node_hardware`` contract record straight from a raw hwinfo probe
+payload instead).
 """
 
 import asyncio
@@ -188,6 +192,7 @@ from node_monitor.collector.usage import (
 )
 from node_monitor.output.acceptance import evaluate_acceptance
 from node_monitor.output.jsonl import Phase0SinkDiskFullError, Phase0SinkError
+from node_monitor.output.postgres import PostgresDaemonSinkError
 
 # Exit codes for Daemon.run(). Design: "Output write/flush failure or
 # low disk is fatal ... [must stop] the daemon nonzero" -- a caller
@@ -746,7 +751,7 @@ class Daemon:
          if event_type == "scheduler_miss":
             try:
                await self._record_scheduler_miss(event)
-            except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as sink_exc:
+            except (Phase0SinkDiskFullError, Phase0SinkError, PostgresDaemonSinkError, OSError) as sink_exc:
                # Same fatal contract as every other sink write in this
                # module. Deliberately NOT re-raised past this point:
                # Scheduler itself is agnostic to sink exception types
@@ -966,7 +971,7 @@ class Daemon:
       except Exception as exc:
          try:
             await self._record_ordinary_poll_failure(node, loop, exc)
-         except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as sink_exc:
+         except (Phase0SinkDiskFullError, Phase0SinkError, PostgresDaemonSinkError, OSError) as sink_exc:
             # Same fatal contract as every other sink write in this
             # module: a write/flush failure recording the poll failure
             # ITSELF is still a sink failure, and design's "Output
@@ -993,7 +998,7 @@ class Daemon:
          # side of the collision).
          try:
             await self._record_ordinary_poll_failure(node, loop, exc)
-         except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as sink_exc:
+         except (Phase0SinkDiskFullError, Phase0SinkError, PostgresDaemonSinkError, OSError) as sink_exc:
             self._fatal_error = sink_exc
             self._scheduler.request_stop()
             raise
@@ -1018,7 +1023,7 @@ class Daemon:
             await self._handle_counter_poll(node, payload)
          elif loop == "census":
             await self._handle_census_poll(node, payload)
-      except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as exc:
+      except (Phase0SinkDiskFullError, Phase0SinkError, PostgresDaemonSinkError, OSError) as exc:
          # Design: "Output write/flush failure or low disk is fatal
          # because JSONL is the only Phase 0 result." A real
          # write/flush/fsync failure from the sink's own file handles
@@ -1477,7 +1482,7 @@ class Daemon:
       try:
          for node in self._config.nodes:
             await self._collect_hardware(node)
-      except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as exc:
+      except (Phase0SinkDiskFullError, Phase0SinkError, PostgresDaemonSinkError, OSError) as exc:
          self._fatal_error = exc
          return EXIT_SINK_FATAL
 
@@ -1531,14 +1536,14 @@ class Daemon:
       # above.
       try:
          await self._flush_trailing_windows()
-      except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as exc:
+      except (Phase0SinkDiskFullError, Phase0SinkError, PostgresDaemonSinkError, OSError) as exc:
          self._fatal_error = exc
          return EXIT_SINK_FATAL
 
       try:
          await self._sink.finalize_summary(acceptance_fn=self._build_acceptance)
          self._sink.write_done()
-      except (Phase0SinkDiskFullError, Phase0SinkError, OSError) as exc:
+      except (Phase0SinkDiskFullError, Phase0SinkError, PostgresDaemonSinkError, OSError) as exc:
          # Same fatal contract as the counter-poll boundary above:
          # finalize_summary() flushes/fsyncs every open JSONL handle
          # and write_done() fsyncs its own DONE file, both of which
