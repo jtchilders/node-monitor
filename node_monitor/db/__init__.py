@@ -1,7 +1,7 @@
-"""node_monitor.db -- schema DDL and the daemon-side hardware writer.
+"""Legacy/bootstrap SQL artifact for node-monitor source tables.
 
-Separate from node_monitor/database/ (which predates this task and is left
-untouched) because the card asked for schema.sql to live under a `db`
-package specifically; consolidating the two is a larger refactor than this
-task's scope.
+Runtime ownership of database engines, migrations, and writers belongs solely
+under :mod:`node_monitor.database`. ``schema.sql`` remains only for legacy
+provisioning compatibility; it is not a migration runner or a second database
+implementation.
 """

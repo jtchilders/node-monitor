@@ -251,6 +251,87 @@ INSERT INTO node_monitor.schema_migrations
 VALUES (%s, %s, %s, %s, %s, %s)
 """
 
+_SOURCE_SCHEMA_COLUMNS = {
+   "node_hardware": (
+      ("system", "text", "NO"), ("source_hostname", "text", "NO"),
+      ("first_seen", "timestamptz", "NO"),
+      ("last_verified", "timestamptz", "NO"), ("boot_id", "text", "YES"),
+      ("btime", "int8", "YES"), ("cpu_model", "text", "YES"),
+      ("cpu_logical", "int4", "YES"), ("sockets", "int4", "YES"),
+      ("cores_per_socket", "int4", "YES"),
+      ("cpu_max_freq_khz", "int8", "YES"),
+      ("numa_nodes", "int4", "YES"), ("mem_total_kb", "int8", "YES"),
+      ("swap_total_kb", "int8", "YES"),
+      ("hugepage_size_kb", "int4", "YES"),
+      ("kernel_release", "text", "YES"),
+      ("os_pretty_name", "text", "YES"),
+      ("net_fs_mounts", "int4", "YES"), ("net_ifaces", "jsonb", "YES"),
+      ("gpus", "jsonb", "YES"), ("probe_version", "int4", "NO"),
+   ),
+   "node_counter_minute": (
+      ("system", "text", "NO"), ("source_hostname", "text", "NO"),
+      ("window_start", "timestamptz", "NO"),
+      ("window_end", "timestamptz", "NO"),
+      ("collector_hostname", "text", "NO"),
+      ("probe_version", "int4", "NO"), ("daemon_version", "text", "NO"),
+      ("sample_count", "int4", "NO"), ("expected_count", "int4", "NO"),
+      ("coverage", "float8", "NO"), ("mem_available_kb", "int8", "YES"),
+      ("cached_kb", "int8", "YES"), ("shmem_kb", "int8", "YES"),
+      ("load1", "float8", "YES"), ("load5", "float8", "YES"),
+      ("load15", "float8", "YES"), ("procs_running", "int4", "YES"),
+      ("procs_total", "int4", "YES"), ("socket_count", "int4", "YES"),
+      ("cpu_busy_pct", "jsonb", "YES"),
+      ("network_rates", "jsonb", "YES"),
+      ("lustre_md_summary", "jsonb", "YES"),
+      ("meets_minimum_samples", "bool", "NO"),
+      ("invalid_pair_count", "int4", "NO"),
+      ("excess_sample_count", "int4", "NO"),
+   ),
+   "node_usage_intervals": (
+      ("id", "int8", "NO"), ("system", "text", "NO"),
+      ("source_hostname", "text", "NO"),
+      ("interval_start", "timestamptz", "NO"),
+      ("interval_end", "timestamptz", "NO"),
+      ("category", "text", "NO"), ("activity", "text", "NO"),
+      ("username", "text", "YES"), ("username_key", "text", "YES"),
+      ("process_count", "jsonb", "NO"),
+      ("cpu_seconds", "float8", "NO"), ("rss_kb", "jsonb", "NO"),
+      ("d_state_fraction", "float8", "NO"),
+      ("interactivity_fraction", "float8", "NO"),
+      ("sample_count", "int4", "NO"), ("expected_count", "int4", "NO"),
+      ("unmeasured_count", "int4", "NO"),
+   ),
+   "node_poll_failures": (
+      ("id", "int8", "NO"), ("system", "text", "NO"),
+      ("source_hostname", "text", "NO"), ("loop", "text", "NO"),
+      ("recorded_at", "timestamptz", "NO"),
+      ("failure_type", "text", "NO"), ("detail", "text", "NO"),
+      ("consecutive_failures", "int4", "NO"),
+      ("breaker_state", "text", "NO"),
+   ),
+   "node_collection_log": (
+      ("id", "int8", "NO"), ("system", "text", "NO"),
+      ("recorded_at", "timestamptz", "NO"), ("event", "text", "NO"),
+      ("detail", "jsonb", "NO"),
+   ),
+}
+
+_REQUIRED_SOURCE_CONSTRAINTS = frozenset({
+   "node_hardware_pkey", "node_hardware_time_check",
+   "node_counter_minute_pkey", "node_counter_minute_window_check",
+   "node_usage_intervals_pkey", "node_usage_intervals_grain_key",
+   "node_usage_intervals_window_check", "node_usage_intervals_username_check",
+   "node_poll_failures_pkey", "node_collection_log_pkey",
+})
+
+_REQUIRED_SOURCE_INDEXES = frozenset({
+   "node_counter_minute_system_time_idx", "node_counter_minute_retention_idx",
+   "node_usage_intervals_system_time_idx", "node_usage_intervals_retention_idx",
+   "node_poll_failures_system_node_time_idx",
+   "node_poll_failures_retention_idx",
+   "node_collection_log_system_time_idx", "node_collection_log_retention_idx",
+})
+
 
 def _has_executable_sql(sql):
    """Return False only when SQL consists solely of whitespace/comments."""
@@ -258,6 +339,45 @@ def _has_executable_sql(sql):
    without_line_comments = re.sub(
       r"--[^\r\n]*(?:\r?\n|$)", "", without_block_comments)
    return bool(without_line_comments.strip())
+
+
+def _validate_initial_source_schema(connection):
+   rows = connection.exec_driver_sql("""
+      SELECT table_name, column_name, udt_name, is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = 'node_monitor'
+        AND table_name <> 'schema_migrations'
+      ORDER BY table_name, ordinal_position
+   """).all()
+   actual = {}
+   for table, column, udt_name, nullable in rows:
+      actual.setdefault(table, []).append((column, udt_name, nullable))
+   expected = {table: list(columns)
+               for table, columns in _SOURCE_SCHEMA_COLUMNS.items()}
+   if actual != expected:
+      raise MigrationApplyError(
+         "migration 1 source schema columns do not match the required contract")
+
+   constraints = frozenset(connection.exec_driver_sql("""
+      SELECT con.conname
+      FROM pg_constraint con
+      JOIN pg_class c ON c.oid = con.conrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'node_monitor'
+        AND c.relname <> 'schema_migrations'
+   """).scalars().all())
+   if not _REQUIRED_SOURCE_CONSTRAINTS.issubset(constraints):
+      raise MigrationApplyError(
+         "migration 1 source schema constraints are incomplete")
+
+   indexes = frozenset(connection.exec_driver_sql("""
+      SELECT indexname FROM pg_indexes
+      WHERE schemaname = 'node_monitor'
+        AND tablename <> 'schema_migrations'
+   """).scalars().all())
+   if not _REQUIRED_SOURCE_INDEXES.issubset(indexes):
+      raise MigrationApplyError(
+         "migration 1 source schema indexes are incomplete")
 
 
 class MigrationError(RuntimeError):
@@ -375,6 +495,9 @@ class MigrationRunner:
                with connection.begin():
                   if _has_executable_sql(sql):
                      connection.exec_driver_sql(sql)
+                  if (migration.version == 1 and
+                        migration.name == "initial_source_schema"):
+                     _validate_initial_source_schema(connection)
                   self._postcondition(connection, migration)
                   elapsed_ms = max(
                      0, (time.monotonic_ns() - started) // 1_000_000)
