@@ -49,5 +49,6 @@ setup(
       ],
    },
    include_package_data=True,
+   package_data={"node_monitor.database.migrations.versions": ["*.sql"]},
    zip_safe=False,
 )

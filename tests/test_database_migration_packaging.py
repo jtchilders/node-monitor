@@ -17,10 +17,8 @@ fetching a build backend from PyPI.
 
 import hashlib
 import json
-import shutil
 import subprocess
 import sys
-import sysconfig
 import textwrap
 from pathlib import Path
 
@@ -74,15 +72,33 @@ def _fresh_venv(venv_dir):
    return venv_dir / "bin" / "python"
 
 
-def _install(venv_python, distribution_path):
+def _install_runtime_dependencies(venv_python, workdir):
+   # setup.py's install_requires is populated from requirements.txt at
+   # metadata-generation time, which is a preexisting packaging gap
+   # unrelated to this task's scope (Task 1 is discovery/resource
+   # packaging only). Install the runtime dependency the discovery
+   # import chain actually needs -- node_monitor/database/__init__.py
+   # imports NodeMonitorDB, which imports sqlalchemy -- explicitly so
+   # this packaging test genuinely isolates the migration-resource
+   # question instead of failing on an unrelated dependency gap.
+   requirements_path = REPO_ROOT / "requirements.txt"
+   assert requirements_path.exists()
    _run([str(venv_python), "-m", "pip", "install", "--quiet",
-         str(distribution_path)])
+         "-r", str(requirements_path)], cwd=workdir)
 
 
-def _discover_via_subprocess(venv_python):
+def _install(venv_python, distribution_path, workdir):
+   _run([str(venv_python), "-m", "pip", "install", "--quiet",
+         str(distribution_path)], cwd=workdir)
+
+
+def _discover_via_subprocess(venv_python, workdir):
    """Run discovery inside the fresh venv's own interpreter -- never
    import the installed package from the outer (developer/editable)
-   interpreter, so this genuinely proves what got packaged.
+   interpreter, so this genuinely proves what got packaged. Runs with
+   cwd=workdir (never REPO_ROOT) so ``python -c``'s implicit sys.path[0]
+   cannot shadow the installed site-packages copy with the developer's
+   working tree.
    """
    probe = textwrap.dedent(
       """
@@ -108,7 +124,7 @@ def _discover_via_subprocess(venv_python):
       }))
       """
    )
-   result = _run([str(venv_python), "-c", probe])
+   result = _run([str(venv_python), "-c", probe], cwd=workdir)
    return json.loads(result.stdout.strip().splitlines()[-1])
 
 
@@ -122,12 +138,13 @@ class TestPackagedMigrationSurvivesInstall:
 
       venv_dir = tmp_path / "venv-wheel"
       venv_python = _fresh_venv(venv_dir)
-      _install(venv_python, wheel_path)
+      _install_runtime_dependencies(venv_python, tmp_path)
+      _install(venv_python, wheel_path, tmp_path)
 
       expected = _expected_bytes()
       expected_checksum = hashlib.sha256(expected).hexdigest()
 
-      report = _discover_via_subprocess(venv_python)
+      report = _discover_via_subprocess(venv_python, tmp_path)
       assert report["version"] == 1
       assert report["name"] == "initial_source_schema"
       assert report["mode"] == "transactional"
@@ -143,12 +160,13 @@ class TestPackagedMigrationSurvivesInstall:
 
       venv_dir = tmp_path / "venv-sdist"
       venv_python = _fresh_venv(venv_dir)
-      _install(venv_python, sdist_path)
+      _install_runtime_dependencies(venv_python, tmp_path)
+      _install(venv_python, sdist_path, tmp_path)
 
       expected = _expected_bytes()
       expected_checksum = hashlib.sha256(expected).hexdigest()
 
-      report = _discover_via_subprocess(venv_python)
+      report = _discover_via_subprocess(venv_python, tmp_path)
       assert report["version"] == 1
       assert report["name"] == "initial_source_schema"
       assert report["mode"] == "transactional"
@@ -167,12 +185,13 @@ class TestPackagedMigrationSurvivesInstall:
 
       venv_dir = tmp_path / "venv-location"
       venv_python = _fresh_venv(venv_dir)
-      _install(venv_python, wheel_path)
+      _install_runtime_dependencies(venv_python, tmp_path)
+      _install(venv_python, wheel_path, tmp_path)
 
       result = _run([
          str(venv_python), "-c",
          "import node_monitor; print(node_monitor.__file__)",
-      ])
+      ], cwd=tmp_path)
       installed_location = Path(result.stdout.strip()).resolve()
       assert str(REPO_ROOT) not in str(installed_location)
       assert str(venv_dir.resolve()) in str(installed_location)

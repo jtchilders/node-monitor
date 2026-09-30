@@ -1,0 +1,13 @@
+-- node_monitor migration 0001: initial source schema (placeholder).
+--
+-- This is a harmless placeholder for Increment 2 Task 1, which
+-- implements only migration *discovery* (Migration value type,
+-- discover_migrations()) -- not a migration runner, not schema DDL.
+-- Task 3 replaces this comment with the reviewed source-table DDL
+-- (node_hardware, node_counter_minute, node_usage_intervals,
+-- node_poll_failures, node_collection_log, schema_migrations) per
+-- node_monitor_planning increment2-schema-migrations-writer.md.
+--
+-- This file's exact bytes are hashed with SHA-256 by
+-- discover_migrations(); do not edit trailing whitespace or line
+-- endings casually once this checksum is relied upon by a runner.
