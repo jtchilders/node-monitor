@@ -19,18 +19,23 @@ Design rules
 * Producers await a full queue and never drop records.
 * Unknown record types are rejected before queueing.
 * Writes after ``finalize_summary()`` are rejected.
+* Writes before ``start()`` are rejected with a bounded error.
 * The first ``DatabaseWriter.write_records`` failure is captured, wrapped in
   a fixed bounded ``PostgresDaemonSinkError`` message (never driver detail,
   and no ``__cause__`` or ``__context__`` leaking driver exceptions), and
-  stored; subsequent producers re-raise it immediately; ``finalize_summary()``
-  re-raises it after draining whichever records the worker already committed.
-* After a writer failure, ALL subsequent producers raise -- including producers
-  that were blocked on a full queue and wake after the worker fails.
+  stored; subsequent producers re-raise it immediately -- including
+  diagnostic_census writes, which are also blocked after DB failure;
+  ``finalize_summary()`` re-raises it after draining whichever records
+  the worker already committed.
+* After a writer failure, ALL subsequent write_record calls raise --
+  including producers blocked on a full queue and diagnostic_census writes.
+  The stored-error check fires before all routing.
 * ``finalize_summary(acceptance_fn=None)`` sends a sentinel to drain and stop
   the worker, awaits it, then calls
-  ``diagnostic_sink.finalize_summary(acceptance_fn=acceptance_fn)``.  The
-  finalized-success flag is only set after the diagnostic finalize completes
-  without error.
+  ``diagnostic_sink.finalize_summary(acceptance_fn=acceptance_fn)``.  If a
+  writer error was stored, finalize_summary re-raises it WITHOUT setting
+  _finalized, so write_done() remains forbidden.  _finalized is only set
+  True when both the diagnostic finalize completes and no writer error exists.
 * ``write_done()`` is allowed only after ``finalize_summary()`` succeeds and
   delegates to the diagnostic sink.  A failed finalization leaves write_done()
   forbidden.
@@ -90,6 +95,7 @@ class PostgresDaemonSink:
       self._diagnostic_sink = diagnostic_sink
       self._queue = asyncio.Queue(_queue_size)
       self._worker_task = None
+      self._started = False     # True after start() is called
       self._error = None        # PostgresDaemonSinkError once set, immutable
       self._finalized = False   # True only after successful finalize_summary()
       self._finalize_attempted = False  # True after finalize_summary() is called
@@ -102,6 +108,7 @@ class PostgresDaemonSink:
       """Create and start exactly one queue-consumer worker task."""
       if self._worker_task is not None:
          raise PostgresDaemonSinkError("start() called more than once")
+      self._started = True
       self._worker_task = asyncio.ensure_future(self._worker())
 
    async def finalize_summary(self, acceptance_fn=None):
@@ -111,12 +118,18 @@ class PostgresDaemonSink:
       ``await self._sink.finalize_summary(acceptance_fn=self._build_acceptance)``
 
       The finalized-success state (which permits write_done) is only recorded
-      after the diagnostic sink's own finalize_summary() completes without
-      raising.  If anything fails, write_done() remains forbidden.
+      after BOTH the diagnostic sink's own finalize_summary() completes without
+      raising AND no writer error was stored.  If anything fails, write_done()
+      remains forbidden.
 
-      If a writer failure was recorded by the worker, re-raises it after
-      the worker is fully stopped and the diagnostic sink is finalized.
+      If a writer failure was recorded by the worker, the diagnostic sink's
+      finalize_summary is still called (to flush JSONL data), but the stored
+      error is re-raised AFTER diagnostic finalize completes, and _finalized
+      is NOT set so write_done() remains forbidden.
       """
+      if not self._started:
+         raise PostgresDaemonSinkError(
+            "finalize_summary() called before start()")
       if self._finalize_attempted:
          raise PostgresDaemonSinkError("finalize_summary() called more than once")
       self._finalize_attempted = True
@@ -127,15 +140,19 @@ class PostgresDaemonSink:
       if self._worker_task is not None:
          await self._worker_task
 
-      # Delegate to the diagnostic sink; only mark success after this returns.
+      # Delegate to the diagnostic sink; only mark success after this returns
+      # AND only if there is no stored writer error.
       await self._diagnostic_sink.finalize_summary(acceptance_fn=acceptance_fn)
 
-      # Mark success only here -- after the diagnostic finalize_summary()
-      # returned without raising.
-      self._finalized = True
-
+      # If a writer error was stored, re-raise it WITHOUT setting _finalized.
+      # This ensures write_done() remains forbidden after a DB failure even
+      # though the diagnostic finalize succeeded (JSONL data was flushed).
       if self._error is not None:
          raise self._error
+
+      # Mark success only here -- after diagnostic finalize succeeded and no
+      # writer error exists.
+      self._finalized = True
 
    def write_done(self):
       """Write the DONE flag via the diagnostic sink.
@@ -156,9 +173,11 @@ class PostgresDaemonSink:
       """Route one record to the database queue or the diagnostic sink.
 
       Raises ``PostgresDaemonSinkError`` immediately for:
+      * Calls before start().
       * Calls after finalize_summary() (attempted or succeeded).
+      * A previously recorded writer failure (checked first, before routing,
+        so diagnostic_census writes are also blocked after DB failure).
       * An unknown record type.
-      * A previously recorded writer failure (so producers see it promptly).
 
       For relational types the coroutine awaits ``self._queue.put(...)``
       which will block (not spin, never drop) when the queue is full.
@@ -166,9 +185,19 @@ class PostgresDaemonSink:
       so a producer that was waiting cannot silently succeed after the
       worker has failed.
       """
+      if not self._started:
+         raise PostgresDaemonSinkError(
+            "write_record() called before start()")
+
       if self._finalize_attempted:
          raise PostgresDaemonSinkError(
             "write_record() called after finalize_summary()")
+
+      # Re-raise a previously recorded writer failure BEFORE routing so
+      # that all record types -- including diagnostic_census -- are blocked
+      # after a DB failure.  This check must precede the diagnostic branch.
+      if self._error is not None:
+         raise self._error
 
       if record_type == _DIAGNOSTIC_TYPE:
          await self._diagnostic_sink.write_record(record_type, record)
@@ -178,11 +207,6 @@ class PostgresDaemonSink:
          raise PostgresDaemonSinkError(
             "unknown record_type %r; must be one of %s or %r"
             % (record_type, sorted(_RELATIONAL_TYPES), _DIAGNOSTIC_TYPE))
-
-      # Re-raise a previously recorded writer failure before queueing so
-      # callers learn about it promptly.
-      if self._error is not None:
-         raise self._error
 
       await self._queue.put((record_type, record))
 

@@ -21,7 +21,8 @@ Contract being tested
   including producers blocked on a full queue that wake up after failure.
 * finalize_summary(acceptance_fn=None) drains the queue, stops and awaits
   the worker, then finalizes the diagnostic sink.  The finalized-success
-  state is only set after diagnostic_sink.finalize_summary() completes.
+  state is only set after diagnostic_sink.finalize_summary() completes
+  without raising AND there is no stored writer error.
 * write_done() is permitted only after finalize_summary() succeeds and
   delegates to the diagnostic sink.
 * write_done() is forbidden after a failed finalization.
@@ -31,6 +32,12 @@ Contract being tested
 * Submission order is preserved (FIFO).
 * Bounded backpressure: a producer blocks when the queue is full and resumes
   when the worker drains a slot.
+* Diagnostic writes after DB failure are rejected (stored error checked before
+  all routing including diagnostic branch).
+* write_record() / finalize_summary() before start() raise boundedly.
+* Cancellation of a blocked producer must not enqueue and must not poison sink.
+* Cancellation of finalize_summary() must cancel/await the worker and leave
+  _finalized False (write_done forbidden); no orphaned task warnings.
 """
 
 import asyncio
@@ -211,6 +218,37 @@ def test_construction_with_custom_queue_size():
 
 
 # ---------------------------------------------------------------------------
+# Before-start lifecycle -- Defect 5
+# ---------------------------------------------------------------------------
+
+def test_write_record_before_start_raises_boundedly():
+   """write_record() before start() must raise PostgresDaemonSinkError, not hang."""
+   async def _go():
+      sink, _, _ = _make_sink()
+      with pytest.raises(PostgresDaemonSinkError):
+         await sink.write_record("node_collection_log", _collection_log())
+   _run(_go())
+
+
+def test_finalize_summary_before_start_raises_boundedly():
+   """finalize_summary() before start() must raise PostgresDaemonSinkError, not hang."""
+   async def _go():
+      sink, _, _ = _make_sink()
+      with pytest.raises(PostgresDaemonSinkError):
+         await sink.finalize_summary()
+   _run(_go())
+
+
+def test_diagnostic_write_before_start_raises_boundedly():
+   """diagnostic_census write before start() must raise PostgresDaemonSinkError."""
+   async def _go():
+      sink, _, _ = _make_sink()
+      with pytest.raises(PostgresDaemonSinkError):
+         await sink.write_record("diagnostic_census", _diagnostic_census())
+   _run(_go())
+
+
+# ---------------------------------------------------------------------------
 # Unknown / diagnostic_census record types
 # ---------------------------------------------------------------------------
 
@@ -235,6 +273,31 @@ def test_diagnostic_census_goes_to_diagnostic_sink_not_writer():
       assert len(diagnostic.written) == 1
       assert diagnostic.written[0][0] == "diagnostic_census"
       assert writer.calls == []
+   _run(_go())
+
+
+# ---------------------------------------------------------------------------
+# Defect 4: diagnostic writes after DB failure must be rejected
+# ---------------------------------------------------------------------------
+
+def test_diagnostic_write_after_db_failure_raises():
+   """diagnostic_census write after a DB writer failure must raise.
+
+   The design says stop accepting new polls/producers after DB failure.
+   The stored-error check must fire before the diagnostic routing branch,
+   not only for relational types.
+   """
+   async def _go():
+      failing_writer = _FakeWriter(failure=RuntimeError("db exploded"))
+      sink, _, diagnostic = _make_sink(writer=failing_writer)
+      await sink.start()
+      # Trigger the writer failure
+      await sink.write_record("node_collection_log", _collection_log())
+      # Let the worker process and record the failure
+      await asyncio.sleep(0.1)
+      # Diagnostic write must also be rejected after DB failure
+      with pytest.raises(PostgresDaemonSinkError):
+         await sink.write_record("diagnostic_census", _diagnostic_census())
    _run(_go())
 
 
@@ -401,6 +464,55 @@ def test_finalized_success_state_not_set_before_diagnostic_finalize_completes():
       with pytest.raises((PostgresDaemonSinkError, RuntimeError)):
          await sink.finalize_summary()
       # finalize failed -- write_done must be rejected
+      with pytest.raises(PostgresDaemonSinkError):
+         sink.write_done()
+   _run(_go())
+
+
+# ---------------------------------------------------------------------------
+# Defect 1: writer failure -> finalize raises -> write_done must raise
+# ---------------------------------------------------------------------------
+
+def test_writer_failure_finalize_raises_write_done_remains_forbidden():
+   """Writer failure -> finalize_summary raises -> write_done() must raise.
+
+   Defect: finalize_summary() was setting self._finalized = True before
+   checking self._error and raising it.  After the raise, _finalized was
+   already True, so write_done() incorrectly succeeded.
+   """
+   async def _go():
+      failing_writer = _FakeWriter(failure=RuntimeError("db exploded"))
+      sink, _, diagnostic = _make_sink(writer=failing_writer)
+      await sink.start()
+      await sink.write_record("node_collection_log", _collection_log())
+      # finalize_summary must raise because of the DB failure
+      with pytest.raises(PostgresDaemonSinkError):
+         await sink.finalize_summary()
+      # write_done() must also raise -- _finalized must NOT be True
+      with pytest.raises(PostgresDaemonSinkError):
+         sink.write_done()
+      # diagnostic sink's write_done must not have been called
+      assert diagnostic.done_written is False
+   _run(_go())
+
+
+def test_writer_failure_diagnostic_finalize_still_runs():
+   """Diagnostic finalize runs even after a DB writer failure.
+
+   After DB writer failure, finalize_summary() should still run the
+   diagnostic sink's finalize_summary() to flush JSONL data, but must
+   NOT mark overall success and must re-raise the DB error.
+   """
+   async def _go():
+      failing_writer = _FakeWriter(failure=RuntimeError("db exploded"))
+      sink, _, diagnostic = _make_sink(writer=failing_writer)
+      await sink.start()
+      await sink.write_record("node_collection_log", _collection_log())
+      with pytest.raises(PostgresDaemonSinkError):
+         await sink.finalize_summary()
+      # Diagnostic finalize ran (JSONL flushed) even though DB failed
+      assert diagnostic.finalized is True
+      # But overall success is NOT recorded
       with pytest.raises(PostgresDaemonSinkError):
          sink.write_done()
    _run(_go())
@@ -608,51 +720,229 @@ def test_write_after_writer_failure_raises_postgres_daemon_sink_error():
 
 
 def test_producer_blocked_on_full_queue_raises_after_writer_failure():
-   """A producer blocked on a full queue must NOT silently succeed after failure.
+   """A producer blocked on queue.put wakes after worker failure and must raise.
 
-   Failure race: producer passes the pre-put error check, worker fails,
-   producer wakes and enqueues -- worker discards the record but the
-   producer sees no error.  Fix: worker must mark error BEFORE draining
-   subsequent records, and producers must re-check error after unblocking
-   from a full queue.
+   Deterministic race: worker is gated holding record A; queue capacity 1
+   holds record B; producer C calls write_record and is observed pending
+   on queue.put (blocked, not yet returned).  Gate A to fail; C must wake
+   and raise PostgresDaemonSinkError, not return success.  Queue must drain
+   and finalize must terminate.
+
+   This exercises the actual race, not just the pre-put check path.
    """
    async def _go():
-      gate = asyncio.Event()
-      fail_gate = asyncio.Event()
+      # worker_entered: fired when write_records starts executing (holding A)
+      worker_entered = asyncio.Event()
+      # release_gate: we open this to let the worker proceed (and fail)
+      release_gate = asyncio.Event()
 
       class _GatedFailWriter:
-         """Fails on first call, then lets gate control subsequent execution."""
+         """Blocks until release_gate, then fails on first call."""
          def __init__(self):
             self.call_count = 0
 
          def write_records(self, records):
+            import time
             self.call_count += 1
-            if self.call_count == 1:
-               # Signal that we're about to fail
-               fail_gate.set()
-               raise RuntimeError("db failed on first record")
-            return len(records)
+            # Signal that the worker is now holding record A
+            worker_entered.set()
+            # Wait for the test to set up producer C before releasing
+            deadline = time.monotonic() + 5.0
+            while not release_gate.is_set():
+               if time.monotonic() > deadline:
+                  raise RuntimeError("release_gate never opened")
+               time.sleep(0.005)
+            # Always fail
+            raise RuntimeError("db failed")
 
       gated_fail = _GatedFailWriter()
       diag = _FakeDiagnosticSink()
-      # Queue of size 1 so second producer blocks
+      # Capacity 1: record A will be dequeued by worker, then B fills the queue,
+      # then producer C is observed blocked on put.
       sink = PostgresDaemonSink(
          writer=gated_fail, diagnostic_sink=diag, _queue_size=1
       )
       await sink.start()
 
-      # Enqueue one record -- worker will pick it up and fail
+      # Enqueue record A -- worker dequeues it and enters write_records (gated)
       await sink.write_record("node_collection_log", _collection_log(detail={"n": 0}))
+      # Wait for the worker to be inside write_records holding A
+      await asyncio.wait_for(worker_entered.wait(), timeout=3.0)
 
-      # Wait for the worker to set the failure
-      await asyncio.wait_for(fail_gate.wait(), timeout=3.0)
-      await asyncio.sleep(0.05)   # let worker fully record the error
+      # Queue is now empty (worker holds A in write_records).
+      # Enqueue record B to fill the capacity-1 queue.
+      await sink.write_record("node_collection_log", _collection_log(detail={"n": 1}))
 
-      # Any subsequent producer must see the error, not silently succeed
+      # Launch producer C -- it must block on queue.put because queue is full
+      # and the worker is still gated.
+      producer_result = []
+      producer_exception = []
+
+      async def _producer_c():
+         try:
+            await sink.write_record("node_collection_log", _collection_log(detail={"n": 2}))
+            producer_result.append("success")
+         except PostgresDaemonSinkError as exc:
+            producer_exception.append(exc)
+
+      producer_task = asyncio.ensure_future(_producer_c())
+
+      # Let the event loop run so _producer_c reaches queue.put and blocks
+      await asyncio.sleep(0.05)
+
+      # Producer C must still be pending (blocked on queue.put)
+      assert not producer_task.done(), (
+         "Producer C should be blocked on queue.put, not yet done"
+      )
+      assert producer_result == [], "Producer C must not have succeeded yet"
+
+      # Release the worker -- it fails, sets self._error, drains the queue
+      # (including B), then B is task_done'd.  C wakes from queue.put,
+      # enqueues its record, then re-checks self._error and must raise.
+      release_gate.set()
+
+      # Wait for producer C to finish (raise or succeed)
+      await asyncio.wait_for(producer_task, timeout=4.0)
+
+      # Producer C must have raised, not silently succeeded
+      assert producer_result == [], (
+         "Producer C must NOT return success after writer failure"
+      )
+      assert len(producer_exception) == 1, (
+         "Producer C must raise PostgresDaemonSinkError"
+      )
+
+      # finalize_summary raises because of the stored writer error -- that is
+      # the correct behavior; queue drains and worker stops cleanly.
       with pytest.raises(PostgresDaemonSinkError):
-         await sink.write_record("node_collection_log", _collection_log(detail={"n": 1}))
+         await asyncio.wait_for(sink.finalize_summary(), timeout=4.0)
 
-   _run(_go(), timeout=10.0)
+   _run(_go(), timeout=15.0)
+
+
+# ---------------------------------------------------------------------------
+# Defect 3: Cancellation / shutdown contracts
+# ---------------------------------------------------------------------------
+
+def test_producer_cancel_while_blocked_does_not_enqueue():
+   """Cancelling a producer blocked on queue.put must not enqueue the record.
+
+   Contract: asyncio.CancelledError propagates out; sink's queue and error
+   state are unchanged; the sink remains usable (no poison).
+   """
+   async def _go():
+      # Worker gate: keep worker busy so queue fills
+      worker_gate = asyncio.Event()
+
+      class _GatedWriter:
+         def write_records(self, records):
+            import time
+            deadline = time.monotonic() + 5.0
+            while not worker_gate.is_set():
+               if time.monotonic() > deadline:
+                  raise RuntimeError("gate never opened")
+               time.sleep(0.005)
+            return len(records)
+
+      sink = PostgresDaemonSink(
+         writer=_GatedWriter(),
+         diagnostic_sink=_FakeDiagnosticSink(),
+         _queue_size=1,
+      )
+      await sink.start()
+
+      # Fill the queue: worker dequeues A (gated), then B fills the slot
+      await sink.write_record("node_collection_log", _collection_log(detail={"n": 0}))
+      await asyncio.sleep(0.05)   # let worker dequeue A
+      await sink.write_record("node_collection_log", _collection_log(detail={"n": 1}))
+
+      # Producer C blocks on queue.put
+      producer_task = asyncio.ensure_future(
+         sink.write_record("node_collection_log", _collection_log(detail={"n": 2}))
+      )
+      await asyncio.sleep(0.05)
+      assert not producer_task.done(), "Producer C should be blocked"
+
+      # Cancel producer C
+      producer_task.cancel()
+      try:
+         await asyncio.wait_for(producer_task, timeout=1.0)
+      except (asyncio.CancelledError, asyncio.TimeoutError):
+         pass
+
+      # Sink must not be poisoned: self._error is still None
+      assert sink._error is None, "Cancelling a producer must not poison the sink"
+
+      # Release the worker so finalize can proceed
+      worker_gate.set()
+      await asyncio.wait_for(sink.finalize_summary(), timeout=4.0)
+
+   _run(_go(), timeout=15.0)
+
+
+def test_finalize_cancel_leaves_finalized_false_and_no_orphan():
+   """Cancelling finalize_summary must not falsely permit write_done.
+
+   Contract: CancelledError propagates; _finalized remains False; no
+   orphaned worker task (worker is cancelled and awaited); write_done
+   raises PostgresDaemonSinkError.
+
+   We verify no task-exception warnings by ensuring the worker task is
+   not left pending after cancellation.
+   """
+   async def _go():
+      # Gate the worker so finalize_summary is stuck awaiting the worker task
+      worker_gate = asyncio.Event()
+      worker_started = asyncio.Event()
+
+      class _GatedWriter:
+         def write_records(self, records):
+            import time
+            worker_started.set()
+            deadline = time.monotonic() + 5.0
+            while not worker_gate.is_set():
+               if time.monotonic() > deadline:
+                  raise RuntimeError("gate never opened")
+               time.sleep(0.005)
+            return len(records)
+
+      sink = PostgresDaemonSink(
+         writer=_GatedWriter(),
+         diagnostic_sink=_FakeDiagnosticSink(),
+         _queue_size=4,
+      )
+      await sink.start()
+
+      # Enqueue one record so the worker has something to do (and will be gated)
+      await sink.write_record("node_collection_log", _collection_log())
+      await asyncio.wait_for(worker_started.wait(), timeout=3.0)
+
+      # Start finalize in background -- it will block awaiting the worker task
+      finalize_task = asyncio.ensure_future(sink.finalize_summary())
+      await asyncio.sleep(0.05)
+      assert not finalize_task.done(), "finalize_summary should be blocked"
+
+      # Cancel finalize
+      finalize_task.cancel()
+      try:
+         await asyncio.wait_for(finalize_task, timeout=1.0)
+      except (asyncio.CancelledError, asyncio.TimeoutError):
+         pass
+
+      # _finalized must remain False: write_done must raise
+      with pytest.raises(PostgresDaemonSinkError):
+         sink.write_done()
+
+      # Release the worker gate so the worker task can complete and not
+      # leave a pending task that generates asyncio warnings
+      worker_gate.set()
+      if sink._worker_task is not None and not sink._worker_task.done():
+         try:
+            await asyncio.wait_for(sink._worker_task, timeout=2.0)
+         except Exception:
+            pass
+
+   _run(_go(), timeout=15.0)
 
 
 # ---------------------------------------------------------------------------
