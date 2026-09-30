@@ -196,6 +196,20 @@ class TestClose:
       db.close()
       mock_engine.dispose.assert_called_once()
 
+   def test_begin_exposes_injected_engine_transaction_boundary(self):
+      config = _database_config()
+      mock_engine = mock.Mock()
+      transaction = mock_engine.begin.return_value
+      with mock.patch(
+         "node_monitor.database.connection.create_engine",
+         return_value=mock_engine,
+      ), mock.patch(
+         "node_monitor.database.connection.event"
+      ):
+         db = NodeMonitorDB(config)
+      assert db.begin() is transaction
+      mock_engine.begin.assert_called_once_with()
+
 
 # --------------------------------------------------------------------------
 # Requirement 6: no module-global singleton or implicit config/environment

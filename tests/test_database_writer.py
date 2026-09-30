@@ -151,8 +151,8 @@ def test_hardware_adapter_preserves_first_seen_and_known_boot_identity():
    assert "INSERT INTO node_monitor.node_hardware" in sql
    assert "ON CONFLICT (system, source_hostname) DO UPDATE" in sql
    assert "first_seen =" not in sql.split("DO UPDATE", 1)[1]
-   assert "boot_id = COALESCE(EXCLUDED.boot_id, node_monitor.node_hardware.boot_id)" in sql
-   assert "btime = COALESCE(EXCLUDED.btime, node_monitor.node_hardware.btime)" in sql
+   assert "boot_id = COALESCE(EXCLUDED.boot_id, current.boot_id)" in sql
+   assert "btime = COALESCE(EXCLUDED.btime, current.btime)" in sql
    assert params["first_seen"] == datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
    assert params["last_verified"] == NOW
    assert params["net_ifaces"] == _hardware()["net_ifaces"]
