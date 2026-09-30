@@ -177,7 +177,7 @@ def test_database_failures_are_nonzero_and_sanitized(tmp_path, monkeypatch):
 
       def migrate(self):
          raise MigrationApplyError(
-            "postgresql://user:%s@host/node_monitor" % secret)
+            "migration failed; rejected credential %s" % secret)
 
    monkeypatch.setattr(cli_module, "_create_migration_engine", lambda config: _Engine())
    monkeypatch.setattr(cli_module, "MigrationRunner", Runner)
