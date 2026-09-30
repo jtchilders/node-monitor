@@ -19,7 +19,7 @@ def _config(url="postgresql://file_user:file_password@filehost/node_monitor"):
    return {
       "system": "polaris",
       "nodes": [{"hostname": "login.example.org", "role": "local"}],
-      "probe_python": "/usr/bin/python3",
+      "probe_python": "/usr/bin/python3.11",
       "output": {"root": "~/runs"},
       "collection": {},
       "ssh": {},
@@ -159,7 +159,7 @@ def test_database_commands_reject_legacy_flat_config(tmp_path):
       "system": "polaris",
       "nodes": [{"hostname": "login.example.org", "role": "local"}],
       "output_root": "~/runs",
-      "probe_python": "/usr/bin/python3",
+      "probe_python": "/usr/bin/python3.11",
    })
    result = _invoke(["database", "status", "--config", config_path,
                      "--home", str(tmp_path)])

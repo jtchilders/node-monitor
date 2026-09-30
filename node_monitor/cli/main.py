@@ -56,7 +56,9 @@ import sys
 
 import click
 import yaml
+from sqlalchemy import create_engine
 
+from node_monitor import __version__
 from node_monitor.collector import transport
 from node_monitor.config import (
    ConfigError,
@@ -68,6 +70,7 @@ from node_monitor.config import (
 )
 from node_monitor.daemon import EXIT_OK, Daemon
 from node_monitor.database.connection import NodeMonitorDB
+from node_monitor.database.migration import MigrationError, MigrationRunner
 from node_monitor.output.jsonl import (
    Phase0Sink,
    Phase0SinkDiskFullError,
@@ -375,6 +378,97 @@ def daemon_smoke(config_path, home, run_id, duration_sec):
       run_id = _default_run_id()
    exit_code = _run_daemon(config, config_path, run_id, probe_version)
    sys.exit(exit_code)
+
+
+def _load_database_config_or_exit(config_path, home):
+   database_url_env = os.environ.get("NODE_MONITOR_DB_URL")
+   try:
+      loaded = load_config_file_any(
+         config_path, home=home, database_url_env=database_url_env)
+   except ConfigError as exc:
+      _exit(1, "invalid configuration: %s" % (_sanitize_config_error(exc),),
+            err=True)
+   except yaml.YAMLError as exc:
+      _exit(1, "config file is not valid YAML", err=True)
+   except OSError:
+      _exit(1, "could not read configuration file", err=True)
+   if not isinstance(loaded, NodeMonitorConfig):
+      _exit(1, "database commands require the nested configuration layout",
+            err=True)
+   return loaded.database
+
+
+def _create_migration_engine(database):
+   return create_engine(
+      database.url,
+      pool_size=database.pool_size,
+      max_overflow=database.max_overflow,
+      echo=database.echo_sql,
+      pool_pre_ping=database.pool_pre_ping,
+      pool_timeout=database.pool_timeout_sec,
+      pool_recycle=database.pool_recycle_sec,
+      connect_args=dict(database.connect_args),
+   )
+
+
+def _run_database_command(config_path, home, operation):
+   home = home if home is not None else os.path.expanduser("~")
+   database_config = _load_database_config_or_exit(config_path, home)
+   engine = None
+   try:
+      engine = _create_migration_engine(database_config)
+      runner = MigrationRunner(engine, __version__)
+      return operation(runner)
+   except MigrationError:
+      _exit(1, "database migration failed; inspect operator logs", err=True)
+   except Exception:
+      _exit(1, "database operation failed", err=True)
+   finally:
+      if engine is not None:
+         engine.dispose()
+
+
+@cli.group()
+def database():
+   """Inspect or migrate the node-monitor PostgreSQL schema."""
+
+
+@database.command("status")
+@click.option("--config", "config_path", required=True,
+              type=click.Path(dir_okay=False),
+              help="Path to the strict nested YAML configuration.")
+@click.option("--home", "home", default=None,
+              help="Override $HOME for config path expansion (internal/test).")
+def database_status(config_path, home):
+   """Read migration status without creating schema objects."""
+   status = _run_database_command(
+      config_path, home, lambda runner: runner.status())
+   click.echo("initialized: %s" % status.initialized)
+   click.echo("current_version: %s" % status.current_version)
+   click.echo("latest_version: %s" % status.latest_version)
+   click.echo(
+      "pending_versions: %s"
+      % (",".join(str(version) for version in status.pending_versions)
+         if status.pending_versions else "none"))
+   click.echo("drift: %s" % status.drift)
+
+
+@database.command("migrate")
+@click.option("--config", "config_path", required=True,
+              type=click.Path(dir_okay=False),
+              help="Path to the strict nested YAML configuration.")
+@click.option("--home", "home", default=None,
+              help="Override $HOME for config path expansion (internal/test).")
+def database_migrate(config_path, home):
+   """Apply pending migrations under the operator advisory lock."""
+   result = _run_database_command(
+      config_path, home, lambda runner: runner.migrate())
+   click.echo(
+      "applied_versions: %s"
+      % (",".join(str(version) for version in result.applied_versions)
+         if result.applied_versions else "none"))
+   click.echo("current_version: %s" % result.current_version)
+   click.echo("latest_version: %s" % result.latest_version)
 
 
 @cli.group()
