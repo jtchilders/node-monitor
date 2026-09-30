@@ -77,7 +77,7 @@ safety:
 # Do not put a real password in a committed copy of this file; prefer
 # NODE_MONITOR_DB_URL in the actual deployment environment.
 database:
-  url: postgresql://localhost/pbs_monitor_dev
+  url: postgresql://localhost/node_monitor_dev
   schema: node_monitor
   pool_size: 1
   max_overflow: 0

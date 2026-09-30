@@ -71,6 +71,19 @@ database, because argv routinely carries credentials.
     pip install -e .
     pytest
 
+## PostgreSQL schema operations
+
+The Phase 1 migration and compact-writer infrastructure is operator-controlled;
+it does not change the Phase 0 daemon's JSONL-only behavior. Before using it,
+create the database and role administratively, take a verified backup, then use:
+
+    node-monitor database status --config config.example.phase1.yaml
+    node-monitor database migrate --config config.example.phase1.yaml
+
+See [`docs/database.md`](docs/database.md) for prerequisites, advisory locking,
+fail-closed drift handling, backup/restore policy, and the strict prohibition on
+daemon DDL or PostgreSQL lifecycle management.
+
 ## Phase 0: running, artifacts, and validation
 
 Phase 0 is the JSONL-only daemon: no PostgreSQL access, output is a
