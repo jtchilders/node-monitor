@@ -254,8 +254,33 @@ def test_initial_source_schema_has_exact_tables_and_key_constraints(postgres_eng
 
 
 def test_legacy_bootstrap_upgrades_to_same_schema_as_fresh(postgres_engine):
-   from pathlib import Path
-   legacy_sql = (Path(__file__).parents[1] / "node_monitor" / "db" / "schema.sql").read_text()
+   legacy_sql = """
+      CREATE SCHEMA IF NOT EXISTS node_monitor;
+      CREATE TABLE IF NOT EXISTS node_monitor.node_hardware (
+         system text NOT NULL,
+         source_hostname text NOT NULL,
+         first_seen timestamptz NOT NULL,
+         last_verified timestamptz NOT NULL,
+         boot_id text,
+         btime bigint,
+         cpu_model text,
+         cpu_logical integer,
+         sockets integer,
+         cores_per_socket integer,
+         cpu_max_freq_khz bigint,
+         numa_nodes integer,
+         mem_total_kb bigint,
+         swap_total_kb bigint,
+         hugepage_size_kb integer,
+         kernel_release text,
+         os_pretty_name text,
+         net_fs_mounts integer,
+         net_ifaces jsonb,
+         gpus jsonb,
+         probe_version integer NOT NULL,
+         PRIMARY KEY (system, source_hostname)
+      )
+   """
    with postgres_engine.begin() as connection:
       connection.exec_driver_sql(legacy_sql)
    MigrationRunner(postgres_engine, "test").migrate()
