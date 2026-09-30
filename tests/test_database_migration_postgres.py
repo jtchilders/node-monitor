@@ -161,6 +161,142 @@ def test_postcondition_failure_rolls_back_ddl_and_ledger(postgres_engine):
       ).scalar_one() == 0
 
 
+def _schema_signature(connection):
+   columns = connection.exec_driver_sql("""
+      SELECT table_name, column_name, data_type, udt_name, is_nullable,
+             is_identity, is_generated, generation_expression
+      FROM information_schema.columns
+      WHERE table_schema = 'node_monitor'
+        AND table_name <> 'schema_migrations'
+      ORDER BY table_name, ordinal_position
+   """).all()
+   constraints = connection.exec_driver_sql("""
+      SELECT c.relname, con.conname, con.contype,
+             pg_get_constraintdef(con.oid, true)
+      FROM pg_constraint con
+      JOIN pg_class c ON c.oid = con.conrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'node_monitor'
+        AND c.relname <> 'schema_migrations'
+      ORDER BY c.relname, con.conname
+   """).all()
+   indexes = connection.exec_driver_sql("""
+      SELECT tablename, indexname, indexdef
+      FROM pg_indexes
+      WHERE schemaname = 'node_monitor'
+        AND tablename <> 'schema_migrations'
+      ORDER BY tablename, indexname
+   """).all()
+   return tuple(columns), tuple(constraints), tuple(indexes)
+
+
+def test_initial_source_schema_has_exact_tables_and_key_constraints(postgres_engine):
+   MigrationRunner(postgres_engine, "test").migrate()
+   with postgres_engine.connect() as connection:
+      tables = connection.exec_driver_sql("""
+         SELECT table_name FROM information_schema.tables
+         WHERE table_schema = 'node_monitor' AND table_type = 'BASE TABLE'
+         ORDER BY table_name
+      """).scalars().all()
+      assert tables == [
+         "node_collection_log", "node_counter_minute", "node_hardware",
+         "node_poll_failures", "node_usage_intervals", "schema_migrations",
+      ]
+      columns, constraints, indexes = _schema_signature(connection)
+      by_table = {}
+      for table, column, data_type, udt_name, nullable, identity, generated, expression in columns:
+         by_table.setdefault(table, {})[column] = {
+            "data_type": data_type, "udt_name": udt_name,
+            "nullable": nullable, "identity": identity,
+            "generated": generated, "expression": expression,
+         }
+
+      assert set(by_table["node_hardware"]) == {
+         "system", "source_hostname", "first_seen", "last_verified",
+         "boot_id", "btime", "cpu_model", "cpu_logical", "sockets",
+         "cores_per_socket", "cpu_max_freq_khz", "numa_nodes",
+         "mem_total_kb", "swap_total_kb", "hugepage_size_kb",
+         "kernel_release", "os_pretty_name", "net_fs_mounts",
+         "net_ifaces", "gpus", "probe_version",
+      }
+      assert set(by_table["node_counter_minute"]) == {
+         "system", "source_hostname", "window_start", "window_end",
+         "collector_hostname", "probe_version", "daemon_version",
+         "sample_count", "expected_count", "coverage", "mem_available_kb",
+         "cached_kb", "shmem_kb", "load1", "load5", "load15",
+         "procs_running", "procs_total", "socket_count", "cpu_busy_pct",
+         "network_rates", "lustre_md_summary", "meets_minimum_samples",
+         "invalid_pair_count", "excess_sample_count",
+      }
+      assert set(by_table["node_usage_intervals"]) == {
+         "id", "system", "source_hostname", "interval_start", "interval_end",
+         "category", "activity", "username", "username_key",
+         "process_count", "cpu_seconds", "rss_kb", "d_state_fraction",
+         "interactivity_fraction", "sample_count", "expected_count",
+         "unmeasured_count",
+      }
+      assert by_table["node_usage_intervals"]["id"]["identity"] == "YES"
+      assert by_table["node_usage_intervals"]["username"]["nullable"] == "YES"
+      assert by_table["node_usage_intervals"]["username_key"]["generated"] == "ALWAYS"
+      assert "COALESCE" in by_table["node_usage_intervals"]["username_key"]["expression"].upper()
+      assert by_table["node_counter_minute"]["cpu_busy_pct"]["udt_name"] == "jsonb"
+      assert by_table["node_hardware"]["net_ifaces"]["udt_name"] == "jsonb"
+      constraint_text = "\n".join(str(row) for row in constraints)
+      index_text = "\n".join(str(row) for row in indexes)
+      assert "node_counter_minute_pkey" in constraint_text
+      assert "node_usage_intervals_grain_key" in constraint_text
+      assert "coverage" in constraint_text
+      assert "d_state_fraction" in constraint_text
+      assert "node_counter_minute_retention_idx" in index_text
+      assert "node_usage_intervals_retention_idx" in index_text
+      assert "node_poll_failures_retention_idx" in index_text
+      assert "node_collection_log_retention_idx" in index_text
+
+
+def test_legacy_bootstrap_upgrades_to_same_schema_as_fresh(postgres_engine):
+   from pathlib import Path
+   legacy_sql = (Path(__file__).parents[1] / "node_monitor" / "db" / "schema.sql").read_text()
+   with postgres_engine.begin() as connection:
+      connection.exec_driver_sql(legacy_sql)
+   MigrationRunner(postgres_engine, "test").migrate()
+   with postgres_engine.connect() as connection:
+      upgraded = _schema_signature(connection)
+
+   # Recreate only the disposable schema, then compare a fresh migration.
+   with postgres_engine.begin() as connection:
+      connection.exec_driver_sql("DROP SCHEMA node_monitor CASCADE")
+   MigrationRunner(postgres_engine, "test").migrate()
+   with postgres_engine.connect() as connection:
+      fresh = _schema_signature(connection)
+   assert upgraded == fresh
+
+
+def test_incompatible_legacy_hardware_rolls_back_all_source_tables(postgres_engine):
+   with postgres_engine.begin() as connection:
+      connection.exec_driver_sql("CREATE SCHEMA node_monitor")
+      connection.exec_driver_sql("""
+         CREATE TABLE node_monitor.node_hardware (
+            system integer NOT NULL,
+            source_hostname text NOT NULL,
+            PRIMARY KEY (system, source_hostname)
+         )
+      """)
+
+   with pytest.raises(MigrationApplyError):
+      MigrationRunner(postgres_engine, "test").migrate()
+
+   with postgres_engine.connect() as connection:
+      tables = connection.exec_driver_sql("""
+         SELECT table_name FROM information_schema.tables
+         WHERE table_schema = 'node_monitor'
+         ORDER BY table_name
+      """).scalars().all()
+      assert tables == ["node_hardware", "schema_migrations"]
+      assert connection.exec_driver_sql(
+         "SELECT count(*) FROM node_monitor.schema_migrations"
+      ).scalar_one() == 0
+
+
 def test_changed_checksum_fails_before_pending_sql(postgres_engine):
    first = _migration()
    MigrationRunner(postgres_engine, "test", migrations=(first,)).migrate()
