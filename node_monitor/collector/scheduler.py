@@ -137,9 +137,13 @@ class Scheduler:
          raise SchedulerError(
             "max_parallel_polls must be positive, got %r"
             % (max_parallel_polls,))
-      if duration_sec <= 0:
-         raise SchedulerError(
-            "duration_sec must be positive, got %r" % (duration_sec,))
+      if duration_sec is not None:
+         if (isinstance(duration_sec, bool)
+               or not isinstance(duration_sec, (int, float))
+               or duration_sec <= 0):
+            raise SchedulerError(
+               "duration_sec must be a positive number or None, got %r"
+               % (duration_sec,))
       if failure_threshold <= 0:
          raise SchedulerError(
             "failure_threshold must be positive, got %r"
@@ -156,7 +160,8 @@ class Scheduler:
       self._clock = clock
       self._sleep = sleep
       self._max_parallel_polls = max_parallel_polls
-      self._duration_sec = float(duration_sec)
+      self._duration_sec = (
+         None if duration_sec is None else float(duration_sec))
       self._failure_threshold = failure_threshold
       self._backoff_cap_sec = float(backoff_cap_sec)
       self._grace_sec = float(grace_sec)
@@ -252,7 +257,9 @@ class Scheduler:
          self._stop_event.set()
 
       start_time = self._clock()
-      end_time = start_time + self._duration_sec
+      end_time = (
+         None if self._duration_sec is None
+         else start_time + self._duration_sec)
       tasks = [
          asyncio.ensure_future(
             self._run_target(
@@ -378,7 +385,7 @@ class Scheduler:
          while True:
             if self._stop_requested:
                break
-            if state.next_deadline >= end_time:
+            if end_time is not None and state.next_deadline >= end_time:
                break
 
             now = self._clock()
