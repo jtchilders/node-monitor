@@ -477,7 +477,7 @@ class CollectionConfig:
    census_interval_sec: float
    counter_rollup_interval_sec: float
    usage_interval_sec: float
-   duration_sec: float
+   duration_sec: typing.Optional[float]
    keep_raw_args: bool
 
 
@@ -501,8 +501,12 @@ def _validate_collection_section(raw):
    _reject_unknown_keys(raw, _COLLECTION_ALLOWED_KEYS, "collection")
    values = {}
    for key in _COLLECTION_POSITIVE_NUMBER_KEYS:
-      values[key] = _validate_finite_positive_number(
-         raw.get(key, _COLLECTION_DEFAULTS[key]), "collection.%s" % key)
+      value = raw.get(key, _COLLECTION_DEFAULTS[key])
+      if key == "duration_sec" and value is None:
+         values[key] = None
+      else:
+         values[key] = _validate_finite_positive_number(
+            value, "collection.%s" % key)
    values["keep_raw_args"] = _validate_bool(
       raw.get("keep_raw_args", _COLLECTION_DEFAULTS["keep_raw_args"]),
       "collection.keep_raw_args")
