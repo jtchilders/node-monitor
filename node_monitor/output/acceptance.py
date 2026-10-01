@@ -242,21 +242,15 @@ def _expected_poll_count(duration_sec, interval_sec):
 
 
 def _coverage_threshold(nodes, totals, duration_sec, interval_sec, minimum):
-   """Per-node coverage threshold dict: {hostname: {"value", "required",
-   "met", "expected_count", "actual_count"}} -- one entry for EVERY
-   node in ``nodes``, including a node with zero recorded successes
-   (``totals.get(hostname, 0)``), so a node that never once succeeded
-   can never be silently absent from the summary.
-
-   ``expected_count`` is computed by ``_expected_poll_count``, which
-   walks ``collector.scheduler.Scheduler``'s own fixed dispatch grid
-   rather than a closed-form ratio: a target's first dispatch happens
-   at ``t=0`` (not after waiting one full interval), so a run whose
-   duration is shorter than one interval still gets exactly one
-   dispatch, not zero -- e.g. ``duration_sec=5.0, interval_sec=10.0``
-   dispatches once, at ``t=0``, then stops because the next deadline
-   (``t=10``) is at or past the run's end time.
-   """
+   """Return per-node coverage; indefinite runs have no finite denominator."""
+   if duration_sec is None:
+      return {
+         hostname: {
+            "value": None, "required": minimum, "met": None,
+            "expected_count": None, "actual_count": totals.get(hostname, 0),
+         }
+         for hostname in nodes
+      }
    expected_count = _expected_poll_count(duration_sec, interval_sec)
    result = {}
    for hostname in nodes:
@@ -403,7 +397,8 @@ def evaluate_acceptance(*, completion, duration_sec, counter_interval_sec,
          "completion must be one of %s, got %r"
          % (sorted(_VALID_COMPLETIONS), completion))
 
-   duration_sec = _validate_positive(duration_sec, "duration_sec")
+   if duration_sec is not None:
+      duration_sec = _validate_positive(duration_sec, "duration_sec")
    counter_interval_sec = _validate_positive(
       counter_interval_sec, "counter_interval_sec")
    census_interval_sec = _validate_positive(

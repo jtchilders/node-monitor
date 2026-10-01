@@ -49,8 +49,11 @@ bounded-duration variant of the same run, not a different code path.
 """
 
 import asyncio
+import dataclasses
+import getpass
 import os
 import re
+import socket
 import subprocess
 import sys
 
@@ -68,7 +71,19 @@ from node_monitor.config import (
    load_config,
    load_config_file_any,
 )
-from node_monitor.daemon import EXIT_OK, Daemon
+from node_monitor.daemon import EXIT_OK, EXIT_SINK_FATAL, Daemon
+from node_monitor.daemon_control import (
+   ControlFile,
+   DaemonControlError,
+   DaemonState,
+   STATE_DIFFERENT_HOST,
+   STATE_EXITED,
+   STATE_NOT_RUNNING,
+   STATE_RUNNING,
+   STATE_STALE,
+   STATE_STOPPING,
+   current_process_start_ticks,
+)
 from node_monitor.database.connection import NodeMonitorDB
 from node_monitor.database.migration import MigrationError, MigrationRunner
 from node_monitor.database.writer import DatabaseWriter
@@ -108,6 +123,31 @@ _REMOTE_PROBE_SCRIPT_PATH = os.path.join(
 # collector.transport.run_local_probe's own docstring for that
 # ordering contract.
 _HARD_TIMEOUT_GRACE_SEC = 5.0
+_UNSET = object()
+
+
+def _default_control_file_path():
+   return os.path.join(os.path.expanduser("~"), ".node_monitor_daemon.pid")
+
+
+async def _watch_control_file(control_file, stoppable, *, poll_interval=5.0,
+                              heartbeat_interval=30.0):
+   """Watch local control state; control loss fails closed."""
+   loop = asyncio.get_running_loop()
+   last_heartbeat = loop.time()
+   while True:
+      await asyncio.sleep(poll_interval)
+      try:
+         state = control_file.read()
+         if state.stop_requested:
+            stoppable.request_stop()
+            return
+         if loop.time() - last_heartbeat >= heartbeat_interval:
+            control_file.heartbeat()
+            last_heartbeat = loop.time()
+      except DaemonControlError:
+         stoppable.request_stop()
+         return
 
 
 def _exit(code, message=None, err=False):
@@ -455,6 +495,161 @@ def daemon_run(config_path, home, run_id, duration_sec):
       loaded, config_path, run_id, probe_version, resolved_home,
       phase0_config=phase0_config)
    sys.exit(exit_code)
+
+
+def _load_nested_daemon_config(config_path, home):
+   database_url_env = os.environ.get("NODE_MONITOR_DB_URL")
+   try:
+      loaded = load_config_file_any(
+         config_path, home=home, database_url_env=database_url_env)
+   except (ConfigError, yaml.YAMLError, OSError) as exc:
+      if isinstance(exc, ConfigError):
+         message = "invalid configuration: %s" % _sanitize_config_error(exc)
+      elif isinstance(exc, yaml.YAMLError):
+         message = "config file is not valid YAML"
+      else:
+         message = "could not read configuration file"
+      _exit(1, message, err=True)
+   if not isinstance(loaded, NodeMonitorConfig):
+      _exit(1, "daemon start requires the nested configuration layout",
+            err=True)
+   return loaded
+
+
+def _daemon_state(control_file, run_id, run_directory, log_file):
+   import datetime
+   now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+   return DaemonState(
+      hostname=socket.gethostname(), pid=os.getpid(),
+      process_start_ticks=current_process_start_ticks(),
+      start_timestamp=now, working_directory=os.getcwd(),
+      user=getpass.getuser(), heartbeat=now,
+      stop_requested=False, exited=False, run_id=run_id,
+      run_directory=run_directory, log_file=log_file, outcome="running")
+
+
+def _status_label(status):
+   return {
+      STATE_RUNNING: "Running", STATE_STOPPING: "Stopping",
+      STATE_EXITED: "Exited", STATE_STALE: "Stale",
+      STATE_DIFFERENT_HOST: "Running on different host",
+      STATE_NOT_RUNNING: "Not running",
+   }[status]
+
+
+@daemon.command("status")
+def daemon_status():
+   """Show detached daemon state without touching PostgreSQL."""
+   control = ControlFile(_default_control_file_path())
+   try:
+      status = control.classify()
+      click.echo("Status: %s" % _status_label(status))
+      if status != STATE_NOT_RUNNING:
+         state = control.read()
+         click.echo("PID: %d" % state.pid)
+         click.echo("Hostname: %s" % state.hostname)
+         click.echo("Heartbeat: %s" % state.heartbeat)
+         click.echo("Run directory: %s" % state.run_directory)
+         click.echo("Log file: %s" % state.log_file)
+   except DaemonControlError:
+      _exit(1, "Status: Invalid control file", err=True)
+
+
+@daemon.command("stop")
+def daemon_stop():
+   """Request graceful shutdown through the local control file."""
+   control = ControlFile(_default_control_file_path())
+   try:
+      status = control.classify()
+      if status in (STATE_NOT_RUNNING, STATE_EXITED):
+         click.echo("Status: %s" % _status_label(status))
+         return
+      if status == STATE_DIFFERENT_HOST:
+         _exit(1, "daemon is managed on a different host", err=True)
+      state = control.request_stop()
+      click.echo("Stop requested for PID %d" % state.pid)
+   except DaemonControlError:
+      _exit(1, "could not request daemon stop", err=True)
+
+
+@daemon.command("start")
+@click.option("--config", "config_path", required=True,
+              type=click.Path(dir_okay=False))
+@click.option("--home", default=None)
+@click.option("--run-id", default=None)
+@click.option("--foreground", is_flag=True, default=False)
+def daemon_start(config_path, home, run_id, foreground):
+   """Start the PostgreSQL-backed daemon indefinitely."""
+   resolved_home = home if home is not None else os.path.expanduser("~")
+   loaded = _load_nested_daemon_config(config_path, resolved_home)
+   probe_version = _resolve_probe_version(loaded.probe_python)
+   run_id = run_id if run_id is not None else _default_run_id()
+   control = ControlFile(_default_control_file_path())
+   status = control.classify()
+   if status in (STATE_RUNNING, STATE_STOPPING, STATE_DIFFERENT_HOST):
+      _exit(1, "daemon already active: %s" % _status_label(status), err=True)
+
+   raw = _nested_to_phase0_raw(loaded, duration_sec_override=None)
+   phase0_config = load_config(raw, home=resolved_home)
+   log_file = os.path.join(resolved_home, ".node_monitor_daemon.log")
+
+   if foreground:
+      def startup_ack(run_directory):
+         control.write(_daemon_state(control, run_id, run_directory, log_file))
+      exit_code = _run_daemon_postgres(
+         loaded, config_path, run_id, probe_version, resolved_home,
+         phase0_config=phase0_config, control_file=control,
+         startup_ack=startup_ack)
+      state = control.read()
+      outcome = "fatal" if exit_code == EXIT_SINK_FATAL else "partial"
+      control.mark_exited(outcome=outcome, exit_code=exit_code)
+      sys.exit(exit_code)
+
+   read_fd, write_fd = os.pipe()
+   child_pid = os.fork()
+   if child_pid:
+      os.close(write_fd)
+      ack = os.read(read_fd, 1)
+      os.close(read_fd)
+      if ack != b"1":
+         _exit(1, "daemon start failed during preflight", err=True)
+      state = control.read()
+      click.echo("Daemon started in background. PID: %d" % state.pid)
+      click.echo("PID file: %s" % control.path)
+      click.echo("Log file: %s" % state.log_file)
+      return
+
+   os.close(read_fd)
+   try:
+      os.setsid()
+      os.chdir("/")
+      stdin_fd = os.open(os.devnull, os.O_RDONLY)
+      log_fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+      os.dup2(stdin_fd, 0)
+      os.dup2(log_fd, 1)
+      os.dup2(log_fd, 2)
+      os.close(stdin_fd)
+      os.close(log_fd)
+
+      def startup_ack(run_directory):
+         control.write(_daemon_state(control, run_id, run_directory, log_file))
+         os.write(write_fd, b"1")
+         os.close(write_fd)
+
+      exit_code = _run_daemon_postgres(
+         loaded, config_path, run_id, probe_version, resolved_home,
+         phase0_config=phase0_config, control_file=control,
+         startup_ack=startup_ack)
+      state = control.read()
+      outcome = "fatal" if exit_code == EXIT_SINK_FATAL else "partial"
+      control.mark_exited(outcome=outcome, exit_code=exit_code)
+      os._exit(exit_code)
+   except BaseException:
+      try:
+         os.close(write_fd)
+      except OSError:
+         pass
+      os._exit(1)
 
 
 def _load_database_config_or_exit(config_path, home):
@@ -841,7 +1036,7 @@ def _default_run_id():
    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
 
 
-def _nested_to_phase0_raw(nested, duration_sec_override=None):
+def _nested_to_phase0_raw(nested, duration_sec_override=_UNSET):
    """Convert a validated ``NodeMonitorConfig`` into the flat raw mapping
    that ``node_monitor.config.load_config`` accepts.
 
@@ -881,9 +1076,9 @@ def _nested_to_phase0_raw(nested, duration_sec_override=None):
       "census_interval_sec": col.census_interval_sec,
       "rollup_interval_sec": col.counter_rollup_interval_sec,
       "usage_interval_sec": col.usage_interval_sec,
-      "duration_sec": (duration_sec_override
-                       if duration_sec_override is not None
-                       else col.duration_sec),
+      "duration_sec": (nested.collection.duration_sec
+                       if duration_sec_override is _UNSET
+                       else duration_sec_override),
       "keep_raw_args": col.keep_raw_args,
       "counter_timeout_sec": ssh.counter_timeout_sec,
       "census_timeout_sec": ssh.census_timeout_sec,
@@ -954,7 +1149,8 @@ def _schema_gate_or_exit(engine, app_version):
 
 
 def _run_daemon_postgres(nested, config_path, run_id, probe_version, home,
-                         phase0_config=None):
+                         phase0_config=None, control_file=None,
+                         startup_ack=None):
    """Wire the PostgreSQL sink and run the daemon.
 
    Order:
@@ -1026,18 +1222,32 @@ def _run_daemon_postgres(nested, config_path, run_id, probe_version, home,
                err=True)
          return  # pragma: no cover
 
+      if startup_ack is not None:
+         startup_ack(run_dir)
+
       # Step 5+6 -- start the sink worker, run the daemon.
       # Unexpected exceptions from sink.start() or daemon.run() are
       # sanitized.  If daemon.run() raises after sink.start() succeeded,
       # abort() cancels and awaits the worker so it is not orphaned.
       async def _run():
          await sink.start()
+         watcher = None
+         if control_file is not None:
+            watcher = asyncio.ensure_future(
+               _watch_control_file(control_file, daemon))
          try:
             return await daemon.run()
          except Exception:
             # daemon.run() raised unexpectedly; abort the worker task.
             await sink.abort()
             raise
+         finally:
+            if watcher is not None:
+               watcher.cancel()
+               try:
+                  await watcher
+               except asyncio.CancelledError:
+                  pass
 
       try:
          exit_code = asyncio.run(_run())

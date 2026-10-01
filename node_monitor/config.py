@@ -167,7 +167,7 @@ class Phase0Config:
    census_interval_sec: int
    rollup_interval_sec: int
    usage_interval_sec: int
-   duration_sec: int
+   duration_sec: typing.Optional[int]
    counter_timeout_sec: float
    census_timeout_sec: float
    ssh_connect_timeout_sec: float
@@ -360,7 +360,10 @@ def load_config(raw, home):
    values = {}
    for key in _POSITIVE_NUMBER_KEYS:
       value = raw.get(key, _DEFAULTS[key])
-      values[key] = _validate_positive_number(value, key)
+      if key == "duration_sec" and value is None:
+         values[key] = None
+      else:
+         values[key] = _validate_positive_number(value, key)
    values["max_parallel_polls"] = _validate_max_parallel_polls(
       raw.get("max_parallel_polls", _DEFAULTS["max_parallel_polls"]))
    values["keep_raw_args"] = _validate_keep_raw_args(

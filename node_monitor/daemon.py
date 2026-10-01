@@ -468,6 +468,7 @@ class Daemon:
       self._scheduler_cls = scheduler_cls
       self._on_event = on_event
       self._scheduler = None
+      self._stop_requested = False
 
       # One CounterWindowAccumulator per node hostname, replaced every
       # time its window rolls over -- bounded state, never one
@@ -628,6 +629,12 @@ class Daemon:
    def _emit(self, **fields):
       if self._on_event is not None:
          self._on_event(fields)
+
+   def request_stop(self):
+      """Request orderly shutdown before or during scheduler execution."""
+      self._stop_requested = True
+      if self._scheduler is not None:
+         self._scheduler.request_stop()
 
    def _check_fqdn_consistency(self, node, fqdn):
       """Enforce design's "a remote-reported FQDN unique among
@@ -1511,6 +1518,8 @@ class Daemon:
       if self._sleep is not None:
          scheduler_kwargs["sleep"] = self._sleep
       self._scheduler = self._scheduler_cls(**scheduler_kwargs)
+      if self._stop_requested:
+         self._scheduler.request_stop()
 
       # Design: "SIGINT/SIGTERM stops dispatch, gives active polls a
       # bounded grace period, reaps children, flushes files, and
