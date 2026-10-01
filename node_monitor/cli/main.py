@@ -50,9 +50,12 @@ bounded-duration variant of the same run, not a different code path.
 
 import asyncio
 import dataclasses
+import errno
+import fcntl
 import getpass
 import os
 import re
+import resource
 import socket
 import subprocess
 import sys
@@ -128,6 +131,58 @@ _UNSET = object()
 
 def _default_control_file_path():
    return os.path.join(os.path.expanduser("~"), ".node_monitor_daemon.pid")
+
+
+def _default_control_lock_path():
+   return os.path.join(os.path.expanduser("~"), ".node_monitor_daemon.lock")
+
+
+def _acquire_daemon_lock(path):
+   """Acquire a process-lifetime, non-blocking singleton lock."""
+   fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+   os.fchmod(fd, 0o600)
+   try:
+      fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+   except OSError as exc:
+      os.close(fd)
+      if exc.errno in (errno.EACCES, errno.EAGAIN):
+         return None
+      raise
+   return fd
+
+
+def _release_daemon_lock(fd):
+   if fd is not None:
+      os.close(fd)
+
+
+def _close_inherited_fds(preserve):
+   """Close inherited descriptors except stdio and daemon-owned FDs."""
+   soft_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+   if soft_limit == resource.RLIM_INFINITY:
+      soft_limit = 65536
+   for fd in range(3, int(min(soft_limit, 1048576))):
+      if fd in preserve:
+         continue
+      try:
+         os.close(fd)
+      except OSError:
+         pass
+
+
+def _run_controlled_daemon(control, runtime, startup_ack):
+   """Run one daemon lifecycle and persist its terminal state."""
+   exit_code = 1
+   outcome = "fatal"
+   try:
+      exit_code = runtime(startup_ack)
+      outcome = "fatal" if exit_code == EXIT_SINK_FATAL else "partial"
+      return exit_code
+   finally:
+      try:
+         control.mark_exited(outcome=outcome, exit_code=exit_code)
+      except DaemonControlError:
+         pass
 
 
 async def _watch_control_file(control_file, stoppable, *, poll_interval=5.0,
@@ -516,9 +571,9 @@ def _load_nested_daemon_config(config_path, home):
    return loaded
 
 
-def _daemon_state(control_file, run_id, run_directory, log_file):
-   import datetime
-   now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+def _daemon_state(run_id, run_directory, log_file):
+   from node_monitor.daemon_control import _utc_now
+   now = _utc_now()
    return DaemonState(
       hostname=socket.gethostname(), pid=os.getpid(),
       process_start_ticks=current_process_start_ticks(),
@@ -566,6 +621,8 @@ def daemon_stop():
          return
       if status == STATE_DIFFERENT_HOST:
          _exit(1, "daemon is managed on a different host", err=True)
+      if status == STATE_STALE:
+         _exit(1, "daemon state is stale; no live process was stopped", err=True)
       state = control.request_stop()
       click.echo("Stop requested for PID %d" % state.pid)
    except DaemonControlError:
@@ -585,8 +642,16 @@ def daemon_start(config_path, home, run_id, foreground):
    probe_version = _resolve_probe_version(loaded.probe_python)
    run_id = run_id if run_id is not None else _default_run_id()
    control = ControlFile(_default_control_file_path())
-   status = control.classify()
+   lock_fd = _acquire_daemon_lock(_default_control_lock_path())
+   if lock_fd is None:
+      _exit(1, "daemon already active: singleton lock is held", err=True)
+   try:
+      status = control.classify()
+   except BaseException:
+      _release_daemon_lock(lock_fd)
+      raise
    if status in (STATE_RUNNING, STATE_STOPPING, STATE_DIFFERENT_HOST):
+      _release_daemon_lock(lock_fd)
       _exit(1, "daemon already active: %s" % _status_label(status), err=True)
 
    raw = _nested_to_phase0_raw(loaded, duration_sec_override=None)
@@ -595,19 +660,22 @@ def daemon_start(config_path, home, run_id, foreground):
 
    if foreground:
       def startup_ack(run_directory):
-         control.write(_daemon_state(control, run_id, run_directory, log_file))
-      exit_code = _run_daemon_postgres(
-         loaded, config_path, run_id, probe_version, resolved_home,
-         phase0_config=phase0_config, control_file=control,
-         startup_ack=startup_ack)
-      state = control.read()
-      outcome = "fatal" if exit_code == EXIT_SINK_FATAL else "partial"
-      control.mark_exited(outcome=outcome, exit_code=exit_code)
+         control.write(_daemon_state(run_id, run_directory, log_file))
+      def runtime(ack):
+         return _run_daemon_postgres(
+            loaded, config_path, run_id, probe_version, resolved_home,
+            phase0_config=phase0_config, control_file=control,
+            startup_ack=ack)
+      try:
+         exit_code = _run_controlled_daemon(control, runtime, startup_ack)
+      finally:
+         _release_daemon_lock(lock_fd)
       sys.exit(exit_code)
 
    read_fd, write_fd = os.pipe()
    child_pid = os.fork()
    if child_pid:
+      _release_daemon_lock(lock_fd)
       os.close(write_fd)
       ack = os.read(read_fd, 1)
       os.close(read_fd)
@@ -623,6 +691,7 @@ def daemon_start(config_path, home, run_id, foreground):
    try:
       os.setsid()
       os.chdir("/")
+      _close_inherited_fds({write_fd, lock_fd})
       stdin_fd = os.open(os.devnull, os.O_RDONLY)
       log_fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
       os.dup2(stdin_fd, 0)
@@ -632,23 +701,24 @@ def daemon_start(config_path, home, run_id, foreground):
       os.close(log_fd)
 
       def startup_ack(run_directory):
-         control.write(_daemon_state(control, run_id, run_directory, log_file))
+         control.write(_daemon_state(run_id, run_directory, log_file))
          os.write(write_fd, b"1")
          os.close(write_fd)
 
-      exit_code = _run_daemon_postgres(
-         loaded, config_path, run_id, probe_version, resolved_home,
-         phase0_config=phase0_config, control_file=control,
-         startup_ack=startup_ack)
-      state = control.read()
-      outcome = "fatal" if exit_code == EXIT_SINK_FATAL else "partial"
-      control.mark_exited(outcome=outcome, exit_code=exit_code)
+      def runtime(ack):
+         return _run_daemon_postgres(
+            loaded, config_path, run_id, probe_version, resolved_home,
+            phase0_config=phase0_config, control_file=control,
+            startup_ack=ack)
+      exit_code = _run_controlled_daemon(control, runtime, startup_ack)
+      _release_daemon_lock(lock_fd)
       os._exit(exit_code)
    except BaseException:
       try:
          os.close(write_fd)
       except OSError:
          pass
+      _release_daemon_lock(lock_fd)
       os._exit(1)
 
 

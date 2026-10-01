@@ -4,6 +4,7 @@ import asyncio
 import os
 import socket
 
+import pytest
 import yaml
 from click.testing import CliRunner
 
@@ -66,6 +67,8 @@ def test_stop_sets_request_but_not_exited(tmp_path, monkeypatch):
    control = ControlFile(str(path))
    control.write(_state())
    monkeypatch.setattr(cli_module, "_default_control_file_path", lambda: str(path))
+   monkeypatch.setattr(
+      "node_monitor.daemon_control._linux_start_ticks", lambda unused: 1)
 
    result = CliRunner().invoke(cli, ["daemon", "stop"], catch_exceptions=False)
 
@@ -170,3 +173,51 @@ def test_postgres_runtime_ack_occurs_after_schema_gate_and_sink_creation(
    assert events.index("gate") < events.index(("ack", "/runs/actual"))
    assert events.index(("ack", "/runs/actual")) < events.index("sink_start")
    assert events.index("sink_start") < events.index("run")
+
+
+def test_start_rejects_concurrent_start_while_lifetime_lock_is_held(
+      tmp_path, monkeypatch):
+   config = tmp_path / "config.yaml"
+   config.write_text(yaml.safe_dump(_nested_raw()))
+   path = tmp_path / "daemon.json"
+   lock_path = tmp_path / "daemon.lock"
+   monkeypatch.setattr(cli_module, "_default_control_file_path", lambda: str(path))
+   monkeypatch.setattr(cli_module, "_default_control_lock_path", lambda: str(lock_path))
+   monkeypatch.setattr(cli_module, "_resolve_probe_version", lambda *_: 4)
+
+   first_lock = cli_module._acquire_daemon_lock(str(lock_path))
+   try:
+      result = CliRunner().invoke(
+         cli, ["daemon", "start", "--config", str(config), "--home",
+               str(tmp_path), "--foreground"], catch_exceptions=False)
+   finally:
+      cli_module._release_daemon_lock(first_lock)
+
+   assert result.exit_code == 1
+   assert "daemon already active" in result.output
+
+
+def test_mark_exited_attempted_after_runtime_exception(tmp_path, monkeypatch):
+   control = ControlFile(str(tmp_path / "daemon.json"))
+   control.write(_state())
+   calls = []
+   monkeypatch.setattr(control, "mark_exited",
+                       lambda outcome, exit_code: calls.append((outcome, exit_code)))
+
+   with pytest.raises(RuntimeError, match="boom"):
+      cli_module._run_controlled_daemon(
+         control,
+         lambda unused: (_ for _ in ()).throw(RuntimeError("boom")),
+         lambda unused: None)
+
+   assert calls == [("fatal", 1)]
+
+
+def test_close_inherited_fds_preserves_only_explicit_descriptors(monkeypatch):
+   closed = []
+   monkeypatch.setattr(cli_module.resource, "getrlimit", lambda *_: (9, 9))
+   monkeypatch.setattr(cli_module.os, "close", lambda fd: closed.append(fd))
+
+   cli_module._close_inherited_fds({4, 7})
+
+   assert closed == [3, 5, 6, 8]
