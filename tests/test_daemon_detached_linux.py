@@ -46,11 +46,14 @@ def test_detached_start_ack_status_stop_and_exit(tmp_path):
       "else:\n"
       "   print(json.dumps({'probe_version': 4}))\n"
    )
+   versioned_python = pathlib.Path(sys.executable).with_name(
+      "python%d.%d" % (sys.version_info.major, sys.version_info.minor))
+   assert versioned_python.exists()
    config = tmp_path / "config.yaml"
    config.write_text(yaml.safe_dump({
       "system": "polaris",
       "nodes": [{"hostname": "localhost", "role": "local"}],
-      "probe_python": sys.executable,
+      "probe_python": str(versioned_python),
       "output": {"root": str(home / "runs")},
       "collection": {"duration_sec": 60},
       "ssh": {},
