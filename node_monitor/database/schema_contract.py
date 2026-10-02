@@ -149,6 +149,38 @@ _REQUIRED_SOURCE_INDEXES = frozenset({
 })
 
 
+def compare_source_constraints(actual):
+   """Compare an actual set of constraint names against ``_REQUIRED_SOURCE_CONSTRAINTS``.
+
+   ``actual`` must be a set (or frozenset) of constraint name strings present
+   in the live database.  Required constraints are checked as a *subset*: extra
+   constraints in ``actual`` are tolerated (they do not indicate drift).
+
+   Returns ``None`` if all required constraints are present, or a non-empty
+   string naming the first missing constraint otherwise.
+   """
+   missing = _REQUIRED_SOURCE_CONSTRAINTS - frozenset(actual)
+   if not missing:
+      return None
+   return "missing required constraint(s): %s" % ", ".join(sorted(missing))
+
+
+def compare_source_indexes(actual):
+   """Compare an actual set of index names against ``_REQUIRED_SOURCE_INDEXES``.
+
+   ``actual`` must be a set (or frozenset) of index name strings present in the
+   live database.  Required indexes are checked as a *subset*: extra indexes in
+   ``actual`` are tolerated.
+
+   Returns ``None`` if all required indexes are present, or a non-empty string
+   naming the first missing index otherwise.
+   """
+   missing = _REQUIRED_SOURCE_INDEXES - frozenset(actual)
+   if not missing:
+      return None
+   return "missing required index(es): %s" % ", ".join(sorted(missing))
+
+
 def compare_source_schema(actual):
    """Compare an actual schema catalog dict against ``_SOURCE_SCHEMA_COLUMNS``.
 

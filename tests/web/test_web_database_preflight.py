@@ -521,3 +521,215 @@ def test_preflight_error_omits_url_and_role(migrated_reader_engine):
          assert "SELECT" not in message
    finally:
       db.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Preflight RED path: forbidden database-level TEMP privilege
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _PG_AVAILABLE,
+                    reason="NODE_MONITOR_TEST_DATABASE_URL is required")
+def test_preflight_rejects_database_temp_privilege(migrated_reader_engine):
+   """Database-level TEMP privilege granted to the reader must cause preflight
+   failure.  The fixture revokes PUBLIC TEMP; this test explicitly re-grants
+   TEMP to the reader role and verifies preflight rejects it.
+   """
+   from node_monitor.database.web import WebDatabase, WebDatabaseError
+   with migrated_reader_engine.admin.connect() as conn:
+      conn.exec_driver_sql(
+         'GRANT TEMP ON DATABASE "%s" TO %s'
+         % (migrated_reader_engine._db_name, migrated_reader_engine._role_name))
+   db = WebDatabase(migrated_reader_engine._reader_cfg)
+   try:
+      with pytest.raises(WebDatabaseError, match="web database preflight failed"):
+         db.preflight()
+   finally:
+      db.dispose()
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE,
+                    reason="NODE_MONITOR_TEST_DATABASE_URL is required")
+def test_preflight_rejects_database_create_privilege(migrated_reader_engine):
+   """Database-level CREATE privilege granted to the reader must cause preflight
+   failure.
+   """
+   from node_monitor.database.web import WebDatabase, WebDatabaseError
+   with migrated_reader_engine.admin.connect() as conn:
+      conn.exec_driver_sql(
+         'GRANT CREATE ON DATABASE "%s" TO %s'
+         % (migrated_reader_engine._db_name, migrated_reader_engine._role_name))
+   db = WebDatabase(migrated_reader_engine._reader_cfg)
+   try:
+      with pytest.raises(WebDatabaseError, match="web database preflight failed"):
+         db.preflight()
+   finally:
+      db.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: compare_source_constraints helper
+# ---------------------------------------------------------------------------
+
+def test_compare_source_constraints_accepts_exact_set():
+   """compare_source_constraints returns None when actual exactly equals
+   _REQUIRED_SOURCE_CONSTRAINTS.
+   """
+   from node_monitor.database.schema_contract import (
+      _REQUIRED_SOURCE_CONSTRAINTS,
+      compare_source_constraints,
+   )
+   result = compare_source_constraints(set(_REQUIRED_SOURCE_CONSTRAINTS))
+   assert result is None, (
+       "compare_source_constraints must return None on exact match, got: %r"
+       % result
+   )
+
+
+def test_compare_source_constraints_rejects_missing_constraint():
+   """compare_source_constraints returns a non-None error when a required
+   constraint name is absent from the actual set.
+   """
+   from node_monitor.database.schema_contract import (
+      _REQUIRED_SOURCE_CONSTRAINTS,
+      compare_source_constraints,
+   )
+   one_removed = set(_REQUIRED_SOURCE_CONSTRAINTS) - {"node_hardware_time_check"}
+   result = compare_source_constraints(one_removed)
+   assert result is not None, (
+       "compare_source_constraints must detect missing constraint"
+   )
+
+
+def test_compare_source_constraints_accepts_superset():
+   """compare_source_constraints returns None when actual is a superset of
+   required (extra constraints are tolerated -- they do not indicate drift).
+   """
+   from node_monitor.database.schema_contract import (
+      _REQUIRED_SOURCE_CONSTRAINTS,
+      compare_source_constraints,
+   )
+   superset = set(_REQUIRED_SOURCE_CONSTRAINTS) | {"some_extra_constraint"}
+   result = compare_source_constraints(superset)
+   assert result is None, (
+       "compare_source_constraints must tolerate extra constraints in actual"
+   )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: compare_source_indexes helper
+# ---------------------------------------------------------------------------
+
+def test_compare_source_indexes_accepts_exact_set():
+   """compare_source_indexes returns None when actual exactly equals
+   _REQUIRED_SOURCE_INDEXES.
+   """
+   from node_monitor.database.schema_contract import (
+      _REQUIRED_SOURCE_INDEXES,
+      compare_source_indexes,
+   )
+   result = compare_source_indexes(set(_REQUIRED_SOURCE_INDEXES))
+   assert result is None, (
+       "compare_source_indexes must return None on exact match, got: %r"
+       % result
+   )
+
+
+def test_compare_source_indexes_rejects_missing_index():
+   """compare_source_indexes returns a non-None error when a required index
+   name is absent from the actual set.
+   """
+   from node_monitor.database.schema_contract import (
+      _REQUIRED_SOURCE_INDEXES,
+      compare_source_indexes,
+   )
+   one_removed = set(_REQUIRED_SOURCE_INDEXES) - {"node_counter_minute_system_time_idx"}
+   result = compare_source_indexes(one_removed)
+   assert result is not None, (
+       "compare_source_indexes must detect missing index"
+   )
+
+
+def test_compare_source_indexes_accepts_superset():
+   """compare_source_indexes returns None when actual is a superset of
+   required (extra indexes are tolerated).
+   """
+   from node_monitor.database.schema_contract import (
+      _REQUIRED_SOURCE_INDEXES,
+      compare_source_indexes,
+   )
+   superset = set(_REQUIRED_SOURCE_INDEXES) | {"some_extra_idx"}
+   result = compare_source_indexes(superset)
+   assert result is None, (
+       "compare_source_indexes must tolerate extra indexes in actual"
+   )
+
+
+# ---------------------------------------------------------------------------
+# Unit test: web.py source inspection -- must reference constraint/index catalogs
+# ---------------------------------------------------------------------------
+
+def test_web_preflight_references_required_constraints_catalog():
+   """web.py must reference _REQUIRED_SOURCE_CONSTRAINTS so the preflight
+   validates required constraint presence, not just column names.
+   """
+   import inspect
+   from node_monitor.database import web as web_module
+   src = inspect.getsource(web_module)
+   assert "_REQUIRED_SOURCE_CONSTRAINTS" in src, (
+       "web.py must reference _REQUIRED_SOURCE_CONSTRAINTS for constraint drift detection"
+   )
+
+
+def test_web_preflight_references_required_indexes_catalog():
+   """web.py must reference _REQUIRED_SOURCE_INDEXES so the preflight
+   validates required index presence, not just column names.
+   """
+   import inspect
+   from node_monitor.database import web as web_module
+   src = inspect.getsource(web_module)
+   assert "_REQUIRED_SOURCE_INDEXES" in src, (
+       "web.py must reference _REQUIRED_SOURCE_INDEXES for index drift detection"
+   )
+
+
+# ---------------------------------------------------------------------------
+# Preflight: real-PG constraint/index drift tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _PG_AVAILABLE,
+                    reason="NODE_MONITOR_TEST_DATABASE_URL is required")
+def test_preflight_rejects_missing_required_index(migrated_reader_engine):
+   """Preflight must reject a live database where a required non-PK index has
+   been dropped (index drift), even when columns and constraints are intact.
+   """
+   from node_monitor.database.web import WebDatabase, WebDatabaseError
+   with migrated_reader_engine.admin.begin() as conn:
+      conn.exec_driver_sql(
+         "DROP INDEX IF EXISTS "
+         "node_monitor.node_counter_minute_system_time_idx")
+   db = WebDatabase(migrated_reader_engine._reader_cfg)
+   try:
+      with pytest.raises(WebDatabaseError, match="web database preflight failed"):
+         db.preflight()
+   finally:
+      db.dispose()
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE,
+                    reason="NODE_MONITOR_TEST_DATABASE_URL is required")
+def test_preflight_rejects_missing_required_check_constraint(
+      migrated_reader_engine):
+   """Preflight must reject a live database where a required CHECK constraint
+   has been dropped, even when columns and indexes are intact.
+   """
+   from node_monitor.database.web import WebDatabase, WebDatabaseError
+   with migrated_reader_engine.admin.begin() as conn:
+      conn.exec_driver_sql(
+         "ALTER TABLE node_monitor.node_hardware "
+         "DROP CONSTRAINT IF EXISTS node_hardware_time_check")
+   db = WebDatabase(migrated_reader_engine._reader_cfg)
+   try:
+      with pytest.raises(WebDatabaseError, match="web database preflight failed"):
+         db.preflight()
+   finally:
+      db.dispose()

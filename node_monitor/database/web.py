@@ -13,6 +13,9 @@ SELECT-only access.  Its ``preflight()`` method verifies:
      table match the canonical catalog in ``schema_contract``.  A
      database that merely has the right table names but wrong columns is
      rejected as schema drift.
+  3b. All required constraint names (``_REQUIRED_SOURCE_CONSTRAINTS``) and
+     required index names (``_REQUIRED_SOURCE_INDEXES``) are present in the
+     live ``node_monitor`` schema (subset check).
   4. The reader has SELECT on every required table.
   5. The reader has NO INSERT / UPDATE / DELETE / TRUNCATE / REFERENCES /
      TRIGGER on any required table.
@@ -34,7 +37,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from node_monitor.database.schema_contract import (
    REQUIRED_TABLES,
    _SOURCE_SCHEMA_COLUMNS,
+   _REQUIRED_SOURCE_CONSTRAINTS,
+   _REQUIRED_SOURCE_INDEXES,
    compare_source_schema,
+   compare_source_constraints,
+   compare_source_indexes,
    expected_migration_rows,
 )
 
@@ -95,6 +102,31 @@ def _require_current_schema(connection):
 
    drift = compare_source_schema(actual_cols)
    if drift is not None:
+      raise WebDatabaseError("web database preflight failed")
+
+   # Verify required constraint names are present (subset check -- extra
+   # constraints from triggers, application code, etc. are tolerated).
+   constraint_rows = connection.execute(text(
+      "SELECT conname "
+      "FROM pg_catalog.pg_constraint c "
+      "JOIN pg_catalog.pg_namespace n ON n.oid = c.connamespace "
+      "WHERE n.nspname = 'node_monitor'"
+   )).all()
+   actual_constraints = {row[0] for row in constraint_rows}
+   constraint_drift = compare_source_constraints(actual_constraints)
+   if constraint_drift is not None:
+      raise WebDatabaseError("web database preflight failed")
+
+   # Verify required index names are present (subset check -- extra indexes
+   # are tolerated).
+   index_rows = connection.execute(text(
+      "SELECT indexname "
+      "FROM pg_catalog.pg_indexes "
+      "WHERE schemaname = 'node_monitor'"
+   )).all()
+   actual_indexes = {row[0] for row in index_rows}
+   index_drift = compare_source_indexes(actual_indexes)
+   if index_drift is not None:
       raise WebDatabaseError("web database preflight failed")
 
 

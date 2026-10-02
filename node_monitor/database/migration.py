@@ -52,6 +52,8 @@ from node_monitor.database.schema_contract import (  # noqa: F401
    _parse_filename,
    _read_mode_marker,
    _validate_contiguous,
+   compare_source_constraints,
+   compare_source_indexes,
    compare_source_schema,
    discover_migrations,
    expected_migration_rows,
