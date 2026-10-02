@@ -287,3 +287,22 @@ def test_run_uvicorn_passes_config_to_server(short_tmp):
             "uvicorn.Server must receive the uvicorn.Config instance"
    finally:
       sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Test (Issue 1): uvicorn is a declared runtime dependency
+# ---------------------------------------------------------------------------
+
+def test_uvicorn_is_importable_as_runtime_dependency():
+   """uvicorn must be importable: it is a required runtime dependency.
+
+   This test fails if uvicorn is absent from the environment, which is the
+   case in a clean venv that only installs requirements.txt without uvicorn
+   declared there.  The fix is to add uvicorn to requirements.txt.
+   """
+   import importlib
+   uvicorn = importlib.import_module("uvicorn")
+   assert uvicorn is not None
+   # Confirm the public API we depend on is present
+   assert hasattr(uvicorn, "Config"), "uvicorn.Config missing"
+   assert hasattr(uvicorn, "Server"), "uvicorn.Server missing"

@@ -7,9 +7,11 @@ Security requirements verified here:
 - no accept loop starts before verification succeeds
 - foreign-owned socket is rejected fail-closed
 - operator-owned stale socket removed only after failed connect probe
+- EACCES during probe is treated conservatively as live (not unlinked)
 - duplicate launch cannot disturb live inode
 - pre-existing regular file is rejected
 - pre-existing symlink is rejected
+- symlink in run-directory path components is rejected fail-closed
 - cleanup unlinks only the exact inode created by this process
 
 Note: macOS AF_UNIX path limit is 103 bytes. Tests use short /tmp paths
@@ -367,3 +369,75 @@ def test_returned_socket_is_af_unix_sock_stream(short_tmp):
       assert sock.getsockname() == path
    finally:
       sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Test (Issue 2): EACCES is NOT conclusive stale evidence -- do not unlink
+# ---------------------------------------------------------------------------
+
+def test_eacces_on_probe_is_treated_as_live_not_stale(short_tmp, monkeypatch):
+   """EACCES during connect probe must NOT cause the socket to be unlinked.
+
+   EACCES means permission denied, which can happen even when a live listener
+   exists (e.g. SELinux policy, tight socket permissions).  It is NOT proof
+   that no process is listening.  The function must treat this conservatively
+   as 'live' and raise 'already in use', not remove the socket.
+   """
+   import errno as _errno
+   run_dir = os.path.join(short_tmp, "run")
+   os.makedirs(run_dir, mode=0o700)
+   path = os.path.join(run_dir, "w.sock")
+
+   # Create an operator-owned socket file (no listener needed; we mock connect)
+   stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+   old_umask = os.umask(0o177)
+   try:
+      stale.bind(path)
+   finally:
+      os.umask(old_umask)
+   stale.close()
+
+   # Simulate connect() raising EACCES
+   import node_monitor.web.socket as ws_module
+   real_connect = socket.socket.connect
+
+   def eacces_connect(self, addr):
+      if addr == path:
+         raise OSError(_errno.EACCES, "Permission denied")
+      return real_connect(self, addr)
+
+   monkeypatch.setattr(socket.socket, "connect", eacces_connect)
+
+   with pytest.raises(Exception, match="already in use"):
+      bind_private_socket(path)
+
+   # Socket must NOT have been removed
+   assert os.path.exists(path), "socket must not be unlinked when probe returns EACCES"
+
+
+# ---------------------------------------------------------------------------
+# Test (Issue 3): symlink in run-directory PATH COMPONENTS is rejected
+# ---------------------------------------------------------------------------
+
+def test_rejects_symlinked_run_directory_path_component(short_tmp):
+   """A symlink anywhere in the run-directory path is rejected fail-closed.
+
+   An operator can create a symlink that points outside ~/.node-monitor/run;
+   following it would let a socket land in an uncontrolled location.
+   bind_private_socket must detect and reject any symlink in the path
+   components leading to the socket, not just a symlink AT the socket path.
+   """
+   # Create a real directory and a symlink that points to it
+   real_dir = os.path.join(short_tmp, "real_run")
+   os.makedirs(real_dir, mode=0o700)
+   link_dir = os.path.join(short_tmp, "run")
+   os.symlink(real_dir, link_dir)      # run/ → real_run/
+
+   path = os.path.join(link_dir, "w.sock")   # path walks through symlink
+
+   with pytest.raises(Exception, match="symlink"):
+      bind_private_socket(path)
+
+   # Nothing should have been created inside real_run
+   assert not os.path.exists(os.path.join(real_dir, "w.sock")), \
+      "socket must not be created through a symlinked run directory"

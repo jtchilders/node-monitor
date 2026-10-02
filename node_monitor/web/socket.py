@@ -2,10 +2,12 @@
 
 Security contract (spec §9):
 - Parent run directory: mode 0700, owned by current euid (create or verify).
+- Reject any symlink used as the run directory itself.
 - Reject any pre-existing path that is a symlink.
 - Reject any pre-existing path that is not a socket.
 - Reject any socket owned by a foreign uid (fail-closed).
-- Probe-and-remove operator-owned socket only when connect conclusively fails.
+- Probe-and-remove operator-owned socket only when connect conclusively fails
+  (ECONNREFUSED or ENOENT); EACCES and all other errors are treated as live.
 - A live socket (connect succeeds) raises "socket is already in use"; the
   inode is never disturbed.
 - Create AF_UNIX/SOCK_STREAM under umask 0177 (kernel creates mode 0600).
@@ -37,6 +39,7 @@ def bind_private_socket(path, backlog=128):
    Raises SocketError (or a subclass of OSError) on any policy violation.
    """
    run_dir = os.path.dirname(path)
+   _reject_symlinked_path_components(run_dir)
    _ensure_private_run_directory(run_dir)
    _prepare_absent_or_stale_socket(path)
 
@@ -69,6 +72,27 @@ def bind_private_socket(path, backlog=128):
 # ---------------------------------------------------------------------------
 # Run-directory management
 # ---------------------------------------------------------------------------
+
+def _reject_symlinked_path_components(run_dir):
+   """Fail closed if *run_dir* itself is a symlink.
+
+   An operator-created symlink used as the run directory could redirect the
+   socket outside the intended location.  We lstat *run_dir* without following
+   it; if it is a symlink we raise SocketError immediately.
+
+   Note: we intentionally do not walk the full absolute path from the
+   filesystem root, because system-level symlinks (e.g. /tmp → /private/tmp
+   on macOS) are not operator-controlled and must not be rejected.
+   """
+   try:
+      link_info = os.lstat(run_dir)
+   except FileNotFoundError:
+      return  # Does not exist yet; nothing to check.
+   if stat.S_ISLNK(link_info.st_mode):
+      raise SocketError(
+         "run directory %r is a symlink; refusing to bind" % run_dir
+      )
+
 
 def _ensure_private_run_directory(run_dir):
    """Create run_dir mode 0700 if absent; verify mode and ownership if present."""
@@ -148,9 +172,12 @@ def _socket_accepts_connections(path):
    except (ConnectionRefusedError, FileNotFoundError):
       return False
    except OSError as exc:
-      # ECONNREFUSED (111) and ENOENT are conclusive stale indicators.
-      # Any other error (e.g. EAGAIN) is treated conservatively as "live".
-      if exc.errno in (errno.ECONNREFUSED, errno.ENOENT, errno.EACCES):
+      # Only ECONNREFUSED and ENOENT are conclusive stale indicators:
+      # ECONNREFUSED → kernel actively rejected the connect (no listener).
+      # ENOENT       → socket file vanished between lstat and connect.
+      # EACCES and all other errors are treated conservatively as "live";
+      # a permission-denied probe does not prove no listener exists.
+      if exc.errno in (errno.ECONNREFUSED, errno.ENOENT):
          return False
       return True
    finally:

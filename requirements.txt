@@ -10,6 +10,9 @@ python-dateutil>=2.8.0
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.0
 
+# Web runtime
+uvicorn>=0.20.0,<1.0
+
 # Development and testing
 pytest>=7.0.0
 pytest-cov>=4.0.0
