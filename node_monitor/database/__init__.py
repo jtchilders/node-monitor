@@ -21,48 +21,48 @@ from node_monitor.database.writer import DatabaseWriteError, DatabaseWriter
 # so that __all__ is correct for star-imports and IDE inspection.
 # ---------------------------------------------------------------------------
 _MIGRATION_EXPORTS = frozenset({
-    "MigrationApplyError",
-    "MigrationDriftError",
-    "MigrationError",
-    "MigrationLockError",
-    "MigrationResult",
-    "MigrationRunner",
-    "MigrationStatus",
+   "MigrationApplyError",
+   "MigrationDriftError",
+   "MigrationError",
+   "MigrationLockError",
+   "MigrationResult",
+   "MigrationRunner",
+   "MigrationStatus",
 })
 
 __all__ = [
-    "DatabaseWriteError",
-    "DatabaseWriter",
-    "MigrationApplyError",
-    "MigrationDriftError",
-    "MigrationError",
-    "MigrationLockError",
-    "MigrationResult",
-    "MigrationRunner",
-    "MigrationStatus",
-    "NodeMonitorDB",
+   "DatabaseWriteError",
+   "DatabaseWriter",
+   "MigrationApplyError",
+   "MigrationDriftError",
+   "MigrationError",
+   "MigrationLockError",
+   "MigrationResult",
+   "MigrationRunner",
+   "MigrationStatus",
+   "NodeMonitorDB",
 ]
 
 
 def __getattr__(name: str):
-    """Lazily import migration-runner symbols on first access.
+   """Lazily import migration-runner symbols on first access.
 
-    This satisfies PEP 562 (Python 3.7+): the interpreter calls this
-    function when an attribute lookup on the *module* itself fails,
-    i.e. exactly when a caller writes::
+   This satisfies PEP 562 (Python 3.7+): the interpreter calls this
+   function when an attribute lookup on the *module* itself fails,
+   i.e. exactly when a caller writes::
 
-        from node_monitor.database import MigrationRunner
+       from node_monitor.database import MigrationRunner
 
-    The actual import of node_monitor.database.migration is deferred
-    until that moment, so importing node_monitor.database.web (which
-    never references MigrationRunner) does not trigger it.
-    """
-    if name in _MIGRATION_EXPORTS:
-        import node_monitor.database.migration as _migration  # noqa: PLC0415
-        value = getattr(_migration, name)
-        # Cache on the module so subsequent lookups skip __getattr__.
-        import sys as _sys
-        setattr(_sys.modules[__name__], name, value)
-        return value
-    raise AttributeError(
-        "module %r has no attribute %r" % (__name__, name))
+   The actual import of node_monitor.database.migration is deferred
+   until that moment, so importing node_monitor.database.web (which
+   never references MigrationRunner) does not trigger it.
+   """
+   if name in _MIGRATION_EXPORTS:
+      import node_monitor.database.migration as _migration  # noqa: PLC0415
+      value = getattr(_migration, name)
+      # Cache on the module so subsequent lookups skip __getattr__.
+      import sys as _sys
+      setattr(_sys.modules[__name__], name, value)
+      return value
+   raise AttributeError(
+      "module %r has no attribute %r" % (__name__, name))
