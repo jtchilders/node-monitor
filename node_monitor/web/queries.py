@@ -15,20 +15,26 @@ Strict semantics enforced here:
     before SQL is issued.
   * Username is bound data only; never used as an identifier.
   * Max 256 UTF-8 bytes for username; rejected before SQL is issued.
-  * Counter rows capped at 1440; 1441 raises QueryBoundsError.
-  * Newest window_end freshness: 120 seconds.
-  * Newest closed interval_end freshness: 1200 seconds.
+  * Counter rows capped at 1440; SQL uses LIMIT COUNTER_ROW_LIMIT+1 sentinel
+    so the DB returns at most 1441 rows; load_counters then rejects >1440.
+    The one extra row is the sentinel proving overflow without fetching all.
+  * Newest window_end freshness: 120 seconds; age must satisfy 0 <= age <= threshold
+    (future timestamps are not fresh).
+  * Newest closed interval_end freshness: 1200 seconds; same 0 <= age rule.
   * Max 10 poll failures returned.
-  * Collection log is system-level (no source_hostname filter).
+  * Collection log is system-level (no source_hostname filter); bounded by
+    COLLECTION_LOG_LIMIT rows.
   * Loopback iface "lo" is excluded in the stored network_rates JSONB
     (enforced by the writer/collector; queries project what is stored).
   * LUSTRE_PEAK_SUM_SOURCE = "max_sum"; API label "peak-sum".
   * No ORM rows; no raw column SELECT *; only projected/aggregated columns.
   * All SQL is a fixed Python constant; only VALUES are bound; no identifier
     binding. JSONB field access uses ->> with explicit ::double precision cast.
+  * start and now_utc parameters must be UTC-aware datetimes; naive or
+    non-datetime values raise QueryValidationError before any SQL is issued.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import bindparam, text
 
@@ -54,6 +60,9 @@ USAGE_STALENESS_SECONDS = 1200
 #: Maximum poll failure rows returned per node.
 MAX_POLL_FAILURES = 10
 
+#: Maximum collection log rows returned per query.
+COLLECTION_LOG_LIMIT = 200
+
 #: Field name inside lustre_md_summary JSONB used for peak-sum.
 LUSTRE_PEAK_SUM_SOURCE = "max_sum"
 
@@ -71,7 +80,7 @@ class QueryBoundsError(ValueError):
 
 class QueryValidationError(ValueError):
    """Raised when a query parameter fails domain validation (range, node,
-   username length) before any SQL is issued."""
+   username length, datetime UTC-awareness) before any SQL is issued."""
 
 
 # ---------------------------------------------------------------------------
@@ -110,13 +119,50 @@ def _validate_username(username):
    return username
 
 
+def _validate_utc_datetime(value, name):
+   """Raise QueryValidationError unless value is a UTC-aware datetime.
+
+   Both naive datetimes (tzinfo is None) and non-datetime objects raise
+   QueryValidationError with a message containing 'UTC-aware'.
+   """
+   if not isinstance(value, datetime) or value.tzinfo is None:
+      raise QueryValidationError(
+         "%s must be a UTC-aware datetime (got %r)" % (name, value))
+   return value
+
+
+def range_hours_to_start(hours, now_utc):
+   """Return now_utc - timedelta(hours=hours) after validating both arguments.
+
+   Parameters
+   ----------
+   hours : int -- must be in VALID_RANGES_HOURS.
+   now_utc : datetime (UTC-aware).
+
+   Returns
+   -------
+   datetime -- the start of the query window.
+
+   Raises
+   ------
+   QueryValidationError  if hours is not in VALID_RANGES_HOURS or now_utc is
+                         not a UTC-aware datetime.
+   """
+   _validate_utc_datetime(now_utc, "now_utc")
+   _validate_range_hours(hours)
+   return now_utc - timedelta(hours=hours)
+
+
 # ---------------------------------------------------------------------------
 # Fixed SQL constants -- counter queries
 # ---------------------------------------------------------------------------
 
-#: Load all counter rows for a node within [start, now].
+#: Load at most COUNTER_ROW_LIMIT+1 counter rows for a node within [start, now].
+#: The +1 sentinel allows load_counters to detect overflow without fetching
+#: all rows: if DB returns COUNTER_ROW_LIMIT+1 rows, the limit is exceeded.
 #: Returns (window_start, window_end, sample_count, expected_count, coverage,
-#:          meets_minimum_samples, mem_available_kb, cached_kb, shmem_kb,
+#:          meets_minimum_samples, invalid_pair_count, excess_sample_count,
+#:          mem_available_kb, cached_kb, shmem_kb,
 #:          load1, load5, load15, procs_running, procs_total, socket_count,
 #:          cpu_busy_pct, network_rates, lustre_md_summary)
 #: ordered by window_end ASC.
@@ -124,6 +170,7 @@ COUNTER_SQL = text("""
 SELECT
    window_start, window_end,
    sample_count, expected_count, coverage, meets_minimum_samples,
+   invalid_pair_count, excess_sample_count,
    mem_available_kb, cached_kb, shmem_kb,
    load1, load5, load15, procs_running, procs_total, socket_count,
    cpu_busy_pct, network_rates, lustre_md_summary
@@ -132,6 +179,7 @@ WHERE system = :system
   AND source_hostname = :node
   AND window_start >= :start
 ORDER BY window_end ASC
+LIMIT :limit
 """)
 
 
@@ -171,13 +219,22 @@ ORDER BY interval_end, category, activity
 #
 # No percentile-of-percentiles: each hotspot picks the single username row
 # whose stored per-row percentile is the highest.
+#
+# RSS hotspot: projects rss_p50_kb, rss_p95_kb, rss_max_kb (all three).
+# Process-count hotspot: projects process_count_p50, process_count_p95,
+#   process_count_max (all three).
+# Interactivity hotspot: projects interactivity_fraction and username.
+# D-state hotspot: projects d_state_fraction and username.
 # ---------------------------------------------------------------------------
 
 #: Hotspot: username with highest rss_kb ->> 'p95' per grain.
-USAGE_RSS_P95_HOTSPOT_SQL = text("""
+#: Projects all three rss percentiles: p50, p95, max.
+USAGE_RSS_HOTSPOT_SQL = text("""
 SELECT DISTINCT ON (interval_end, category, activity)
    interval_end, category, activity, username,
+   (rss_kb ->> 'p50')::double precision AS rss_p50_kb,
    (rss_kb ->> 'p95')::double precision AS rss_p95_kb,
+   (rss_kb ->> 'max')::double precision AS rss_max_kb,
    sample_count, expected_count, unmeasured_count
 FROM node_monitor.node_usage_intervals
 WHERE system = :system
@@ -189,6 +246,9 @@ ORDER BY
    (rss_kb ->> 'p95')::double precision DESC,
    username_key ASC
 """)
+
+#: Backward-compatible alias for USAGE_RSS_HOTSPOT_SQL.
+USAGE_RSS_P95_HOTSPOT_SQL = USAGE_RSS_HOTSPOT_SQL
 
 
 #: Hotspot: username with highest d_state_fraction per grain.
@@ -210,10 +270,13 @@ ORDER BY
 
 
 #: Hotspot: username with highest process_count ->> 'p95' per grain.
-USAGE_PROCESS_COUNT_P95_HOTSPOT_SQL = text("""
+#: Projects all three process_count percentiles: p50, p95, max.
+USAGE_PROCESS_COUNT_HOTSPOT_SQL = text("""
 SELECT DISTINCT ON (interval_end, category, activity)
    interval_end, category, activity, username,
+   (process_count ->> 'p50')::double precision AS process_count_p50,
    (process_count ->> 'p95')::double precision AS process_count_p95,
+   (process_count ->> 'max')::double precision AS process_count_max,
    sample_count, expected_count, unmeasured_count
 FROM node_monitor.node_usage_intervals
 WHERE system = :system
@@ -223,6 +286,27 @@ WHERE system = :system
 ORDER BY
    interval_end, category, activity,
    (process_count ->> 'p95')::double precision DESC,
+   username_key ASC
+""")
+
+#: Backward-compatible alias for USAGE_PROCESS_COUNT_HOTSPOT_SQL.
+USAGE_PROCESS_COUNT_P95_HOTSPOT_SQL = USAGE_PROCESS_COUNT_HOTSPOT_SQL
+
+
+#: Hotspot: username with highest interactivity_fraction per grain.
+USAGE_INTERACTIVITY_HOTSPOT_SQL = text("""
+SELECT DISTINCT ON (interval_end, category, activity)
+   interval_end, category, activity, username,
+   interactivity_fraction,
+   sample_count, expected_count, unmeasured_count
+FROM node_monitor.node_usage_intervals
+WHERE system = :system
+  AND source_hostname = :node
+  AND interval_start >= :start
+  AND (:username_is_null OR username = :username)
+ORDER BY
+   interval_end, category, activity,
+   interactivity_fraction DESC,
    username_key ASC
 """)
 
@@ -248,7 +332,7 @@ LIMIT :limit
 # Fixed SQL constants -- collection log (system-level, no node filter)
 # ---------------------------------------------------------------------------
 
-#: Most recent system-level collection log events.
+#: Most recent system-level collection log events, bounded by :limit.
 COLLECTION_LOG_SQL = text("""
 SELECT
    recorded_at, event, detail
@@ -256,6 +340,7 @@ FROM node_monitor.node_collection_log
 WHERE system = :system
   AND recorded_at >= :start
 ORDER BY recorded_at DESC
+LIMIT :limit
 """)
 
 
@@ -269,9 +354,14 @@ class CounterResult:
    Attributes:
      rows: list of dicts with JSONB columns already parsed (as returned
            by SQLAlchemy mappings -- psycopg2 decodes jsonb automatically).
+           Each row carries: window_start, window_end, sample_count,
+           expected_count, coverage, meets_minimum_samples,
+           invalid_pair_count, excess_sample_count, plus gauge columns.
      newest_window_end: datetime or None if no rows.
-     is_fresh: True iff newest_window_end is within COUNTER_STALENESS_SECONDS
-               of the supplied now_utc.
+     is_fresh: True iff newest_window_end satisfies
+               0 <= (now_utc - newest_window_end).total_seconds()
+               <= COUNTER_STALENESS_SECONDS.
+               Future timestamps (age < 0) are not fresh.
    """
 
    def __init__(self, rows, now_utc):
@@ -279,7 +369,7 @@ class CounterResult:
       if rows:
          self.newest_window_end = max(r["window_end"] for r in rows)
          age = (now_utc - self.newest_window_end).total_seconds()
-         self.is_fresh = age <= COUNTER_STALENESS_SECONDS
+         self.is_fresh = 0 <= age <= COUNTER_STALENESS_SECONDS
       else:
          self.newest_window_end = None
          self.is_fresh = False
@@ -290,15 +380,17 @@ class UsageResult:
 
    Attributes:
      by_key: dict mapping (category, activity, interval_end) ->
-             UsageGrain namedtuple-like object.
+             _UsageGrain object with all hotspot attributes.
      rows: flat list of dicts (additive cpu only; hotspots merged separately).
      newest_interval_end: datetime or None.
-     is_fresh: True iff newest closed interval_end is within
-               USAGE_STALENESS_SECONDS of now_utc.
+     is_fresh: True iff newest closed interval_end satisfies
+               0 <= (now_utc - newest_interval_end).total_seconds()
+               <= USAGE_STALENESS_SECONDS.
+               Future timestamps (age < 0) are not fresh.
    """
 
    def __init__(self, cpu_rows, rss_hotspot_rows, d_state_hotspot_rows,
-                proc_hotspot_rows, now_utc):
+                proc_hotspot_rows, interactivity_hotspot_rows, now_utc):
       # Index hotspots by (interval_end, category, activity).
       rss_index = {
          (r["interval_end"], r["category"], r["activity"]): r
@@ -312,6 +404,10 @@ class UsageResult:
          (r["interval_end"], r["category"], r["activity"]): r
          for r in proc_hotspot_rows
       }
+      interactivity_index = {
+         (r["interval_end"], r["category"], r["activity"]): r
+         for r in interactivity_hotspot_rows
+      }
 
       self.by_key = {}
       for row in cpu_rows:
@@ -320,15 +416,22 @@ class UsageResult:
          rss = rss_index.get(t_key)
          d = d_index.get(t_key)
          proc = proc_index.get(t_key)
+         ia = interactivity_index.get(t_key)
          self.by_key[key] = _UsageGrain(
             cpu_seconds=row["cpu_seconds"],
             complete=row["complete"],
+            rss_p50_kb=rss["rss_p50_kb"] if rss else None,
             rss_p95_kb=rss["rss_p95_kb"] if rss else None,
+            rss_max_kb=rss["rss_max_kb"] if rss else None,
             rss_p95_username=rss["username"] if rss else None,
             d_state_fraction=d["d_state_fraction"] if d else None,
             d_state_username=d["username"] if d else None,
+            process_count_p50=proc["process_count_p50"] if proc else None,
             process_count_p95=proc["process_count_p95"] if proc else None,
+            process_count_max=proc["process_count_max"] if proc else None,
             process_count_p95_username=proc["username"] if proc else None,
+            interactivity_fraction=ia["interactivity_fraction"] if ia else None,
+            interactivity_username=ia["username"] if ia else None,
          )
 
       self.rows = cpu_rows
@@ -336,33 +439,50 @@ class UsageResult:
          self.newest_interval_end = max(
             r["interval_end"] for r in cpu_rows)
          age = (now_utc - self.newest_interval_end).total_seconds()
-         self.is_fresh = age <= USAGE_STALENESS_SECONDS
+         self.is_fresh = 0 <= age <= USAGE_STALENESS_SECONDS
       else:
          self.newest_interval_end = None
          self.is_fresh = False
 
 
 class _UsageGrain:
-   """Merged per-(category, activity, interval_end) grain."""
+   """Merged per-(category, activity, interval_end) grain.
+
+   All non-additive hotspot fields (rss, process_count, interactivity,
+   d_state) carry the value AND the username of the hotspot row selected
+   by DISTINCT ON.  Each group carries all stored percentiles (p50/p95/max)
+   so the caller is not forced to re-query for other percentile levels.
+   """
 
    __slots__ = (
       "cpu_seconds", "complete",
-      "rss_p95_kb", "rss_p95_username",
+      "rss_p50_kb", "rss_p95_kb", "rss_max_kb", "rss_p95_username",
       "d_state_fraction", "d_state_username",
-      "process_count_p95", "process_count_p95_username",
+      "process_count_p50", "process_count_p95", "process_count_max",
+      "process_count_p95_username",
+      "interactivity_fraction", "interactivity_username",
    )
 
-   def __init__(self, cpu_seconds, complete, rss_p95_kb, rss_p95_username,
+   def __init__(self, cpu_seconds, complete,
+                rss_p50_kb, rss_p95_kb, rss_max_kb, rss_p95_username,
                 d_state_fraction, d_state_username,
-                process_count_p95, process_count_p95_username):
+                process_count_p50, process_count_p95, process_count_max,
+                process_count_p95_username,
+                interactivity_fraction, interactivity_username):
       self.cpu_seconds = cpu_seconds
       self.complete = complete
+      self.rss_p50_kb = rss_p50_kb
       self.rss_p95_kb = rss_p95_kb
+      self.rss_max_kb = rss_max_kb
       self.rss_p95_username = rss_p95_username
       self.d_state_fraction = d_state_fraction
       self.d_state_username = d_state_username
+      self.process_count_p50 = process_count_p50
       self.process_count_p95 = process_count_p95
+      self.process_count_max = process_count_max
       self.process_count_p95_username = process_count_p95_username
+      self.interactivity_fraction = interactivity_fraction
+      self.interactivity_username = interactivity_username
 
 
 # ---------------------------------------------------------------------------
@@ -378,9 +498,9 @@ def load_counters(connection, system, node, start, inventory, *,
    connection : SQLAlchemy connection (inside a transaction).
    system : str -- system name (e.g. "polaris").
    node : str -- source_hostname to query.
-   start : datetime (UTC) -- lower bound on window_start (inclusive).
+   start : datetime (UTC-aware) -- lower bound on window_start (inclusive).
    inventory : frozenset of str -- known node hostnames for validation.
-   now_utc : datetime (UTC) or None; defaults to datetime.now(timezone.utc).
+   now_utc : datetime (UTC-aware) or None; defaults to datetime.now(timezone.utc).
 
    Returns
    -------
@@ -388,16 +508,25 @@ def load_counters(connection, system, node, start, inventory, *,
 
    Raises
    ------
-   QueryValidationError  if node is not in inventory.
+   QueryValidationError  if node is not in inventory, or start/now_utc are
+                         not UTC-aware datetimes.
    QueryBoundsError      if the row count exceeds COUNTER_ROW_LIMIT.
    """
    _validate_node(node, inventory)
+   _validate_utc_datetime(start, "start")
    if now_utc is None:
       now_utc = datetime.now(timezone.utc)
+   else:
+      _validate_utc_datetime(now_utc, "now_utc")
 
+   # Pass COUNTER_ROW_LIMIT+1 as the sentinel LIMIT so the DB returns at most
+   # 1441 rows.  If we get exactly 1441, we know the true count is >= 1441
+   # and reject it without having fetched all rows.  This is the necessary
+   # enforcement interpretation: inspect the sentinel row to prove overflow.
    rows = list(connection.execute(
       COUNTER_SQL,
-      {"system": system, "node": node, "start": start},
+      {"system": system, "node": node, "start": start,
+       "limit": COUNTER_ROW_LIMIT + 1},
    ).mappings())
 
    if len(rows) > COUNTER_ROW_LIMIT:
@@ -413,10 +542,10 @@ def load_usage(connection, system, node, start, inventory, *,
    """Load and aggregate usage interval rows for one node.
 
    Additive: cpu_seconds is summed across username grains per
-   (interval_end, category, activity).  Hotspot metrics (rss_kb p95,
-   d_state_fraction, process_count p95) use DISTINCT ON to pick the single
-   contributing username row with the highest value -- never a
-   percentile-of-percentiles and never an unweighted average.
+   (interval_end, category, activity).  Hotspot metrics (rss_kb p50/p95/max,
+   d_state_fraction, process_count p50/p95/max, interactivity_fraction) use
+   DISTINCT ON to pick the single contributing username row with the highest
+   value -- never a percentile-of-percentiles and never an unweighted average.
 
    Gaps are preserved as-is: intervals with no rows produce no output.
    Missing intervals are never zero-filled.
@@ -426,11 +555,11 @@ def load_usage(connection, system, node, start, inventory, *,
    connection : SQLAlchemy connection.
    system : str.
    node : str -- source_hostname.
-   start : datetime (UTC).
+   start : datetime (UTC-aware).
    inventory : frozenset of str.
    username : str or None -- when not None, rows are filtered to this
               username; bound as a data value, never as an identifier.
-   now_utc : datetime (UTC) or None.
+   now_utc : datetime (UTC-aware) or None.
 
    Returns
    -------
@@ -438,12 +567,16 @@ def load_usage(connection, system, node, start, inventory, *,
 
    Raises
    ------
-   QueryValidationError  if node is not in inventory or username is invalid.
+   QueryValidationError  if node is not in inventory, username is invalid,
+                         or start/now_utc are not UTC-aware datetimes.
    """
    _validate_node(node, inventory)
+   _validate_utc_datetime(start, "start")
    username = _validate_username(username)
    if now_utc is None:
       now_utc = datetime.now(timezone.utc)
+   else:
+      _validate_utc_datetime(now_utc, "now_utc")
 
    params = {
       "system": system,
@@ -456,13 +589,16 @@ def load_usage(connection, system, node, start, inventory, *,
    cpu_rows = list(
       connection.execute(USAGE_CPU_SQL, params).mappings())
    rss_rows = list(
-      connection.execute(USAGE_RSS_P95_HOTSPOT_SQL, params).mappings())
+      connection.execute(USAGE_RSS_HOTSPOT_SQL, params).mappings())
    d_rows = list(
       connection.execute(USAGE_D_STATE_HOTSPOT_SQL, params).mappings())
    proc_rows = list(
-      connection.execute(USAGE_PROCESS_COUNT_P95_HOTSPOT_SQL, params).mappings())
+      connection.execute(USAGE_PROCESS_COUNT_HOTSPOT_SQL, params).mappings())
+   interactivity_rows = list(
+      connection.execute(USAGE_INTERACTIVITY_HOTSPOT_SQL, params).mappings())
 
-   return UsageResult(cpu_rows, rss_rows, d_rows, proc_rows, now_utc)
+   return UsageResult(cpu_rows, rss_rows, d_rows, proc_rows,
+                      interactivity_rows, now_utc)
 
 
 def load_poll_failures(connection, system, node, inventory):
@@ -495,6 +631,7 @@ def load_collection_log(connection, system, start):
    """Load system-level collection log events since start.
 
    Note: collection log has no source_hostname -- it is system-level.
+   Results are bounded at COLLECTION_LOG_LIMIT rows.
 
    Parameters
    ----------
@@ -508,6 +645,6 @@ def load_collection_log(connection, system, start):
    """
    rows = list(connection.execute(
       COLLECTION_LOG_SQL,
-      {"system": system, "start": start},
+      {"system": system, "start": start, "limit": COLLECTION_LOG_LIMIT},
    ).mappings())
    return rows
