@@ -461,13 +461,24 @@ def _make_interactivity_row(interval_end=None, interactivity_fraction=0.80,
 
 
 def _make_usage_conn(cpu=None, rss=None, d=None, proc=None, interactivity=None):
-   """Build a mock conn returning the five query result lists in order:
-   cpu, rss, d_state, process_count, interactivity."""
+   """Build a mock conn returning the nine query result lists in order:
+   cpu, rss_p50, rss_p95, rss_max, d_state,
+   proc_p50, proc_p95, proc_max, interactivity.
+
+   For backward compatibility, rss is replicated to all three RSS slots and
+   proc is replicated to all three process_count slots.  Tests that need
+   independent per-stat control should call _make_usage_conn_9q directly."""
+   rss_rows = rss if rss is not None else [_make_rss_row()]
+   proc_rows = proc if proc is not None else [_make_proc_row()]
    return _make_conn([
       cpu if cpu is not None else [_make_cpu_row()],
-      rss if rss is not None else [_make_rss_row()],
+      rss_rows,          # rss_p50 query
+      rss_rows,          # rss_p95 query
+      rss_rows,          # rss_max query
       d if d is not None else [_make_d_row()],
-      proc if proc is not None else [_make_proc_row()],
+      proc_rows,         # proc_p50 query
+      proc_rows,         # proc_p95 query
+      proc_rows,         # proc_max query
       interactivity if interactivity is not None else [_make_interactivity_row()],
    ])
 
@@ -497,7 +508,7 @@ def test_usage_stale_beyond_1200s():
 
 
 def test_usage_no_rows_is_not_fresh():
-   conn = _make_conn([[], [], [], [], []])
+   conn = _make_conn([[], [], [], [], [], [], [], [], []])
    result = load_usage(conn, "polaris", "login-04", _START, _INVENTORY,
                        now_utc=_NOW)
    assert result.is_fresh is False
@@ -525,7 +536,7 @@ def test_usage_future_interval_end_is_not_fresh():
 
 def test_load_usage_rejects_naive_now_utc():
    """load_usage must raise QueryValidationError for a naive now_utc."""
-   conn = _make_conn([[], [], [], [], []])
+   conn = _make_conn([[], [], [], [], [], [], [], [], []])
    naive = datetime(2026, 9, 30, 14, 0)
    with pytest.raises(QueryValidationError, match="UTC-aware"):
       load_usage(conn, "polaris", "login-04", _START, _INVENTORY,
@@ -534,7 +545,7 @@ def test_load_usage_rejects_naive_now_utc():
 
 def test_load_usage_rejects_non_datetime_now_utc():
    """load_usage must raise QueryValidationError for a non-datetime now_utc."""
-   conn = _make_conn([[], [], [], [], []])
+   conn = _make_conn([[], [], [], [], [], [], [], [], []])
    with pytest.raises(QueryValidationError, match="UTC-aware"):
       load_usage(conn, "polaris", "login-04", _START, _INVENTORY,
                  now_utc="2026-09-30T14:00:00Z")
@@ -542,7 +553,7 @@ def test_load_usage_rejects_non_datetime_now_utc():
 
 def test_load_usage_rejects_naive_start():
    """load_usage must raise QueryValidationError for a naive start."""
-   conn = _make_conn([[], [], [], [], []])
+   conn = _make_conn([[], [], [], [], [], [], [], [], []])
    naive_start = datetime(2026, 9, 30, 13, 0)
    with pytest.raises(QueryValidationError, match="UTC-aware"):
       load_usage(conn, "polaris", "login-04", naive_start, _INVENTORY,
@@ -580,7 +591,7 @@ def test_unfiltered_usage_sums_cpu_and_attributes_hotspots():
 def test_usage_username_filter_is_bound_data_not_sql():
    """Username filter must be passed as a bound parameter, not concatenated."""
    hostile = "x' OR true; --%00\n"
-   conn = _make_conn([[], [], [], [], []])
+   conn = _make_conn([[], [], [], [], [], [], [], [], []])
    # Must not raise (hostile string is valid data once length is checked).
    result = load_usage(conn, "polaris", "login-04", _START, _INVENTORY,
                        username=hostile, now_utc=_NOW)
@@ -685,9 +696,13 @@ def test_usage_grain_interactivity_is_none_when_no_hotspot_row():
    """interactivity_fraction and interactivity_username are None when no row."""
    conn = _make_conn([
       [_make_cpu_row()],
-      [_make_rss_row()],
+      [_make_rss_row()],   # rss_p50
+      [_make_rss_row()],   # rss_p95
+      [_make_rss_row()],   # rss_max
       [_make_d_row()],
-      [_make_proc_row()],
+      [_make_proc_row()],  # proc_p50
+      [_make_proc_row()],  # proc_p95
+      [_make_proc_row()],  # proc_max
       [],   # no interactivity hotspot row
    ])
    result = load_usage(conn, "polaris", "login-04", _START, _INVENTORY,
@@ -701,9 +716,13 @@ def test_usage_grain_rss_is_none_when_no_hotspot_row():
    """rss_p50_kb, rss_p95_kb, rss_max_kb are None when no RSS hotspot row."""
    conn = _make_conn([
       [_make_cpu_row()],
-      [],   # no RSS hotspot row
+      [],   # no rss_p50 hotspot row
+      [],   # no rss_p95 hotspot row
+      [],   # no rss_max hotspot row
       [_make_d_row()],
-      [_make_proc_row()],
+      [_make_proc_row()],  # proc_p50
+      [_make_proc_row()],  # proc_p95
+      [_make_proc_row()],  # proc_max
       [_make_interactivity_row()],
    ])
    result = load_usage(conn, "polaris", "login-04", _START, _INVENTORY,
@@ -718,9 +737,13 @@ def test_usage_grain_process_count_is_none_when_no_hotspot_row():
    """process_count_p50/p95/max are None when no process_count hotspot row."""
    conn = _make_conn([
       [_make_cpu_row()],
-      [_make_rss_row()],
+      [_make_rss_row()],   # rss_p50
+      [_make_rss_row()],   # rss_p95
+      [_make_rss_row()],   # rss_max
       [_make_d_row()],
-      [],   # no process_count hotspot row
+      [],   # no proc_p50 hotspot row
+      [],   # no proc_p95 hotspot row
+      [],   # no proc_max hotspot row
       [_make_interactivity_row()],
    ])
    result = load_usage(conn, "polaris", "login-04", _START, _INVENTORY,
@@ -732,11 +755,14 @@ def test_usage_grain_process_count_is_none_when_no_hotspot_row():
 
 
 def test_load_usage_executes_five_queries():
-   """load_usage must issue exactly five SQL queries: cpu + 4 hotspot queries."""
+   """load_usage must issue exactly nine SQL queries: cpu + 3 rss + d + 3 proc + ia.
+
+   NOTE: Updated from 5 to 9 after Task 4 correction: rss and process_count
+   each require 3 independent queries (one per percentile stat)."""
    conn = _make_usage_conn()
    load_usage(conn, "polaris", "login-04", _START, _INVENTORY, now_utc=_NOW)
-   assert conn.execute.call_count == 5, (
-      "load_usage must execute exactly 5 queries; got %d" % conn.execute.call_count)
+   assert conn.execute.call_count == 9, (
+      "load_usage must execute exactly 9 queries; got %d" % conn.execute.call_count)
 
 
 # ---------------------------------------------------------------------------

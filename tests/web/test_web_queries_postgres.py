@@ -269,7 +269,8 @@ def test_counter_query_returns_production_jsonb_shapes(writer, conn):
 
    rows = list(conn.execute(
       COUNTER_SQL,
-      {"system": "polaris", "node": "login-04", "start": _WINDOW_START},
+      {"system": "polaris", "node": "login-04", "start": _WINDOW_START,
+       "end": _NOW + timedelta(hours=1), "limit": COUNTER_ROW_LIMIT + 1},
    ).mappings())
    assert len(rows) == 1
    row = rows[0]
@@ -361,7 +362,7 @@ def test_usage_cpu_seconds_is_additive_across_username_grains(writer, conn):
    rows = list(conn.execute(
       USAGE_CPU_SQL,
       {"system": "polaris", "node": "login-04",
-       "start": _WINDOW_START,
+       "start": _WINDOW_START, "end": _NOW + timedelta(hours=1),
        "username_is_null": True, "username": None},
    ).mappings())
    assert len(rows) == 1
@@ -381,7 +382,7 @@ def test_usage_rss_hotspot_selects_highest_p95_username(writer, conn):
    rows = list(conn.execute(
       USAGE_RSS_P95_HOTSPOT_SQL,
       {"system": "polaris", "node": "login-04",
-       "start": _WINDOW_START,
+       "start": _WINDOW_START, "end": _NOW + timedelta(hours=1),
        "username_is_null": True, "username": None},
    ).mappings())
    assert len(rows) == 1
@@ -399,7 +400,7 @@ def test_usage_d_state_hotspot_selects_highest_fraction_username(writer, conn):
    rows = list(conn.execute(
       USAGE_D_STATE_HOTSPOT_SQL,
       {"system": "polaris", "node": "login-04",
-       "start": _WINDOW_START,
+       "start": _WINDOW_START, "end": _NOW + timedelta(hours=1),
        "username_is_null": True, "username": None},
    ).mappings())
    assert len(rows) == 1
@@ -420,7 +421,7 @@ def test_usage_username_key_tiebreaker_is_deterministic(writer, conn):
    rows = list(conn.execute(
       USAGE_RSS_P95_HOTSPOT_SQL,
       {"system": "polaris", "node": "login-04",
-       "start": _WINDOW_START,
+       "start": _WINDOW_START, "end": _NOW + timedelta(hours=1),
        "username_is_null": True, "username": None},
    ).mappings())
    assert len(rows) == 1
@@ -438,7 +439,7 @@ def test_usage_username_filter_binds_as_data(writer, conn):
    rows = list(conn.execute(
       USAGE_CPU_SQL,
       {"system": "polaris", "node": "login-04",
-       "start": _WINDOW_START,
+       "start": _WINDOW_START, "end": _NOW + timedelta(hours=1),
        "username_is_null": False, "username": "alice"},
    ).mappings())
    assert len(rows) == 1
@@ -454,7 +455,7 @@ def test_usage_complete_is_false_when_unmeasured_count_nonzero(writer, conn):
    rows = list(conn.execute(
       USAGE_CPU_SQL,
       {"system": "polaris", "node": "login-04",
-       "start": _WINDOW_START,
+       "start": _WINDOW_START, "end": _NOW + timedelta(hours=1),
        "username_is_null": True, "username": None},
    ).mappings())
    assert len(rows) == 1
@@ -516,7 +517,8 @@ def test_poll_failures_capped_at_10(writer, conn):
       writer.write_record("node_poll_failures", _poll_failure_record(
          _ts(-15 + i)))
 
-   result = load_poll_failures(conn, "polaris", "login-04", _INVENTORY)
+   result = load_poll_failures(conn, "polaris", "login-04", _INVENTORY,
+                               start=_WINDOW_START, end=_NOW + timedelta(hours=1))
    assert len(result) == MAX_POLL_FAILURES
 
 
@@ -526,7 +528,8 @@ def test_poll_failures_most_recent_first(writer, conn):
       writer.write_record("node_poll_failures", _poll_failure_record(
          _ts(-3 + i), consecutive_failures=i + 1))
 
-   result = load_poll_failures(conn, "polaris", "login-04", _INVENTORY)
+   result = load_poll_failures(conn, "polaris", "login-04", _INVENTORY,
+                               start=_WINDOW_START, end=_NOW + timedelta(hours=1))
    # Highest consecutive_failures = 3 = most recent
    assert result[0]["consecutive_failures"] == 3
 
@@ -542,7 +545,8 @@ def test_collection_log_returns_system_events_without_node_filter(writer, conn):
    writer.write_record("node_collection_log", _collection_log_record(
       _ts(-20), event="stop"))
 
-   result = load_collection_log(conn, "polaris", _WINDOW_START)
+   result = load_collection_log(conn, "polaris", _WINDOW_START,
+                                end=_NOW + timedelta(hours=1))
    assert len(result) == 2
    events = {r["event"] for r in result}
    assert events == {"start", "stop"}
@@ -567,7 +571,8 @@ def test_explain_counter_sql(writer, conn):
 
    plan = _explain(conn, COUNTER_SQL,
                    {"system": "polaris", "node": "login-04",
-                    "start": _WINDOW_START})
+                    "start": _WINDOW_START, "end": _NOW + timedelta(hours=1),
+                    "limit": COUNTER_ROW_LIMIT + 1})
    print("\n--- EXPLAIN COUNTER_SQL ---\n" + plan)
    # Planner evidence: not asserting latency, just verifying plan is returned.
    assert "Seq Scan" in plan or "Index Scan" in plan or "Bitmap" in plan
@@ -579,6 +584,7 @@ def test_explain_usage_cpu_sql(writer, conn):
       _ts(-60), _ts(-45), username="alice"))
    params = {
       "system": "polaris", "node": "login-04", "start": _WINDOW_START,
+      "end": _NOW + timedelta(hours=1),
       "username_is_null": True, "username": None,
    }
    plan = _explain(conn, USAGE_CPU_SQL, params)
@@ -592,6 +598,7 @@ def test_explain_rss_hotspot_sql(writer, conn):
       _ts(-60), _ts(-45), username="alice"))
    params = {
       "system": "polaris", "node": "login-04", "start": _WINDOW_START,
+      "end": _NOW + timedelta(hours=1),
       "username_is_null": True, "username": None,
    }
    plan = _explain(conn, USAGE_RSS_P95_HOTSPOT_SQL, params)
@@ -605,6 +612,7 @@ def test_explain_d_state_hotspot_sql(writer, conn):
       _ts(-60), _ts(-45), username="alice"))
    params = {
       "system": "polaris", "node": "login-04", "start": _WINDOW_START,
+      "end": _NOW + timedelta(hours=1),
       "username_is_null": True, "username": None,
    }
    plan = _explain(conn, USAGE_D_STATE_HOTSPOT_SQL, params)
@@ -617,6 +625,7 @@ def test_explain_poll_failures_sql(writer, conn):
    writer.write_record("node_poll_failures", _poll_failure_record(_ts(-5)))
    plan = _explain(conn, POLL_FAILURES_SQL,
                    {"system": "polaris", "node": "login-04",
+                    "start": _WINDOW_START, "end": _NOW + timedelta(hours=1),
                     "limit": MAX_POLL_FAILURES})
    print("\n--- EXPLAIN POLL_FAILURES_SQL ---\n" + plan)
    assert "Seq Scan" in plan or "Index Scan" in plan or "Bitmap" in plan
@@ -626,6 +635,8 @@ def test_explain_collection_log_sql(writer, conn):
    """EXPLAIN collection log query -- planner evidence."""
    writer.write_record("node_collection_log", _collection_log_record(_ts(-10)))
    plan = _explain(conn, COLLECTION_LOG_SQL,
-                   {"system": "polaris", "start": _WINDOW_START})
+                   {"system": "polaris", "start": _WINDOW_START,
+                    "end": _NOW + timedelta(hours=1),
+                    "limit": 200})
    print("\n--- EXPLAIN COLLECTION_LOG_SQL ---\n" + plan)
    assert "Seq Scan" in plan or "Index Scan" in plan or "Bitmap" in plan
