@@ -946,3 +946,195 @@ def load_config_file_any(path, home=None, database_url_env=None):
    if raw is None:
       raise ConfigError("config file %r is empty" % (path,))
    return load_any_config(raw, home=home, database_url_env=database_url_env)
+
+
+# ==========================================================================
+# Web-only configuration boundary.
+#
+# Design: node-monitor web process loads a separate YAML file that is
+# entirely disjoint from the collector (Phase-0 / Phase-1) configuration.
+#
+# Accepted top-level keys: ``system`` and ``web`` only.  Every collector
+# key (``nodes``, ``probe_python``, ``output``, ``collection``, ``ssh``,
+# ``safety``, ``retention``, …) is rejected on sight.
+#
+# ``web.database`` reuses ``DatabaseConfig`` validation and defaults but
+# constrains ``pool_size`` to exactly 1 and ``max_overflow`` to exactly 0.
+# Keys intentionally absent from the approved web YAML shape
+# (``pool_timeout_sec``, ``pool_recycle_sec``, ``pool_pre_ping``,
+# ``echo_sql``) are populated from ``_DATABASE_DEFAULTS``.
+#
+# ``web.socket_path`` must expand to an absolute path inside the
+# operator's ``~/.node-monitor/run/`` directory.  ``~`` is expanded to
+# the ``home`` argument (never read from ``os.environ`` -- tests must not
+# depend on the invoking user's real $HOME).
+#
+# URL resolution order (explicit YAML always wins):
+#   1. ``web.database.url`` when present in YAML
+#   2. ``database_url_env`` argument when injected by the caller
+#   3. ``NODE_MONITOR_WEB_DB_URL`` environment variable
+#   4. Raise ``ConfigError`` (no URL available)
+#
+# ``NODE_MONITOR_DB_URL`` is NEVER consulted -- it is the writer/collector
+# credential and must never flow into the read-only web process.
+# ==========================================================================
+
+_WEB_TOP_ALLOWED_KEYS = frozenset({"system", "web"})
+_WEB_SECTION_ALLOWED_KEYS = frozenset({"database", "socket_path"})
+
+# The web YAML shape intentionally omits echo_sql, pool_timeout_sec,
+# pool_recycle_sec, and pool_pre_ping -- those are populated from
+# _DATABASE_DEFAULTS unchanged.
+_WEB_DATABASE_ALLOWED_KEYS = frozenset(
+   {"url", "schema", "pool_size", "max_overflow", "connect_args"})
+
+
+def _validate_nonempty_string(value, key):
+   if not isinstance(value, str) or not value:
+      raise ConfigError("%s must be a non-empty string, got %r" % (key, value))
+   return value
+
+
+def _validate_web_pool_size(value):
+   """Web database pool is exactly one connection -- no more."""
+   if isinstance(value, bool) or not isinstance(value, int):
+      raise ConfigError(
+         "database.pool_size must be an integer, got %r" % (value,))
+   if value != 1:
+      raise ConfigError(
+         "database.pool_size must be exactly 1 for the web process "
+         "(single read-only connection), got %r" % (value,))
+   return value
+
+
+def _validate_web_socket_path(value, home):
+   """Validate and expand socket_path; confine it to ~/.node-monitor/run/."""
+   if not isinstance(value, str) or not value:
+      raise ConfigError(
+         "web.socket_path must be a non-empty string, got %r" % (value,))
+   if "\x00" in value:
+      raise ConfigError(
+         "web.socket_path must not contain NUL bytes, got %r" % (value,))
+   # Expand leading ~/ against the injected home (never os.environ["HOME"])
+   if value == "~" or value.startswith("~/"):
+      expanded = home.rstrip("/") + value[1:]
+   else:
+      expanded = value
+   expanded = os.path.normpath(expanded)
+   if not os.path.isabs(expanded):
+      raise ConfigError(
+         "web.socket_path must be an absolute path after expansion "
+         "(relative paths are not safe for socket locations), "
+         "got %r (expanded to %r)" % (value, expanded))
+   # Confine to ~/.node-monitor/run/ under the injected home
+   run_dir = os.path.normpath(os.path.join(home, ".node-monitor", "run"))
+   if not expanded.startswith(run_dir + "/") and expanded != run_dir:
+      raise ConfigError(
+         "web.socket_path must be inside ~/.node-monitor/run/ "
+         "(expanded: %r, run_dir: %r)" % (expanded, run_dir))
+   return expanded
+
+
+def _validate_web_database_section(raw, resolved_url):
+   """Validate web database section reusing DatabaseConfig machinery.
+
+   ``raw`` is the raw database mapping from YAML (may contain ``url`` or
+   not).  ``resolved_url`` is the already-resolved URL (YAML > injected
+   env > env var).  This function enforces the web-specific allowlist
+   (``_WEB_DATABASE_ALLOWED_KEYS``) so collector-only keys such as
+   ``echo_sql``, ``pool_timeout_sec``, ``pool_recycle_sec``, and
+   ``pool_pre_ping`` are rejected on sight even though ``DatabaseConfig``
+   accepts them.  Fixed defaults from ``_DATABASE_DEFAULTS`` are filled
+   in for the intentionally absent keys.
+   """
+   raw = _require_mapping(raw, "web.database")
+   _reject_unknown_keys(raw, _WEB_DATABASE_ALLOWED_KEYS, "web.database")
+   url = _validate_database_url(resolved_url)
+   schema = _validate_database_schema(
+      raw.get("schema", _DATABASE_DEFAULTS["schema"]))
+   pool_size = _validate_web_pool_size(
+      raw.get("pool_size", _DATABASE_DEFAULTS["pool_size"]))
+   max_overflow = _validate_database_max_overflow(
+      raw.get("max_overflow", _DATABASE_DEFAULTS["max_overflow"]))
+   # echo_sql, pool_pre_ping, pool_timeout_sec, pool_recycle_sec are not in
+   # the approved web YAML shape -- use fixed defaults only.
+   echo_sql = _DATABASE_DEFAULTS["echo_sql"]
+   pool_pre_ping = _DATABASE_DEFAULTS["pool_pre_ping"]
+   pool_timeout_sec = _DATABASE_DEFAULTS["pool_timeout_sec"]
+   pool_recycle_sec = _DATABASE_DEFAULTS["pool_recycle_sec"]
+   connect_args = _validate_database_connect_args(raw.get("connect_args", {}))
+   return DatabaseConfig(
+      url=url, schema=schema, pool_size=pool_size, max_overflow=max_overflow,
+      echo_sql=echo_sql, pool_pre_ping=pool_pre_ping,
+      pool_timeout_sec=pool_timeout_sec, pool_recycle_sec=pool_recycle_sec,
+      connect_args=connect_args)
+
+
+@dataclasses.dataclass(frozen=True)
+class WebConfig:
+   """Immutable, fully-validated web-process configuration.
+
+   Disjoint from ``Phase0Config`` and ``NodeMonitorConfig``: it shares
+   ``system`` as an identity field and ``DatabaseConfig`` for the
+   read-only PostgreSQL connection, but never carries nodes, probe_python,
+   output, collection, ssh, safety, or retention.
+   """
+
+   system: str
+   database: DatabaseConfig
+   socket_path: str
+
+
+def load_web_config(path, *, home=None, database_url_env=None):
+   """Read and strictly validate a web-only YAML configuration file.
+
+   ``path`` -- path to the YAML file.
+   ``home`` -- home directory for tilde expansion and socket confinement;
+      defaults to ``os.path.expanduser("~")`` when None.
+   ``database_url_env`` -- caller-injected value to use as the database
+      URL when the YAML omits ``web.database.url``; when None, the
+      function reads ``NODE_MONITOR_WEB_DB_URL`` from the environment.
+      ``NODE_MONITOR_DB_URL`` is NEVER read.
+
+   URL resolution (explicit YAML always wins):
+     1. ``web.database.url`` in YAML
+     2. ``database_url_env`` argument
+     3. ``NODE_MONITOR_WEB_DB_URL`` env var
+     4. ``ConfigError``
+   """
+   resolved_home = os.path.expanduser("~") if home is None else home
+   # Resolve URL env var once here; NODE_MONITOR_DB_URL is never touched.
+   if database_url_env is None:
+      database_url_env = os.environ.get("NODE_MONITOR_WEB_DB_URL")
+   with open(path, "r") as handle:
+      raw = yaml.safe_load(handle)
+   if raw is None:
+      raise ConfigError("web config file %r is empty" % (path,))
+   raw = _require_mapping(raw, "config")
+   _reject_unknown_keys(raw, _WEB_TOP_ALLOWED_KEYS, "config")
+   if set(raw) != {"system", "web"}:
+      raise ConfigError("web config requires exactly system and web keys")
+   web = _require_mapping(raw["web"], "web")
+   _reject_unknown_keys(web, _WEB_SECTION_ALLOWED_KEYS, "web")
+   database_raw = web.get("database")
+   if database_raw is None:
+      raise ConfigError("web.database section is required")
+   explicit_url = _require_mapping(database_raw, "web.database").get("url")
+   if explicit_url is not None:
+      resolved_url = explicit_url
+   elif database_url_env is not None:
+      resolved_url = database_url_env
+   else:
+      raise ConfigError(
+         "web.database.url is required: set web.database.url in the "
+         "config or set NODE_MONITOR_WEB_DB_URL")
+   database = _validate_web_database_section(database_raw, resolved_url)
+   socket_raw = web.get("socket_path")
+   if socket_raw is None:
+      raise ConfigError("web.socket_path is required")
+   socket_path = _validate_web_socket_path(socket_raw, resolved_home)
+   return WebConfig(
+      system=_validate_nonempty_string(raw["system"], "system"),
+      database=database,
+      socket_path=socket_path,
+   )
