@@ -394,6 +394,43 @@ class DashboardWorker:
          result = self._operation(sa_conn, dbapi_conn)
          self.result_value = result
 
+         # Check whether cancel was requested while the operation was running.
+         # If cancel was requested (even if the operation returned normally),
+         # the transaction may be tainted -- roll back instead of committing.
+         # This decision and the ownership handoff (clearing _dbapi_conn) are
+         # made atomically under lock, so cancel_dbapi cannot obtain a handle
+         # to a connection that is about to be closed/returned to the pool.
+         with self._cleanup_lock:
+            cancel_was_requested = self._cancel_attempted
+            # Relinquish ownership of the DBAPI handle.  cancel_dbapi reads
+            # _dbapi_conn under the same lock; after this point it will see
+            # None and will not attempt to cancel a recycled connection.
+            self._dbapi_conn = None
+
+         if cancel_was_requested:
+            # Cancellation was requested: rollback the tainted transaction.
+            try:
+               sa_conn.rollback()
+               self.rollback_state = _ROLLBACK_SUCCEEDED
+            except Exception:
+               self.rollback_state = _ROLLBACK_FAILED
+               try:
+                  sa_conn.invalidate()
+               except Exception:
+                  pass
+            try:
+               sa_conn.close()
+            except Exception:
+               pass
+            # Signal that the result is unavailable (operation was cancelled).
+            exc = asyncio.CancelledError()
+            self._exception = exc
+            # CancelledError is not an Exception; wrap for Future.
+            self._loop.call_soon_threadsafe(
+               self._safe_set_exception,
+               RuntimeError("dashboard operation cancelled"))
+            return
+
          # Commit and close cleanly.
          # Do NOT clear _sa_conn here -- the external caller may need to call
          # invalidate_connection() after join() if cancel failed.  Keeping
@@ -407,6 +444,15 @@ class DashboardWorker:
          self._loop.call_soon_threadsafe(self._safe_set_result, result)
 
       except BaseException as exc:
+         # Relinquish ownership of the DBAPI handle under the same lock used
+         # by cancel_dbapi, mirroring the success/cancel-detected path above.
+         # Without this, a concurrent cancel_dbapi racing with this rollback
+         # could still see a non-None _dbapi_conn after close() returns the
+         # connection to the pool, risking a stale cancel() on a recycled
+         # DBAPI connection from a later, unrelated checkout.
+         with self._cleanup_lock:
+            self._dbapi_conn = None
+
          # Attempt rollback before closing.
          if sa_conn is not None:
             try:
@@ -492,7 +538,11 @@ class DashboardWorker:
       """Blocking cancel helper -- runs in thread pool executor."""
       # Wait for worker to publish the DBAPI connection (normally immediate).
       self._dbapi_ready.wait(timeout=5.0)
-      dbapi_conn = self._dbapi_conn
+      # Read _dbapi_conn under lock: the worker clears it to None (under the
+      # same lock) just before committing/closing, so we cannot cancel a
+      # recycled pool connection.
+      with self._cleanup_lock:
+         dbapi_conn = self._dbapi_conn
       if dbapi_conn is not None:
          try:
             dbapi_conn.cancel()
@@ -575,28 +625,75 @@ async def run_dashboard_with_deadline(engine, operation, timeout_sec=12.0):
        CancelledError propagates.
    Any exception raised by ``operation``
        Propagated after rollback and connection close by the worker.
+
+   Double-cancel safety
+   --------------------
+   Cleanup (cancel_dbapi + join + invalidate) runs as its own asyncio.Task
+   shielded from further cancellation.  If the outer coroutine receives a
+   second CancelledError while cleanup is in progress, asyncio.shield absorbs
+   it and cleanup continues uninterrupted.  The caller re-awaits the cleanup
+   task directly after shield raises to guarantee completion before re-raise.
+
+   Task-exception-never-retrieved prevention
+   ------------------------------------------
+   worker._future is a raw asyncio.Future (not a coroutine).
+   asyncio.shield(worker._future) links a new Future to the raw Future
+   without creating an intermediate Task.  The raw Future's exception is
+   consumed by the cleanup path (or by the normal success return), so no
+   'Task exception was never retrieved' warning is issued.
    """
    worker = DashboardWorker(engine, operation)
    worker.start()
 
-   # Shield worker.result() so that wait_for's internal cancellation of the
-   # shielded coroutine does not propagate a CancelledError back into the
-   # worker's future path.  We catch asyncio.TimeoutError (from wait_for)
-   # and CancelledError (from caller cancel) explicitly below.
-   shielded = asyncio.shield(worker.result())
+   # Shield the raw worker._future directly (not worker.result() coroutine).
+   # asyncio.shield(Future) links a new outer Future without creating an
+   # intermediate Task, eliminating the 'Task exception was never retrieved'
+   # warning that arises when shield wraps a coroutine.
+   shielded = asyncio.shield(worker._future)
+
+   async def _cleanup():
+      """Run full cleanup; must complete even under repeated cancellation."""
+      await worker.cancel_dbapi()
+      await worker.join()
+      if worker.needs_invalidation:
+         worker.invalidate_connection()
+      # Drain worker._future so its exception is never unhandled.
+      # After join(), the future is done.  Calling result() consumes the
+      # exception and prevents 'Task exception was never retrieved'.
+      if worker._future.done() and not worker._future.cancelled():
+         try:
+            worker._future.result()
+         except Exception:
+            pass
 
    try:
       return await asyncio.wait_for(shielded, timeout=timeout_sec)
    except (asyncio.TimeoutError, asyncio.CancelledError) as caught:
-      # Initiate DBAPI cancel (offloaded to executor; non-blocking).
-      await worker.cancel_dbapi()
-      # Wait for the worker thread to finish.
-      await worker.join()
-      # Rollback/invalidate as required.
-      if worker.needs_invalidation:
-         worker.invalidate_connection()
+      # Schedule cleanup as its own Task so it is not interrupted by a
+      # second (or third, or Nth) CancelledError hitting the outer
+      # coroutine.  asyncio.shield() only absorbs ONE cancellation per
+      # await; a caller that calls task.cancel() repeatedly in quick
+      # succession can otherwise deliver a second CancelledError to this
+      # very except-block's `await asyncio.shield(cleanup_task)` line,
+      # which would let this coroutine return/raise before cleanup
+      # (cancel_dbapi + join + invalidate + future-drain) has actually
+      # finished -- the exact "repeated cancel must not allow return
+      # before cleanup" hazard.  Loop so every delivered CancelledError is
+      # absorbed and cleanup_task is re-awaited until it is truly done.
+      cleanup_task = asyncio.ensure_future(_cleanup())
+      while True:
+         try:
+            await asyncio.shield(cleanup_task)
+            break
+         except asyncio.CancelledError:
+            if cleanup_task.done():
+               # cleanup_task itself finished (or was itself cancelled,
+               # which cannot happen since nothing cancels it directly);
+               # stop looping either way.
+               break
+            continue
       # Re-raise the appropriate exception.
       if isinstance(caught, asyncio.TimeoutError):
          raise DashboardTimeout("dashboard request timed out") from None
-      # CancelledError: re-raise after cleanup.
+      # CancelledError: re-raise after cleanup is confirmed complete.
       raise

@@ -216,7 +216,13 @@ class DashboardService:
          raise DashboardServiceError("dashboard query failed") from None
 
       # ------------------------------------------------------------------
-      # 4. Serialize and enforce size cap.
+      # 4. Enrich snapshot with response-contract metadata (gaps, status,
+      #    latest gauges, mem_used_physical_kb).
+      # ------------------------------------------------------------------
+      snapshot = _enrich_snapshot(snapshot)
+
+      # ------------------------------------------------------------------
+      # 5. Serialize and enforce size cap.
       #    Nested NaN/Infinity and TypeError cross a bounded chainless
       #    DashboardServiceError boundary; DashboardTooLarge is distinct.
       # ------------------------------------------------------------------
@@ -260,6 +266,193 @@ class DashboardService:
       from node_monitor.database.web import run_dashboard_with_deadline
       return await run_dashboard_with_deadline(
          self._engine, _operation, timeout_sec=12.0)
+
+
+# ---------------------------------------------------------------------------
+# Internal -- snapshot enrichment (response-contract metadata)
+# ---------------------------------------------------------------------------
+
+#: Expected cadence for counter rows (1 window per minute = 60 seconds).
+#: This is the schema-defined counter window width (node_counter_minute).
+_COUNTER_CADENCE_SECONDS = 60
+
+#: Expected cadence for usage interval_end timestamps (closed 15-minute
+#: intervals).  This matches the collector's usage_interval_sec default
+#: (see node_monitor/config.py: usage_interval_sec = 900) and the stored
+#: node_usage_intervals grain: multiple (category, activity) rows share
+#: the SAME interval_end per 15-minute closing, so timestamps are
+#: deduplicated before gap computation to avoid miscounting repeated
+#: interval_end values as additional data points.
+_USAGE_CADENCE_SECONDS = 900
+
+
+def _parse_ts(v):
+   """Parse a datetime or ISO-8601 string into a datetime, or None."""
+   if v is None:
+      return None
+   if isinstance(v, datetime):
+      return v
+   try:
+      return datetime.fromisoformat(str(v))
+   except (ValueError, TypeError):
+      return None
+
+
+def _compute_gap_metadata(timestamps, cadence_seconds):
+   """Return {"missing_count": int, "intervals": [...]}  for a bounded series.
+
+   ``timestamps`` is deduplicated and sorted before gap computation, so
+   callers whose series legitimately repeats a timestamp across multiple
+   independent rows (e.g. multiple usage (category, activity) grains per
+   closed interval_end) are not miscounted as extra data points.
+
+   A gap exists when consecutive DISTINCT timestamps differ by more than
+   1.5x the expected cadence; missing_count is the number of entire
+   cadence-sized windows skipped between them.  No zero-fill is performed
+   here -- only explicit gap metadata is returned.
+   """
+   distinct = sorted(set(ts for ts in timestamps if ts is not None))
+
+   missing_count = 0
+   gaps_list = []
+   for i in range(1, len(distinct)):
+      delta = (distinct[i] - distinct[i - 1]).total_seconds()
+      # Expected delta is exactly one cadence.  Gaps are integer multiples
+      # of the cadence beyond the first expected window.
+      if delta > cadence_seconds * 1.5:   # allow 50% slack for rounding
+         n_missing = int(round(delta / cadence_seconds)) - 1
+         missing_count += n_missing
+         gaps_list.append({
+            "after": _dt(distinct[i - 1]),
+            "before": _dt(distinct[i]),
+            "missing_count": n_missing,
+         })
+
+   return {"missing_count": missing_count, "intervals": gaps_list}
+
+
+def _enrich_snapshot(snapshot):
+   """Enrich a raw snapshot dict with response-contract metadata.
+
+   Adds:
+     counters.gaps         -- gap metadata (missing_count, sorted interval list)
+     counters.status       -- 'empty' | 'stale' | 'partial' | 'complete'
+     counters.latest       -- current-card gauge values from newest row, or None
+     counters.latest.mem_used_physical_kb -- derived physical memory used, or None
+     usage.gaps            -- gap metadata over DEDUPLICATED interval_end
+                               timestamps (closed 15-minute cadence)
+     usage.status          -- 'empty' | 'stale' | 'partial' | 'complete'
+
+   Does NOT zero-fill gaps; gaps appear as explicit metadata.
+   Does NOT modify the rows lists.
+
+   Parameters
+   ----------
+   snapshot : dict -- assembled snapshot from _run_dashboard_queries or stub.
+
+   Returns
+   -------
+   dict -- snapshot with enrichment added (same object, mutated in place).
+   """
+   counters = snapshot.get("counters", {})
+   rows = counters.get("rows", [])
+   is_fresh = counters.get("is_fresh", False)
+   newest_window_end = counters.get("newest_window_end")
+   hardware = snapshot.get("hardware", {})
+   mem_total_kb = hardware.get("mem_total_kb") if hardware else None
+
+   # ------------------------------------------------------------------
+   # Counter gap metadata
+   # Compute gaps as intervals between sorted window_end timestamps.
+   # Expected cadence: _COUNTER_CADENCE_SECONDS (60s).  Counter rows are
+   # one-per-minute per node; no deduplication is expected (but harmless
+   # if a duplicate window_end were ever present).
+   # ------------------------------------------------------------------
+   window_ends = [_parse_ts(row.get("window_end")) for row in rows]
+   counters["gaps"] = _compute_gap_metadata(window_ends, _COUNTER_CADENCE_SECONDS)
+
+   # ------------------------------------------------------------------
+   # Counter status
+   # empty  : no rows
+   # stale  : rows exist but newest is not fresh
+   # partial: fresh but at least one row has complete=False
+   # complete: fresh and all rows have complete=True
+   # ------------------------------------------------------------------
+   if not rows:
+      counters["status"] = "empty"
+   elif not is_fresh:
+      counters["status"] = "stale"
+   else:
+      all_complete = all(row.get("complete", False) for row in rows)
+      counters["status"] = "complete" if all_complete else "partial"
+
+   # ------------------------------------------------------------------
+   # Latest counter gauges (current-card values from most-recent row)
+   # ------------------------------------------------------------------
+   if rows:
+      # Find the row with the newest window_end.
+      latest_row = max(
+         rows,
+         key=lambda r: _parse_ts(r.get("window_end")) or datetime.min.replace(
+            tzinfo=timezone.utc),
+      )
+      mem_available_kb = latest_row.get("mem_available_kb")
+      if mem_total_kb is not None and mem_available_kb is not None:
+         mem_used = mem_total_kb - mem_available_kb
+      else:
+         mem_used = None
+
+      counters["latest"] = {
+         "window_end": _dt(latest_row.get("window_end")),
+         "mem_available_kb": mem_available_kb,
+         "mem_used_physical_kb": mem_used,
+         "cached_kb": latest_row.get("cached_kb"),
+         "shmem_kb": latest_row.get("shmem_kb"),
+         "load1": _safe_float(latest_row.get("load1")),
+         "load5": _safe_float(latest_row.get("load5")),
+         "load15": _safe_float(latest_row.get("load15")),
+         "procs_running": latest_row.get("procs_running"),
+         "procs_total": latest_row.get("procs_total"),
+         "socket_count": latest_row.get("socket_count"),
+         "cpu_busy_pct": latest_row.get("cpu_busy_pct"),
+      }
+   else:
+      counters["latest"] = None
+
+   snapshot["counters"] = counters
+
+   # ------------------------------------------------------------------
+   # Usage gap metadata + status
+   # Gap metadata is computed over DEDUPLICATED interval_end timestamps:
+   # multiple (category, activity) grains share the same closed-interval
+   # interval_end (collector usage_interval_sec default = 900s / 15min;
+   # see node_monitor/config.py), so repeated timestamps must not be
+   # treated as extra data points when detecting missing cadence windows.
+   # Status semantics mirror counters.status but are based on the grains
+   # list and usage.is_fresh:
+   #   empty  : no grains
+   #   stale  : grains exist but newest interval_end is not fresh
+   #   partial: fresh but at least one grain has complete=False
+   #   complete: fresh and all grains have complete=True
+   # ------------------------------------------------------------------
+   usage = snapshot.get("usage", {})
+   if isinstance(usage, dict):
+      usage_grains = usage.get("grains", [])
+      usage_is_fresh = usage.get("is_fresh", False)
+
+      interval_ends = [_parse_ts(g.get("interval_end")) for g in usage_grains]
+      usage["gaps"] = _compute_gap_metadata(interval_ends, _USAGE_CADENCE_SECONDS)
+
+      if not usage_grains:
+         usage["status"] = "empty"
+      elif not usage_is_fresh:
+         usage["status"] = "stale"
+      else:
+         all_usage_complete = all(g.get("complete", False) for g in usage_grains)
+         usage["status"] = "complete" if all_usage_complete else "partial"
+      snapshot["usage"] = usage
+
+   return snapshot
 
 
 # ---------------------------------------------------------------------------
