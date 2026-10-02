@@ -9,11 +9,15 @@ SELECT-only access.  Its ``preflight()`` method verifies:
   1. The database is reachable via CONNECT.
   2. The schema_migrations ledger exactly matches the packaged migration
      history (version / name / checksum / transactional).
-  3. The reader has SELECT on every required table.
-  4. The reader has NO INSERT / UPDATE / DELETE / TRUNCATE / REFERENCES /
+  3. The exact column/type/nullability signatures of every telemetry
+     table match the canonical catalog in ``schema_contract``.  A
+     database that merely has the right table names but wrong columns is
+     rejected as schema drift.
+  4. The reader has SELECT on every required table.
+  5. The reader has NO INSERT / UPDATE / DELETE / TRUNCATE / REFERENCES /
      TRIGGER on any required table.
-  5. The reader has NO database-level TEMP or CREATE privilege.
-  6. The reader has NO schema-level CREATE privilege.
+  6. The reader has NO database-level TEMP or CREATE privilege.
+  7. The reader has NO schema-level CREATE privilege.
 
 All checks use SELECT-only queries against ``information_schema`` and
 ``pg_catalog``; no DDL is executed.  ``WebDatabaseError`` messages are
@@ -29,6 +33,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from node_monitor.database.schema_contract import (
    REQUIRED_TABLES,
+   _SOURCE_SCHEMA_COLUMNS,
+   compare_source_schema,
    expected_migration_rows,
 )
 
@@ -45,8 +51,11 @@ _FORBIDDEN_TABLE_PRIVILEGES = frozenset({
 
 def _require_current_schema(connection):
    """Verify the schema_migrations ledger exactly matches the packaged
-   migration history.  Raises ``WebDatabaseError`` on any mismatch,
-   including an uninitialised database.
+   migration history, and that every telemetry table has the exact expected
+   column/type/nullability signatures.
+
+   Raises ``WebDatabaseError`` on any mismatch, including an uninitialised
+   database or schema drift (wrong columns, wrong types, wrong nullability).
    """
    # Check that the schema and ledger table exist.
    table_exists = connection.execute(text(
@@ -71,16 +80,22 @@ def _require_current_schema(connection):
    if actual != expected:
       raise WebDatabaseError("web database preflight failed")
 
-   # Verify catalog: all REQUIRED_TABLES (excluding schema_migrations) must
-   # exist in the node_monitor schema.
-   telemetry_tables = [t for t in REQUIRED_TABLES if t != "schema_migrations"]
-   existing = frozenset(connection.execute(text(
-      "SELECT table_name FROM information_schema.tables "
-      "WHERE table_schema = 'node_monitor' AND table_type = 'BASE TABLE'"
-   )).scalars().all())
-   for table in telemetry_tables:
-      if table not in existing:
-         raise WebDatabaseError("web database preflight failed")
+   # Verify exact column/type/nullability signatures for all telemetry tables.
+   # This catches schema drift: tables that exist but have wrong columns.
+   col_rows = connection.execute(text(
+      "SELECT table_name, column_name, udt_name, is_nullable "
+      "FROM information_schema.columns "
+      "WHERE table_schema = 'node_monitor' "
+      "  AND table_name <> 'schema_migrations' "
+      "ORDER BY table_name, ordinal_position"
+   )).all()
+   actual_cols = {}
+   for table, column, udt_name, nullable in col_rows:
+      actual_cols.setdefault(table, []).append((column, udt_name, nullable))
+
+   drift = compare_source_schema(actual_cols)
+   if drift is not None:
+      raise WebDatabaseError("web database preflight failed")
 
 
 def _require_reader_privileges(connection):
@@ -175,7 +190,7 @@ class WebDatabase:
             _require_reader_privileges(connection)
       except WebDatabaseError:
          raise
-      except (SQLAlchemyError, ValueError, RuntimeError, Exception):
+      except Exception:
          raise WebDatabaseError("web database preflight failed") from None
 
    def dispose(self):

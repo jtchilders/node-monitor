@@ -1,226 +1,61 @@
-"""node_monitor.database.migration -- immutable Migration value type and
-fail-closed, deterministic discovery of packaged SQL migration
-resources.
+"""node_monitor.database.migration -- transactional migration runner for
+the node_monitor schema.
+
+The canonical immutable ``Migration`` value type, fail-closed resource
+discovery (``discover_migrations``), contiguity validation
+(``_validate_contiguous``), and schema catalog constants
+(``_SOURCE_SCHEMA_COLUMNS``, ``_REQUIRED_SOURCE_CONSTRAINTS``,
+``_REQUIRED_SOURCE_INDEXES``) all live in
+``node_monitor.database.schema_contract``.  This module imports and
+re-exports them so that existing public imports (``from
+node_monitor.database.migration import Migration, discover_migrations``)
+remain compatible, while the single implementation lives only in
+``schema_contract.py``.
+
+Dependency direction::
+
+    schema_contract.py   (canonical types/discovery/catalog)
+         ▲
+    migration.py         (imports + re-exports + runner)
 
 Design: node_monitor_planning increment2-schema-migrations-writer.md
-Task 1 ("Migration resource model and fail-closed discovery"). This
-module implements *discovery only*: no migration runner, no SQL
-execution, no CLI, no final tables. Task 2 builds the transactional
-runner on top of this; Task 3 replaces the placeholder SQL body of
-migration 0001 with reviewed source-table DDL.
-
-``discover_migrations()`` reads the packaged
-``node_monitor.database.migrations.versions`` resource package via
-``importlib.resources`` -- never the filesystem path of the developer's
-working tree -- so behavior is identical whether node_monitor is
-installed as a wheel, an sdist, or in editable/development mode.
+Task 1 ("Migration resource model and fail-closed discovery") is now
+implemented in schema_contract.py.  Task 2 (this module) builds the
+transactional runner on top of the shared contract.  Task 3 replaces
+the placeholder SQL body of migration 0001 with reviewed source-table
+DDL.
 """
 
-import dataclasses
-import hashlib
-import importlib.resources as resources
 import re
 import time
 
 from sqlalchemy.exc import SQLAlchemyError
 
-_SUPPORTED_MODES = frozenset({"transactional"})
-
-# NNNN_name.sql -- exactly 4 digits, underscore, a name using only
-# letters/digits/underscores, then ".sql". Deliberately strict: no
-# hyphens, no spaces, no missing segments.
-_FILENAME_PATTERN = re.compile(r"^(\d{4})_([A-Za-z0-9_]+)\.sql$")
-
-_MIGRATIONS_PACKAGE = "node_monitor.database.migrations.versions"
-
-
-@dataclasses.dataclass(frozen=True)
-class Migration:
-   """One immutable, validated migration resource.
-
-   ``sql`` holds the exact packaged bytes -- never decoded, re-encoded,
-   or newline-normalized. ``checksum`` is the lowercase hex SHA-256 of
-   those exact bytes, and construction fails closed if the checksum
-   passed in does not match. ``mode`` names the execution strategy a
-   future runner will use; only ``"transactional"`` is supported in
-   this increment.
-   """
-
-   version: int
-   name: str
-   sql: bytes
-   checksum: str
-   mode: str
-
-   def __post_init__(self):
-      if not isinstance(self.version, int) or isinstance(self.version, bool):
-         raise TypeError("version must be an int, got %r" % (self.version,))
-      if self.version <= 0:
-         raise ValueError(
-            "version must be a positive integer, got %r" % (self.version,))
-      if not isinstance(self.name, str) or not self.name:
-         raise ValueError("name must be a non-empty string")
-      if not isinstance(self.sql, (bytes, bytearray)):
-         raise TypeError("sql must be bytes, got %r" % (type(self.sql),))
-      if isinstance(self.sql, bytearray):
-         object.__setattr__(self, "sql", bytes(self.sql))
-      if self.mode not in _SUPPORTED_MODES:
-         raise ValueError(
-            "unsupported migration mode %r; only %r is supported this "
-            "increment" % (self.mode, sorted(_SUPPORTED_MODES)))
-      expected_checksum = hashlib.sha256(self.sql).hexdigest()
-      if not isinstance(self.checksum, str) or self.checksum != self.checksum.lower():
-         raise ValueError(
-            "checksum must be a lowercase hex string, got %r"
-            % (self.checksum,))
-      if self.checksum != expected_checksum:
-         raise ValueError(
-            "checksum %r does not match SHA-256 of exact SQL bytes "
-            "(expected %r)" % (self.checksum, expected_checksum))
-
-
-def _parse_filename(filename):
-   """Return (version, name) for a well-formed ``NNNN_name.sql``
-   filename, or None if it does not match the required shape at all
-   (used to silently skip unrelated files such as ``__init__.py``).
-   """
-   match = _FILENAME_PATTERN.match(filename)
-   if match is None:
-      return None
-   version_str, name = match.group(1), match.group(2)
-   return int(version_str), name
-
-
-def _looks_like_intended_migration(filename):
-   """True if a filename is clearly *meant* to be a migration (ends in
-   .sql and isn't a dunder file) even if it is malformed -- so a typo'd
-   filename fails closed with a clear error instead of being silently
-   skipped.
-   """
-   if filename.startswith("__"):
-      return False
-   return filename.endswith(".sql")
-
-
-def _build_migration(directory_or_traversable, filename, version, name,
-                      read_bytes):
-   sql = read_bytes(filename)
-   mode = "transactional"
-   mode_marker_name = filename + ".mode"
-   marker_mode = _read_mode_marker(directory_or_traversable,
-                                    mode_marker_name)
-   if marker_mode is not None:
-      mode = marker_mode
-   checksum = hashlib.sha256(sql).hexdigest()
-   return Migration(version=version, name=name, sql=sql, checksum=checksum,
-                     mode=mode)
-
-
-def _read_mode_marker(directory_or_traversable, marker_name):
-   """Return the stripped text content of a ``<file>.sql.mode`` sidecar
-   if present, else None. This function only reads and strips whatever
-   text is present -- it does not itself validate or reject the mode
-   value; that check happens in ``Migration.__post_init__`` when the
-   returned string is used to construct the ``Migration``, so an
-   unsupported mode fails closed there rather than being guessed here.
-   """
-   try:
-      marker = directory_or_traversable / marker_name
-      if hasattr(marker, "is_file"):
-         if not marker.is_file():
-            return None
-      else:
-         from pathlib import Path
-         if not (Path(directory_or_traversable) / marker_name).is_file():
-            return None
-   except (FileNotFoundError, NotADirectoryError):
-      return None
-   if hasattr(marker, "read_text"):
-      return marker.read_text().strip()
-   return (directory_or_traversable / marker_name).read_text().strip()
-
-
-def _validate_contiguous(migrations):
-   versions = [m.version for m in migrations]
-   seen = set()
-   for version in versions:
-      if version in seen:
-         raise ValueError("duplicate migration version: %d" % version)
-      seen.add(version)
-   ordered = sorted(seen)
-   expected = list(range(1, len(ordered) + 1))
-   if ordered != expected:
-      raise ValueError(
-         "migration versions must be contiguous starting at 1; found %r"
-         % (ordered,))
-
-
-def _migrations_from_entries(entries, read_bytes, container):
-   """Shared assembly logic given an iterable of filenames present in
-   a migration source (a directory or a packaged resource
-   traversable), a ``read_bytes(filename)`` callable, and the
-   container itself (used to look up ``.mode`` sidecar files).
-   """
-   migrations = []
-   for filename in entries:
-      if not _looks_like_intended_migration(filename):
-         continue
-      parsed = _parse_filename(filename)
-      if parsed is None:
-         raise ValueError(
-            "malformed migration filename %r; expected NNNN_name.sql"
-            % (filename,))
-      version, name = parsed
-      migrations.append(
-         _build_migration(container, filename, version, name, read_bytes))
-   if not migrations:
-      raise ValueError(
-         "no migrations found; every installation must ship at least "
-         "migration 1 (expected files matching NNNN_name.sql)")
-   migrations.sort(key=lambda m: m.version)
-   _validate_contiguous(migrations)
-   return migrations
-
-
-def _migrations_from_directory(directory):
-   """Discover migrations from a plain filesystem directory. Used
-   directly by tests to exercise filename-parsing and
-   version-contiguity edge cases without needing to rebuild the
-   packaged resource tree; production discovery goes through
-   ``discover_migrations()`` / ``importlib.resources`` instead.
-   """
-   from pathlib import Path
-   directory = Path(directory)
-   entries = sorted(
-      entry.name for entry in directory.iterdir() if entry.is_file()
-   )
-
-   def read_bytes(filename):
-      return (directory / filename).read_bytes()
-
-   return _migrations_from_entries(entries, read_bytes, directory)
-
-
-def discover_migrations():
-   """Return the sorted, validated tuple of packaged ``Migration``
-   resources from ``node_monitor.database.migrations.versions``, read
-   via ``importlib.resources`` so behavior is identical under a wheel
-   install, an sdist install, or editable/development mode.
-
-   Raises ``ValueError`` if any filename is malformed, or if versions
-   are non-positive, duplicated, or not contiguous from 1.
-   """
-   package_root = resources.files(_MIGRATIONS_PACKAGE)
-   entries = sorted(
-      entry.name for entry in package_root.iterdir() if entry.is_file()
-   )
-
-   def read_bytes(filename):
-      return package_root.joinpath(filename).read_bytes()
-
-   return tuple(
-      _migrations_from_entries(entries, read_bytes, package_root))
-
+# ---------------------------------------------------------------------------
+# Re-export canonical types and discovery from schema_contract so that
+# existing imports of the form:
+#   from node_monitor.database.migration import Migration, discover_migrations
+# remain compatible.
+# ---------------------------------------------------------------------------
+from node_monitor.database.schema_contract import (  # noqa: F401
+   Migration,
+   _FILENAME_PATTERN,
+   _MIGRATIONS_PACKAGE,
+   _SOURCE_SCHEMA_COLUMNS,
+   _REQUIRED_SOURCE_CONSTRAINTS,
+   _REQUIRED_SOURCE_INDEXES,
+   _SUPPORTED_MODES,
+   _build_migration,
+   _looks_like_intended_migration,
+   _migrations_from_directory,
+   _migrations_from_entries,
+   _parse_filename,
+   _read_mode_marker,
+   _validate_contiguous,
+   compare_source_schema,
+   discover_migrations,
+   expected_migration_rows,
+)
 
 # Stable signed int64 derived once from the migration-lock namespace. Changing
 # this value would split coordination between old and new operators.
@@ -251,87 +86,6 @@ INSERT INTO node_monitor.schema_migrations
 VALUES (%s, %s, %s, %s, %s, %s)
 """
 
-_SOURCE_SCHEMA_COLUMNS = {
-   "node_hardware": (
-      ("system", "text", "NO"), ("source_hostname", "text", "NO"),
-      ("first_seen", "timestamptz", "NO"),
-      ("last_verified", "timestamptz", "NO"), ("boot_id", "text", "YES"),
-      ("btime", "int8", "YES"), ("cpu_model", "text", "YES"),
-      ("cpu_logical", "int4", "YES"), ("sockets", "int4", "YES"),
-      ("cores_per_socket", "int4", "YES"),
-      ("cpu_max_freq_khz", "int8", "YES"),
-      ("numa_nodes", "int4", "YES"), ("mem_total_kb", "int8", "YES"),
-      ("swap_total_kb", "int8", "YES"),
-      ("hugepage_size_kb", "int4", "YES"),
-      ("kernel_release", "text", "YES"),
-      ("os_pretty_name", "text", "YES"),
-      ("net_fs_mounts", "int4", "YES"), ("net_ifaces", "jsonb", "YES"),
-      ("gpus", "jsonb", "YES"), ("probe_version", "int4", "NO"),
-   ),
-   "node_counter_minute": (
-      ("system", "text", "NO"), ("source_hostname", "text", "NO"),
-      ("window_start", "timestamptz", "NO"),
-      ("window_end", "timestamptz", "NO"),
-      ("collector_hostname", "text", "NO"),
-      ("probe_version", "int4", "NO"), ("daemon_version", "text", "NO"),
-      ("sample_count", "int4", "NO"), ("expected_count", "int4", "NO"),
-      ("coverage", "float8", "NO"), ("mem_available_kb", "int8", "YES"),
-      ("cached_kb", "int8", "YES"), ("shmem_kb", "int8", "YES"),
-      ("load1", "float8", "YES"), ("load5", "float8", "YES"),
-      ("load15", "float8", "YES"), ("procs_running", "int4", "YES"),
-      ("procs_total", "int4", "YES"), ("socket_count", "int4", "YES"),
-      ("cpu_busy_pct", "jsonb", "YES"),
-      ("network_rates", "jsonb", "YES"),
-      ("lustre_md_summary", "jsonb", "YES"),
-      ("meets_minimum_samples", "bool", "NO"),
-      ("invalid_pair_count", "int4", "NO"),
-      ("excess_sample_count", "int4", "NO"),
-   ),
-   "node_usage_intervals": (
-      ("id", "int8", "NO"), ("system", "text", "NO"),
-      ("source_hostname", "text", "NO"),
-      ("interval_start", "timestamptz", "NO"),
-      ("interval_end", "timestamptz", "NO"),
-      ("category", "text", "NO"), ("activity", "text", "NO"),
-      ("username", "text", "YES"), ("username_key", "text", "YES"),
-      ("process_count", "jsonb", "NO"),
-      ("cpu_seconds", "float8", "NO"), ("rss_kb", "jsonb", "NO"),
-      ("d_state_fraction", "float8", "NO"),
-      ("interactivity_fraction", "float8", "NO"),
-      ("sample_count", "int4", "NO"), ("expected_count", "int4", "NO"),
-      ("unmeasured_count", "int4", "NO"),
-   ),
-   "node_poll_failures": (
-      ("id", "int8", "NO"), ("system", "text", "NO"),
-      ("source_hostname", "text", "NO"), ("loop", "text", "NO"),
-      ("recorded_at", "timestamptz", "NO"),
-      ("failure_type", "text", "NO"), ("detail", "text", "NO"),
-      ("consecutive_failures", "int4", "NO"),
-      ("breaker_state", "text", "NO"),
-   ),
-   "node_collection_log": (
-      ("id", "int8", "NO"), ("system", "text", "NO"),
-      ("recorded_at", "timestamptz", "NO"), ("event", "text", "NO"),
-      ("detail", "jsonb", "NO"),
-   ),
-}
-
-_REQUIRED_SOURCE_CONSTRAINTS = frozenset({
-   "node_hardware_pkey", "node_hardware_time_check",
-   "node_counter_minute_pkey", "node_counter_minute_window_check",
-   "node_usage_intervals_pkey", "node_usage_intervals_grain_key",
-   "node_usage_intervals_window_check", "node_usage_intervals_username_check",
-   "node_poll_failures_pkey", "node_collection_log_pkey",
-})
-
-_REQUIRED_SOURCE_INDEXES = frozenset({
-   "node_counter_minute_system_time_idx", "node_counter_minute_retention_idx",
-   "node_usage_intervals_system_time_idx", "node_usage_intervals_retention_idx",
-   "node_poll_failures_system_node_time_idx",
-   "node_poll_failures_retention_idx",
-   "node_collection_log_system_time_idx", "node_collection_log_retention_idx",
-})
-
 
 def _has_executable_sql(sql):
    """Return False only when SQL consists solely of whitespace/comments."""
@@ -352,9 +106,8 @@ def _validate_initial_source_schema(connection):
    actual = {}
    for table, column, udt_name, nullable in rows:
       actual.setdefault(table, []).append((column, udt_name, nullable))
-   expected = {table: list(columns)
-               for table, columns in _SOURCE_SCHEMA_COLUMNS.items()}
-   if actual != expected:
+   drift = compare_source_schema(actual)
+   if drift is not None:
       raise MigrationApplyError(
          "migration 1 source schema columns do not match the required contract")
 
@@ -394,6 +147,9 @@ class MigrationDriftError(MigrationError):
 
 class MigrationApplyError(MigrationError):
    """A pending migration could not be applied atomically."""
+
+
+import dataclasses
 
 
 @dataclasses.dataclass(frozen=True)
@@ -455,7 +211,7 @@ class MigrationRunner:
             )
       except MigrationError:
          raise
-      except (SQLAlchemyError, RuntimeError, ValueError, TypeError) as exc:
+      except Exception:
          raise MigrationError("could not inspect migration status") from None
 
    def migrate(self):
@@ -523,7 +279,7 @@ class MigrationRunner:
          )
       except MigrationError:
          raise
-      except (SQLAlchemyError, RuntimeError, ValueError, TypeError):
+      except Exception:
          raise MigrationError("migration operation failed") from None
       finally:
          if connection is not None:
