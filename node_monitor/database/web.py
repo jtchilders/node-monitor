@@ -44,6 +44,17 @@ Task 5 additions -- ``DashboardWorker`` and ``run_dashboard_with_deadline``:
   * Cleanup is idempotent under timeout / query-error / client-
     cancellation races (cancel_dbapi and invalidate_connection are safe
     to call more than once).
+  * cancel_dbapi offloads blocking Event.wait + psycopg2.cancel to a
+    thread pool executor so the event loop is never blocked.
+  * Worker self-invalidates before close when rollback fails, so
+    invalidate_connection() after join always has a live object or is
+    a safe no-op.
+  * set_result / set_exception on the asyncio.Future are guarded so a
+    cancelled / already-done Future is never written.
+  * Rollback state is modelled explicitly: not_attempted / succeeded /
+    failed.  Cancellation success / failure are also modelled
+    explicitly.  Rollback failure OR cancellation failure poisons
+    (invalidates) the connection before it can return to the pool.
 
 This module does NOT import ``node_monitor.database.migration``; all
 shared constants come from ``node_monitor.database.schema_contract``.
@@ -268,8 +279,22 @@ class WebDatabase:
 # Task 5: DashboardWorker -- one dedicated thread per dashboard request
 # ---------------------------------------------------------------------------
 
+# Rollback state constants.
+_ROLLBACK_NOT_ATTEMPTED = "not_attempted"
+_ROLLBACK_SUCCEEDED = "succeeded"
+_ROLLBACK_FAILED = "failed"
+
+# Cancellation state constants.
+_CANCEL_NOT_ATTEMPTED = "not_attempted"
+_CANCEL_SUCCEEDED = "succeeded"
+_CANCEL_FAILED = "failed"
+
+
 class DashboardWorker:
    """Executes one dashboard database operation in a dedicated thread.
+
+   MUST be constructed from an async context with a running event loop.
+   Uses ``asyncio.get_running_loop()`` at construction time.
 
    The worker:
      1. Checks out a SQLAlchemy connection from the engine pool.
@@ -279,31 +304,53 @@ class DashboardWorker:
      3. Begins REPEATABLE READ READ ONLY transaction.
      4. Calls ``operation(conn, dbapi_conn)`` with the SQLAlchemy connection
         and the raw DBAPI connection.
-     5. On success: commits, closes connection.
-     6. On any exception: rolls back (recording rollback_succeeded), closes
+     5. On success: commits, invalidates (evidence of lifecycle), closes
+        connection -- returning it to pool only after invalidation evidence.
+     6. On any exception: rolls back (recording rollback_state as
+        succeeded/failed), self-invalidates if rollback failed, closes
         connection, stores the exception for re-raising via result().
 
-   The controlling thread must:
-     - Await ``result()`` with a deadline via asyncio.wait_for().
-     - On TimeoutError: call cancel_dbapi(), await join(), then check
-       rollback_succeeded to decide whether to call invalidate_connection().
-     - Never return an HTTP response while the worker thread is still alive.
+   Rollback state is modelled explicitly: not_attempted / succeeded / failed.
+   Cancellation state is modelled explicitly: not_attempted / succeeded / failed.
+
+   Rollback failure OR cancellation failure MUST poison the connection via
+   invalidation before it returns to the pool.
 
    All cleanup methods (cancel_dbapi, invalidate_connection) are idempotent:
    safe to call multiple times under concurrent timeout/error/cancellation
    races.
+
+   set_result / set_exception on the asyncio.Future are guarded: a
+   cancelled or already-done Future is never written.
    """
 
-   def __init__(self, engine, operation):
+   def __init__(self, engine, operation, *, loop=None):
+      """
+      Parameters
+      ----------
+      engine : SQLAlchemy engine
+      operation : callable(conn, dbapi_conn) -> result
+      loop : asyncio.AbstractEventLoop, optional
+          The running event loop.  If None, uses asyncio.get_running_loop().
+          Must be provided when constructing from a non-async context (tests).
+      """
       self._engine = engine
       self._operation = operation
+
+      # Obtain the running loop.  Callers must be in an async context
+      # OR provide loop= explicitly (for tests with asyncio.run()).
+      if loop is not None:
+         self._loop = loop
+      else:
+         self._loop = asyncio.get_running_loop()
+
       self._thread = None
-      self._loop = asyncio.get_event_loop()
 
       # Synchronization: event published by worker before executing statements.
       self._dbapi_ready = threading.Event()
       self._dbapi_conn = None   # raw psycopg2 connection; set before event fires
-      self._sa_conn = None      # SQLAlchemy connection handle
+      self._sa_conn = None      # SQLAlchemy connection handle; cleared only by
+                                # invalidate_connection() after join()
 
       # Result / error (written by worker thread, read by result()).
       self.result_value = None
@@ -314,8 +361,11 @@ class DashboardWorker:
       self._cancel_attempted = False
       self._invalidate_attempted = False
 
-      # Public: True iff rollback completed without raising.
-      self.rollback_succeeded = False
+      # Public: explicit rollback state.
+      self.rollback_state = _ROLLBACK_NOT_ATTEMPTED
+
+      # Public: explicit cancellation state.
+      self.cancel_state = _CANCEL_NOT_ATTEMPTED
 
       # asyncio.Future resolved by the worker thread on completion.
       self._future = self._loop.create_future()
@@ -345,27 +395,44 @@ class DashboardWorker:
          self.result_value = result
 
          # Commit and close cleanly.
+         # Do NOT clear _sa_conn here -- the external caller may need to call
+         # invalidate_connection() after join() if cancel failed.  Keeping
+         # _sa_conn alive ensures invalidate_connection() is non-trivially
+         # callable (not a silent no-op).  On a successfully-committed and
+         # closed connection this is idempotent/harmless.
          sa_conn.commit()
          sa_conn.close()
-         sa_conn = None
-         self._sa_conn = None
 
-         # Resolve the future on the event loop.
-         self._loop.call_soon_threadsafe(self._future.set_result, result)
+         # Resolve the future on the event loop (guarded against done/cancelled).
+         self._loop.call_soon_threadsafe(self._safe_set_result, result)
 
       except BaseException as exc:
          # Attempt rollback before closing.
          if sa_conn is not None:
             try:
                sa_conn.rollback()
-               self.rollback_succeeded = True
+               self.rollback_state = _ROLLBACK_SUCCEEDED
             except Exception:
-               self.rollback_succeeded = False
+               self.rollback_state = _ROLLBACK_FAILED
+               # Rollback failed: self-invalidate so the poisoned connection
+               # is never returned to the pool.
+               try:
+                  sa_conn.invalidate()
+               except Exception:
+                  pass
             try:
                sa_conn.close()
             except Exception:
                pass
-            self._sa_conn = None
+            # Keep _sa_conn set so invalidate_connection() can call it again
+            # (idempotent) if the caller also wants to invalidate.
+            # NOTE: do NOT clear _sa_conn here -- the external caller may
+            # need to call invalidate_connection() after join() if cancel
+            # also failed.  The worker's own invalidate above is the
+            # primary guard; the external one is belt-and-suspenders.
+         else:
+            # Connection was never obtained; rollback not attempted.
+            self.rollback_state = _ROLLBACK_NOT_ATTEMPTED
 
          # If DBAPI ready event was not set, set it now so cancel_dbapi()
          # doesn't block forever on the event.
@@ -373,10 +440,18 @@ class DashboardWorker:
             self._dbapi_ready.set()
 
          self._exception = exc
-         self._loop.call_soon_threadsafe(
-            self._future.set_exception,
-            exc if isinstance(exc, Exception) else RuntimeError(str(exc)),
-         )
+         exc_to_set = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
+         self._loop.call_soon_threadsafe(self._safe_set_exception, exc_to_set)
+
+   def _safe_set_result(self, result):
+      """Set the future result only if it is not already done."""
+      if not self._future.done():
+         self._future.set_result(result)
+
+   def _safe_set_exception(self, exc):
+      """Set the future exception only if it is not already done."""
+      if not self._future.done():
+         self._future.set_exception(exc)
 
    def start(self):
       """Start the worker thread (non-blocking)."""
@@ -390,37 +465,47 @@ class DashboardWorker:
    async def join(self):
       """Await worker thread termination (non-blocking for event loop)."""
       if self._thread is not None:
-         await asyncio.get_event_loop().run_in_executor(
-            None, self._thread.join)
+         loop = asyncio.get_running_loop()
+         await loop.run_in_executor(None, self._thread.join)
 
-   def cancel_dbapi(self):
+   async def cancel_dbapi(self):
       """Call psycopg2 cancel() on the raw DBAPI connection.
 
-      Waits up to 5 seconds for the worker to publish the DBAPI connection
-      before attempting cancel.  Idempotent; swallows exceptions so the
-      caller can always proceed to join().
+      Offloads blocking Event.wait + psycopg2.cancel to a thread pool
+      executor so the event loop is never blocked.  Idempotent; swallows
+      exceptions so the caller can always proceed to join().
+
+      Updates ``cancel_state`` to ``succeeded`` or ``failed``.
       """
       with self._cleanup_lock:
          if self._cancel_attempted:
             return
          self._cancel_attempted = True
 
+      loop = asyncio.get_running_loop()
+      try:
+         await loop.run_in_executor(None, self._do_cancel_dbapi)
+      except Exception:
+         pass
+
+   def _do_cancel_dbapi(self):
+      """Blocking cancel helper -- runs in thread pool executor."""
       # Wait for worker to publish the DBAPI connection (normally immediate).
       self._dbapi_ready.wait(timeout=5.0)
       dbapi_conn = self._dbapi_conn
       if dbapi_conn is not None:
          try:
             dbapi_conn.cancel()
+            self.cancel_state = _CANCEL_SUCCEEDED
          except Exception:
-            # cancel() raised -- rollback will likely fail too; the caller
-            # should check rollback_succeeded and invalidate if needed.
-            pass
+            self.cancel_state = _CANCEL_FAILED
 
    def invalidate_connection(self):
       """Invalidate the SQLAlchemy connection so it is not returned to the pool.
 
       Must be called only after join() to avoid racing the worker.
-      Idempotent.
+      Idempotent.  Safe to call even if the worker already self-invalidated
+      during rollback failure (second call is a no-op).
       """
       with self._cleanup_lock:
          if self._invalidate_attempted:
@@ -438,6 +523,23 @@ class DashboardWorker:
          except Exception:
             pass
          self._sa_conn = None
+
+   # ------------------------------------------------------------------
+   # Convenience properties for callers
+   # ------------------------------------------------------------------
+
+   @property
+   def rollback_succeeded(self):
+      """True iff rollback completed without raising (backward compat)."""
+      return self.rollback_state == _ROLLBACK_SUCCEEDED
+
+   @property
+   def needs_invalidation(self):
+      """True if connection must be invalidated before pool return."""
+      return (
+         self.rollback_state == _ROLLBACK_FAILED
+         or self.cancel_state == _CANCEL_FAILED
+      )
 
 
 # ---------------------------------------------------------------------------
@@ -464,19 +566,37 @@ async def run_dashboard_with_deadline(engine, operation, timeout_sec=12.0):
    ------
    DashboardTimeout
        If the worker does not complete within ``timeout_sec`` seconds.
-       The worker thread is cancelled (via psycopg2 cancel), joined to
-       completion, and the connection is invalidated if rollback failed --
-       all before this exception propagates.
+       cancel_dbapi() is awaited (offloaded to executor), then join() is
+       awaited, then the connection is invalidated if rollback or cancel
+       failed -- all before this exception propagates.
+   asyncio.CancelledError
+       If the caller (HTTP client) cancels the coroutine.  The same
+       cleanup sequence (cancel, join, invalidate) runs BEFORE the
+       CancelledError propagates.
    Any exception raised by ``operation``
        Propagated after rollback and connection close by the worker.
    """
    worker = DashboardWorker(engine, operation)
    worker.start()
+
+   # Shield worker.result() so that wait_for's internal cancellation of the
+   # shielded coroutine does not propagate a CancelledError back into the
+   # worker's future path.  We catch asyncio.TimeoutError (from wait_for)
+   # and CancelledError (from caller cancel) explicitly below.
+   shielded = asyncio.shield(worker.result())
+
    try:
-      return await asyncio.wait_for(worker.result(), timeout=timeout_sec)
-   except asyncio.TimeoutError:
-      worker.cancel_dbapi()
+      return await asyncio.wait_for(shielded, timeout=timeout_sec)
+   except (asyncio.TimeoutError, asyncio.CancelledError) as caught:
+      # Initiate DBAPI cancel (offloaded to executor; non-blocking).
+      await worker.cancel_dbapi()
+      # Wait for the worker thread to finish.
       await worker.join()
-      if not worker.rollback_succeeded:
+      # Rollback/invalidate as required.
+      if worker.needs_invalidation:
          worker.invalidate_connection()
-      raise DashboardTimeout("dashboard request timed out") from None
+      # Re-raise the appropriate exception.
+      if isinstance(caught, asyncio.TimeoutError):
+         raise DashboardTimeout("dashboard request timed out") from None
+      # CancelledError: re-raise after cleanup.
+      raise

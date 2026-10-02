@@ -11,21 +11,36 @@ Guarantees:
   * All subquery calls share the same ``now_utc`` timestamp (one snapshot).
   * One subquery failure rejects the whole response -- no partial result.
   * Inventory is obtained from ``node_hardware`` inside the same transaction
-    snapshot used for all other queries.
+    snapshot used for all other queries.  Constructor-supplied inventory is
+    NOT trusted for node validation.
+  * Inside the same REPEATABLE READ READ ONLY transaction, a fixed
+    parameterized SELECT against node_monitor.node_hardware for exact
+    (system, source_hostname) validates the node and fetches required
+    hardware fields (mem_total_kb and other hardware context).
   * Username is validated (max 256 UTF-8 bytes) before any SQL is issued.
   * Range name is validated against the exact allowed set before any SQL.
-  * Node is validated against the exact inventory node before any SQL.
+  * Node validation from in-transaction inventory: unknown node fails from
+    inside the transaction.
   * Serialized response is capped at exactly 5 MiB (5 * 1024 * 1024 bytes).
     Exact 5 MiB is accepted; 5 MiB + 1 byte raises DashboardTooLarge.
   * JSON is serialized with allow_nan=False; NaN/Infinity in any value raises.
-  * server_utc_now carries an explicit +00:00 UTC offset.
+    Nested NaN/Infinity and serialization ValueError/TypeError cross a
+    bounded chainless DashboardServiceError boundary.  DashboardTooLarge
+    remains a distinct subclass.
+  * server_utc_now carries an explicit +00:00 UTC offset, produced by real
+    production datetime formatting (not injected snapshots).
   * No HTTP response time is used for telemetry freshness.
   * No zero-fill; gaps appear as null or explicit gap metadata.
   * Error messages are sanitized: no URL, role, SQL, or driver details.
+  * Hardware fields (mem_total_kb and context) are included in the response.
+  * DashboardService.dashboard is async; it must be awaited by FastAPI.
+    No get_event_loop / run_until_complete logic anywhere in this module.
 """
 
 import json
 from datetime import datetime, timezone
+
+from sqlalchemy import text
 
 from node_monitor.web.queries import (
    MAX_USERNAME_BYTES,
@@ -52,6 +67,18 @@ RANGES = {
 
 #: Maximum serialized response size in bytes (inclusive).
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024  # 5 MiB
+
+# Fixed parameterized SQL for in-transaction node inventory + hardware lookup.
+# Runs inside the same REPEATABLE READ READ ONLY snapshot as all other queries.
+_HARDWARE_SQL = text(
+   "SELECT system, source_hostname, "
+   "       cpu_model, cpu_logical, sockets, cores_per_socket, "
+   "       cpu_max_freq_khz, numa_nodes, mem_total_kb, swap_total_kb, "
+   "       hugepage_size_kb, kernel_release, os_pretty_name, "
+   "       net_fs_mounts, gpus "
+   "FROM node_monitor.node_hardware "
+   "WHERE system = :system AND source_hostname = :node"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -112,25 +139,31 @@ class DashboardService:
        obtains the engine via ``database._engine`` if present, otherwise
        treats ``database`` as the engine directly.
    system : str -- system name (e.g. ``"polaris"``).
-   inventory : frozenset of str -- known source hostnames.
-       The service validates the requested node against this set before
-       issuing any SQL.
+   inventory : frozenset of str, optional -- ignored for node validation.
+       Constructor-supplied inventory is NOT trusted.  Node validation
+       uses an in-transaction SELECT against node_hardware.  This
+       parameter is accepted for API compatibility only.
    """
 
-   def __init__(self, database, system, inventory):
+   def __init__(self, database, system, inventory=None):
       # Accept either a WebDatabase wrapper or a bare engine.
       if hasattr(database, "_engine"):
          self._engine = database._engine
       else:
          self._engine = database
       self._system = system
+      # inventory is ignored for validation; kept only for API compat.
       self._inventory = inventory
 
       # Allow tests to inject a synchronous operation replacement.
+      # When set, dashboard() calls this instead of the real worker.
       self._run_operation = None
 
-   def dashboard(self, *, node, range_name, username):
+   async def dashboard(self, *, node, range_name, username):
       """Build and serialize one atomic dashboard snapshot.
+
+      This is an async method; it must be awaited by FastAPI.
+      No get_event_loop / run_until_complete logic is used.
 
       Parameters
       ----------
@@ -171,17 +204,11 @@ class DashboardService:
                "username exceeds %d UTF-8 bytes" % MAX_USERNAME_BYTES)
 
       # ------------------------------------------------------------------
-      # 3. Validate node against the known inventory.
-      # ------------------------------------------------------------------
-      if node not in self._inventory:
-         raise DashboardServiceError(
-            "node %r is not in the known inventory" % (node,))
-
-      # ------------------------------------------------------------------
-      # 4. Run the atomic database operation.
+      # 3. Run the atomic database operation (includes in-transaction
+      #    inventory/hardware lookup and node validation).
       # ------------------------------------------------------------------
       try:
-         snapshot = self._execute_operation(
+         snapshot = await self._execute_operation(
             node=node, range_hours=range_hours, username=username)
       except DashboardServiceError:
          raise
@@ -189,24 +216,32 @@ class DashboardService:
          raise DashboardServiceError("dashboard query failed") from None
 
       # ------------------------------------------------------------------
-      # 5. Serialize and enforce size cap.
+      # 4. Serialize and enforce size cap.
+      #    Nested NaN/Infinity and TypeError cross a bounded chainless
+      #    DashboardServiceError boundary; DashboardTooLarge is distinct.
       # ------------------------------------------------------------------
-      return serialize_dashboard(snapshot)
+      try:
+         return serialize_dashboard(snapshot)
+      except DashboardTooLarge:
+         raise
+      except (ValueError, TypeError):
+         raise DashboardServiceError(
+            "dashboard serialization failed") from None
 
    # ------------------------------------------------------------------
-   # Internal -- atomic operation callable
+   # Internal -- async operation dispatch
    # ------------------------------------------------------------------
 
-   def _execute_operation(self, *, node, range_hours, username):
+   async def _execute_operation(self, *, node, range_hours, username):
       """Run the full set of dashboard queries in one atomic snapshot.
 
       If ``self._run_operation`` has been injected (by tests), that
-      callable is used instead of the real worker/thread path.
+      callable is used instead of the real worker/async path.
 
       Returns a snapshot dict suitable for ``serialize_dashboard``.
       """
       if self._run_operation is not None:
-         # Test injection: call stub directly (synchronous).
+         # Test injection: call stub directly (synchronous shim).
          conn = None
          dbapi_conn = None
          return self._run_operation(conn, dbapi_conn)
@@ -214,32 +249,17 @@ class DashboardService:
       # Capture now_utc once for the entire snapshot (one timestamp per request).
       now_utc = datetime.now(timezone.utc)
       system = self._system
-      inventory = self._inventory
 
       def _operation(conn, dbapi_conn):
          return _run_dashboard_queries(
             conn, system=system, node=node,
-            range_hours=range_hours, inventory=inventory,
+            range_hours=range_hours,
             username=username, now_utc=now_utc)
 
-      # Run synchronously (no async event loop in service layer;
-      # the HTTP layer is responsible for the async deadline wrapper).
-      import asyncio
+      # Import here to avoid circular imports at module load time.
       from node_monitor.database.web import run_dashboard_with_deadline
-      try:
-         loop = asyncio.get_event_loop()
-      except RuntimeError:
-         loop = asyncio.new_event_loop()
-         asyncio.set_event_loop(loop)
-
-      try:
-         result = loop.run_until_complete(
-            run_dashboard_with_deadline(
-               self._engine, _operation, timeout_sec=12.0))
-      except Exception:
-         raise
-
-      return result
+      return await run_dashboard_with_deadline(
+         self._engine, _operation, timeout_sec=12.0)
 
 
 # ---------------------------------------------------------------------------
@@ -247,14 +267,53 @@ class DashboardService:
 # ---------------------------------------------------------------------------
 
 def _run_dashboard_queries(conn, *, system, node, range_hours,
-                           inventory, username, now_utc):
+                           username, now_utc):
    """Execute all dashboard subqueries on ``conn`` within one transaction.
+
+   First runs a fixed parameterized SELECT against node_monitor.node_hardware
+   for exact (system, source_hostname) inventory plus required hardware
+   fields.  Unknown node fails from inside the transaction.
 
    All calls use the same ``now_utc`` so the snapshot is coherent.
    Any subquery failure propagates immediately, aborting the whole response.
 
    Returns a dict suitable for ``serialize_dashboard``.
    """
+   from node_monitor.web.service import DashboardServiceError
+
+   # ------------------------------------------------------------------
+   # In-transaction inventory + hardware lookup (same REPEATABLE READ
+   # READ ONLY snapshot).  No extra connection; uses the checked-out conn.
+   # ------------------------------------------------------------------
+   hw_row = conn.execute(
+      _HARDWARE_SQL, {"system": system, "node": node}
+   ).mappings().first()
+
+   if hw_row is None:
+      raise DashboardServiceError(
+         "node %r is not in the known inventory" % (node,))
+
+   hardware = {
+      "system": hw_row["system"],
+      "source_hostname": hw_row["source_hostname"],
+      "cpu_model": hw_row.get("cpu_model"),
+      "cpu_logical": hw_row.get("cpu_logical"),
+      "sockets": hw_row.get("sockets"),
+      "cores_per_socket": hw_row.get("cores_per_socket"),
+      "cpu_max_freq_khz": hw_row.get("cpu_max_freq_khz"),
+      "numa_nodes": hw_row.get("numa_nodes"),
+      "mem_total_kb": hw_row.get("mem_total_kb"),
+      "swap_total_kb": hw_row.get("swap_total_kb"),
+      "hugepage_size_kb": hw_row.get("hugepage_size_kb"),
+      "kernel_release": hw_row.get("kernel_release"),
+      "os_pretty_name": hw_row.get("os_pretty_name"),
+      "net_fs_mounts": hw_row.get("net_fs_mounts"),
+      "gpus": hw_row.get("gpus"),
+   }
+
+   # We have a valid inventory frozenset for queries.
+   inventory = frozenset({node})
+
    # Counter rows (series + quality/gap metadata).
    counter_result = load_counters_for_range(
       conn, system, node, range_hours, inventory, now_utc=now_utc)
@@ -273,7 +332,8 @@ def _run_dashboard_queries(conn, *, system, node, range_hours,
       conn, system, range_hours, now_utc=now_utc)
 
    # Assemble the snapshot.  server_utc_now carries an explicit +00:00
-   # offset so clients can parse it unambiguously.
+   # offset so clients can parse it unambiguously.  Use real production
+   # datetime formatting (not injected snapshots).
    server_utc_now = now_utc.isoformat()
    if not server_utc_now.endswith("+00:00"):
       # Force explicit UTC offset representation.
@@ -296,6 +356,7 @@ def _run_dashboard_queries(conn, *, system, node, range_hours,
       "server_utc_now": server_utc_now,
       "node": node,
       "range_hours": range_hours,
+      "hardware": hardware,
       "counters": {
          "rows": counter_rows,
          "newest_window_end": (

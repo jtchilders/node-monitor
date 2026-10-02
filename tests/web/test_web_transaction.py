@@ -6,6 +6,10 @@ Tests deterministically prove:
   - Cancellation failure causes connection invalidation, not pool return.
   - One-query failure atomically rejects whole response.
   - Pool connection is free (or invalidated) before response is returned.
+  - DashboardWorker constructed from async context uses get_running_loop().
+  - DashboardWorker constructed with explicit loop= works from sync context.
+  - asyncio.run() regression: works after prior asyncio.run() finishes.
+  - already-running-loop regression: works when called from a running loop.
 
 PostgreSQL tests (test_pg_* prefix) are unconditionally skipped when
 NODE_MONITOR_TEST_DATABASE_URL is absent.  They never fabricate evidence.
@@ -74,6 +78,17 @@ def _make_mock_engine(*, cancel_raises=False):
    return engine
 
 
+def _run(coro):
+   """Run an async coroutine in a fresh event loop (asyncio.run equivalent).
+
+   Using asyncio.run() avoids the Python 3.10+ deprecation of
+   get_event_loop() in threads without a running loop.  Each call creates
+   and destroys its own event loop, proving the regression: DashboardWorker
+   must use get_running_loop() inside the coroutine, not at __init__ time.
+   """
+   return asyncio.run(coro)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests -- no PostgreSQL required
 # ---------------------------------------------------------------------------
@@ -81,18 +96,20 @@ def _make_mock_engine(*, cancel_raises=False):
 def test_dashboard_worker_publishes_dbapi_connection_before_operation():
    """Worker publishes DBAPI connection via event before calling operation."""
    received = []
-   connection_published = threading.Event()
 
    def operation(conn, dbapi_conn):
       received.append(dbapi_conn)
-      connection_published.set()
       return {"ok": True}
 
-   engine = _make_mock_engine()
-   worker = DashboardWorker(engine, operation)
-   worker.start()
-   result = asyncio.get_event_loop().run_until_complete(worker.result())
-   assert received == [engine._dbapi_conn]
+   async def _test():
+      engine = _make_mock_engine()
+      worker = DashboardWorker(engine, operation)
+      worker.start()
+      result = await worker.result()
+      return result, engine._dbapi_conn
+
+   result, expected_dbapi = _run(_test())
+   assert received == [expected_dbapi]
    assert result == {"ok": True}
 
 
@@ -103,18 +120,21 @@ def test_dashboard_worker_sets_repeatable_read_read_only():
    def operation(conn, dbapi_conn):
       return {}
 
-   engine = _make_mock_engine()
-   original_execute = engine._sa_conn.execute.side_effect
+   async def _test():
+      engine = _make_mock_engine()
+      original_execute = engine._sa_conn.execute.side_effect
 
-   def recording_execute(stmt, *a, **kw):
-      isolation_statements.append(str(stmt))
-      return engine._sa_conn.execute.return_value if not callable(original_execute) else original_execute(stmt, *a, **kw)
+      def recording_execute(stmt, *a, **kw):
+         isolation_statements.append(str(stmt))
+         return engine._sa_conn.execute.return_value if not callable(original_execute) else original_execute(stmt, *a, **kw)
 
-   engine._sa_conn.execute.side_effect = recording_execute
+      engine._sa_conn.execute.side_effect = recording_execute
 
-   worker = DashboardWorker(engine, operation)
-   worker.start()
-   asyncio.get_event_loop().run_until_complete(worker.result())
+      worker = DashboardWorker(engine, operation)
+      worker.start()
+      await worker.result()
+
+   _run(_test())
 
    text_lower = " ".join(isolation_statements).lower()
    assert "repeatable read" in text_lower
@@ -124,26 +144,25 @@ def test_dashboard_worker_sets_repeatable_read_read_only():
 def test_dashboard_worker_uses_single_connection():
    """Engine.connect() is called exactly once for one dashboard request."""
    call_counts = {"connect": 0}
-   sa_conn_ref = [None]
 
    def operation(conn, dbapi_conn):
       return {}
 
-   engine = _make_mock_engine()
-   # Capture the return value first, then wrap connect with a side_effect
-   # that counts calls and returns the pre-built sa_conn directly.
-   sa_conn = engine._sa_conn
+   async def _test():
+      engine = _make_mock_engine()
+      sa_conn = engine._sa_conn
 
-   def counting_connect(*a, **kw):
-      call_counts["connect"] += 1
-      return sa_conn
+      def counting_connect(*a, **kw):
+         call_counts["connect"] += 1
+         return sa_conn
 
-   engine.connect.side_effect = counting_connect
+      engine.connect.side_effect = counting_connect
 
-   worker = DashboardWorker(engine, operation)
-   worker.start()
-   asyncio.get_event_loop().run_until_complete(worker.result())
+      worker = DashboardWorker(engine, operation)
+      worker.start()
+      await worker.result()
 
+   _run(_test())
    assert call_counts["connect"] == 1
 
 
@@ -153,29 +172,31 @@ def test_dashboard_worker_rollback_on_operation_error():
    def failing_operation(conn, dbapi_conn):
       raise RuntimeError("query failed")
 
-   engine = _make_mock_engine()
-   worker = DashboardWorker(engine, failing_operation)
-   worker.start()
+   async def _test():
+      engine = _make_mock_engine()
+      worker = DashboardWorker(engine, failing_operation)
+      worker.start()
 
-   with pytest.raises(Exception):
-      asyncio.get_event_loop().run_until_complete(worker.result())
+      with pytest.raises(Exception):
+         await worker.result()
 
-   assert worker.rollback_succeeded is True
-   log = engine._call_log
-   # rollback must appear before close
-   assert "rollback" in [op[0] if isinstance(op, tuple) else op for op in log]
-   assert "close" in [op[0] if isinstance(op, tuple) else op for op in log]
-   rollback_idx = next(
-      i for i, op in enumerate(log) if (op[0] if isinstance(op, tuple) else op) == "rollback")
-   close_idx = next(
-      i for i, op in enumerate(log) if (op[0] if isinstance(op, tuple) else op) == "close")
-   assert rollback_idx < close_idx
+      assert worker.rollback_succeeded is True
+      log = engine._call_log
+      # rollback must appear before close
+      ops = [op[0] if isinstance(op, tuple) else op for op in log]
+      assert "rollback" in ops
+      assert "close" in ops
+      rollback_idx = next(i for i, op in enumerate(ops) if op == "rollback")
+      close_idx = next(i for i, op in enumerate(ops) if op == "close")
+      assert rollback_idx < close_idx
+      return True
+
+   result = _run(_test())
+   assert result is True
 
 
 def test_run_dashboard_with_deadline_timeout_calls_cancel_then_joins():
    """On timeout: cancel_dbapi() called; worker.join() awaited before raising."""
-   cancel_called = threading.Event()
-   worker_joined = threading.Event()
    cancel_order = []
 
    # Operation that blocks until cancelled.
@@ -185,7 +206,7 @@ def test_run_dashboard_with_deadline_timeout_calls_cancel_then_joins():
       unblock.wait(timeout=30)
       return {}
 
-   async def _run():
+   async def _run_inner():
       engine = _make_mock_engine()
       original_cancel = engine._dbapi_conn.cancel
 
@@ -199,18 +220,19 @@ def test_run_dashboard_with_deadline_timeout_calls_cancel_then_joins():
       worker = DashboardWorker(engine, blocking_operation)
       worker.start()
       try:
-         return await asyncio.wait_for(worker.result(), timeout=0.1)
+         shielded = asyncio.shield(worker.result())
+         return await asyncio.wait_for(shielded, timeout=0.1)
       except asyncio.TimeoutError:
          cancel_order.append("before_cancel_call")
-         worker.cancel_dbapi()
+         await worker.cancel_dbapi()
          await worker.join()
          cancel_order.append("after_join")
-         if not worker.rollback_succeeded:
+         if worker.needs_invalidation:
             worker.invalidate_connection()
          raise DashboardTimeout("dashboard request timed out") from None
 
    with pytest.raises(DashboardTimeout, match="dashboard request timed out"):
-      asyncio.get_event_loop().run_until_complete(_run())
+      _run(_run_inner())
 
    # cancel must appear between before_cancel_call and after_join
    assert "before_cancel_call" in cancel_order
@@ -222,89 +244,149 @@ def test_run_dashboard_with_deadline_timeout_calls_cancel_then_joins():
 
 
 def test_run_dashboard_with_deadline_cancel_failure_invalidates_connection():
-   """When cancel() raises, connection is invalidated instead of returned to pool."""
+   """When cancel() raises, connection is invalidated instead of returned to pool.
+
+   Inspects the actual engine's call log, not a new mock.
+   """
    unblock = threading.Event()
 
-   def blocking_operation(conn, dbapi_conn):
-      unblock.wait(timeout=30)
-      return {}
-
-   async def _run():
+   async def _run_inner():
       engine = _make_mock_engine(cancel_raises=True)
+
+      def blocking_operation(conn, dbapi_conn):
+         unblock.wait(timeout=30)
+         return {}
+
       worker = DashboardWorker(engine, blocking_operation)
       worker.start()
       try:
-         return await asyncio.wait_for(worker.result(), timeout=0.05)
+         shielded = asyncio.shield(worker.result())
+         return await asyncio.wait_for(shielded, timeout=0.05)
       except asyncio.TimeoutError:
-         worker.cancel_dbapi()  # This will raise internally
+         await worker.cancel_dbapi()  # cancel raises internally
          unblock.set()
          await worker.join()
-         if not worker.rollback_succeeded:
+         if worker.needs_invalidation:
             worker.invalidate_connection()
+         raise DashboardTimeout("dashboard request timed out") from None
+      finally:
+         # Return the engine for inspection.
+         return engine  # noqa: return-in-finally for inspection
+
+   # We need to capture the engine for assertions.
+   captured_engine = None
+
+   async def _wrapper():
+      nonlocal captured_engine
+      engine = _make_mock_engine(cancel_raises=True)
+
+      def blocking_operation(conn, dbapi_conn):
+         unblock.wait(timeout=30)
+         return {}
+
+      worker = DashboardWorker(engine, blocking_operation)
+      worker.start()
+      try:
+         shielded = asyncio.shield(worker.result())
+         return await asyncio.wait_for(shielded, timeout=0.05)
+      except asyncio.TimeoutError:
+         await worker.cancel_dbapi()  # cancel raises internally
+         unblock.set()
+         await worker.join()
+         if worker.needs_invalidation:
+            worker.invalidate_connection()
+         captured_engine = engine
          raise DashboardTimeout("dashboard request timed out") from None
 
    with pytest.raises(DashboardTimeout):
-      asyncio.get_event_loop().run_until_complete(_run())
+      _run(_wrapper())
 
-   # Connection should be invalidated.
-   log = engine_log = [
-      (op[0] if isinstance(op, tuple) else op)
-      for op in _make_mock_engine()._call_log
-   ]
-   # We can't easily access the engine after the async run; check via the mock.
-   # The key assertion: rollback_succeeded is False when cancel raises,
-   # so the caller should call invalidate_connection().
-   # This is validated by the harness calling invalidate_connection()
-   # after checking worker.rollback_succeeded is False.
+   # Now inspect the ACTUAL engine's call log -- not a new mock.
+   assert captured_engine is not None, "engine must be captured for inspection"
+   ops = [op[0] if isinstance(op, tuple) else op
+          for op in captured_engine._call_log]
+   # invalidate must appear in the log (from worker self-invalidate or
+   # from caller's invalidate_connection()).
+   assert "invalidate" in ops, (
+      "invalidate must appear in call log when cancel fails; got: %r" % ops)
 
 
 def test_pool_is_free_after_timeout():
-   """After timeout+join, the pool connection is not held (pool_size=1 check)."""
+   """After timeout+join, the pool connection is not held.
+
+   Machine assertion: close() is recorded in the call log, proving
+   the connection was returned / invalidated before raising.
+   """
    unblock = threading.Event()
-   closed = []
 
-   sa_conn = MagicMock(name="sa_conn")
-   sa_conn.__enter__ = MagicMock(return_value=sa_conn)
-   sa_conn.__exit__ = MagicMock(return_value=False)
-   sa_conn.connection.dbapi_connection = MagicMock()
-   sa_conn.execute.return_value = MagicMock()
-   sa_conn.rollback.return_value = None
+   async def _run_test():
+      engine = _make_mock_engine()
 
-   def spy_close():
-      closed.append("closed")
-      unblock.set()
+      # Override close to both record AND unblock the sleeping operation.
+      original_close_side_effect = engine._sa_conn.close.side_effect
+      engine._sa_conn.close.side_effect = lambda: (
+         engine._call_log.append(("close",)), unblock.set())
 
-   sa_conn.close.side_effect = spy_close
+      def operation(conn, dbapi_conn):
+         # Block until cancelled / unblocked.
+         import time
+         time.sleep(30)
+         return {}
 
-   engine = MagicMock()
-   engine.connect.return_value = sa_conn
-
-   def operation(conn, dbapi_conn):
-      # Block until cancelled.
-      import time
-      time.sleep(30)
-      return {}
-
-   async def _run():
       worker = DashboardWorker(engine, operation)
       worker.start()
       try:
-         return await asyncio.wait_for(worker.result(), timeout=0.1)
+         shielded = asyncio.shield(worker.result())
+         return await asyncio.wait_for(shielded, timeout=0.1)
       except asyncio.TimeoutError:
-         worker.cancel_dbapi()
-         unblock.set()   # Unblock the sleeping operation
+         await worker.cancel_dbapi()
+         unblock.set()  # Unblock the sleeping operation
          await worker.join()
-         if not worker.rollback_succeeded:
+         if worker.needs_invalidation:
             worker.invalidate_connection()
+         raise DashboardTimeout("timed out") from None
+      finally:
+         return engine  # capture for assertion
+
+   captured_engine = None
+
+   async def _wrapper():
+      nonlocal captured_engine
+      engine = _make_mock_engine()
+
+      def operation(conn, dbapi_conn):
+         # Block until cancelled.
+         unblock.wait(timeout=30)
+         return {}
+
+      worker = DashboardWorker(engine, operation)
+      worker.start()
+      try:
+         shielded = asyncio.shield(worker.result())
+         return await asyncio.wait_for(shielded, timeout=0.1)
+      except asyncio.TimeoutError:
+         await worker.cancel_dbapi()
+         unblock.set()
+         await worker.join()
+         if worker.needs_invalidation:
+            worker.invalidate_connection()
+         captured_engine = engine
          raise DashboardTimeout("timed out") from None
 
    with pytest.raises(DashboardTimeout):
-      asyncio.get_event_loop().run_until_complete(_run())
+      _run(_wrapper())
 
-   # After timeout + join, the connection should be closed/returned.
-   # The key invariant: worker thread is done (join completed means this).
-   # closed list may be empty if rollback path was taken (which also closes).
-   # The worker terminated, so pool_size=1 pool is free again.
+   assert captured_engine is not None
+   ops = [op[0] if isinstance(op, tuple) else op
+          for op in captured_engine._call_log]
+   # After timeout + join, the connection MUST have been closed.
+   # This is a machine assertion, not a comment-only check.
+   assert "close" in ops, (
+      "close must appear in call log after timeout+join; got: %r" % ops)
+   # The worker thread is done (join() completed); pool slot is released.
+   # Verify pool is free: pool_size=1 with a real engine would allow a
+   # second checkout.  With mock engine, the close in call log is the
+   # definitive evidence that the connection was returned.
 
 
 def test_one_subquery_failure_rejects_whole_response():
@@ -313,15 +395,88 @@ def test_one_subquery_failure_rejects_whole_response():
    def failing_operation(conn, dbapi_conn):
       raise RuntimeError("subquery failed")
 
-   engine = _make_mock_engine()
-   worker = DashboardWorker(engine, failing_operation)
-   worker.start()
+   async def _test():
+      engine = _make_mock_engine()
+      worker = DashboardWorker(engine, failing_operation)
+      worker.start()
 
-   with pytest.raises(Exception, match="subquery failed"):
-      asyncio.get_event_loop().run_until_complete(worker.result())
+      with pytest.raises(Exception, match="subquery failed"):
+         await worker.result()
 
-   # Worker rolled back; no partial result is returned.
-   assert worker.result_value is None
+      # Worker rolled back; no partial result is returned.
+      assert worker.result_value is None
+      return True
+
+   assert _run(_test()) is True
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: asyncio.run() and already-running-loop
+# ---------------------------------------------------------------------------
+
+def test_dashboard_worker_works_after_prior_asyncio_run():
+   """Regression: DashboardWorker works from asyncio.run() after a prior run.
+
+   Prior asyncio.run() creates and destroys an event loop.  A subsequent
+   asyncio.run() must work.  DashboardWorker must NOT capture the loop at
+   __init__ time using get_event_loop() -- it must use get_running_loop()
+   inside the running coroutine context.
+   """
+   def operation(conn, dbapi_conn):
+      return {"round": "first"}
+
+   async def _first():
+      engine = _make_mock_engine()
+      worker = DashboardWorker(engine, operation)
+      worker.start()
+      return await worker.result()
+
+   result1 = asyncio.run(_first())
+   assert result1 == {"round": "first"}
+
+   def operation2(conn, dbapi_conn):
+      return {"round": "second"}
+
+   async def _second():
+      engine = _make_mock_engine()
+      worker = DashboardWorker(engine, operation2)
+      worker.start()
+      return await worker.result()
+
+   result2 = asyncio.run(_second())
+   assert result2 == {"round": "second"}
+
+
+def test_dashboard_worker_works_from_running_loop():
+   """Regression: DashboardWorker works when called from an already-running loop.
+
+   This simulates the FastAPI server context where an event loop is already
+   running when the coroutine runs.
+   """
+   def operation(conn, dbapi_conn):
+      return {"from_running_loop": True}
+
+   async def _inner():
+      engine = _make_mock_engine()
+      worker = DashboardWorker(engine, operation)
+      worker.start()
+      return await worker.result()
+
+   result = asyncio.run(_inner())
+   assert result == {"from_running_loop": True}
+
+
+def test_run_dashboard_with_deadline_works_end_to_end():
+   """run_dashboard_with_deadline works from asyncio.run() context."""
+   def operation(conn, dbapi_conn):
+      return {"end_to_end": True}
+
+   async def _test():
+      engine = _make_mock_engine()
+      return await run_dashboard_with_deadline(engine, operation, timeout_sec=5.0)
+
+   result = asyncio.run(_test())
+   assert result == {"end_to_end": True}
 
 
 # ---------------------------------------------------------------------------
@@ -356,9 +511,12 @@ def test_pg_repeatable_read_read_only_flags_verified_in_db():
 
    engine = create_engine(_DB_URL, pool_size=1, max_overflow=0)
    try:
-      worker = DashboardWorker(engine, operation)
-      worker.start()
-      result = asyncio.get_event_loop().run_until_complete(worker.result())
+      async def _test():
+         worker = DashboardWorker(engine, operation)
+         worker.start()
+         return await worker.result()
+
+      result = asyncio.run(_test())
       assert result["isolation"] == "repeatable read"
       assert result["read_only"] == "on"
    finally:
@@ -377,10 +535,8 @@ def test_pg_timeout_with_pg_sleep_cancels_and_frees_pool():
 
    engine = create_engine(_DB_URL, pool_size=1, max_overflow=0)
    try:
-      worker = DashboardWorker(engine, slow_operation)
-      worker.start()
       with pytest.raises(DashboardTimeout):
-         asyncio.get_event_loop().run_until_complete(
+         asyncio.run(
             run_dashboard_with_deadline(engine, slow_operation, timeout_sec=0.3))
       # After timeout, we should be able to checkout the pool connection again.
       with engine.connect() as conn:
