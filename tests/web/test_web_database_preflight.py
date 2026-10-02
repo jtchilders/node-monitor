@@ -6,8 +6,8 @@ are explicitly skipped (not errored) when that variable is absent.
 The import-isolation test runs unconditionally.
 """
 
-import importlib
 import os
+import subprocess
 import sys
 import uuid
 
@@ -29,18 +29,31 @@ _PG_AVAILABLE = bool(os.environ.get("NODE_MONITOR_TEST_DATABASE_URL"))
 def test_web_database_module_does_not_import_ddl_runner():
    """Importing node_monitor.database.web must NOT trigger import of
    node_monitor.database.migration (which contains MigrationRunner / DDL).
-   """
-   for key in list(sys.modules):
-      if "node_monitor.database.migration" in key:
-         del sys.modules[key]
-      if "node_monitor.database.web" in key:
-         del sys.modules[key]
-      if "node_monitor.database.schema_contract" in key:
-         del sys.modules[key]
 
-   module = importlib.import_module("node_monitor.database.web")
-   assert module is not None
-   assert "node_monitor.database.migration" not in sys.modules
+   This test uses a fresh subprocess to guarantee clean-process isolation;
+   it does NOT mutate sys.modules (which only tests the current process
+   after prior imports may have already populated the module cache).
+   """
+   script = (
+      "import node_monitor.database.web; "
+      "import sys; "
+      "leaked = [k for k in sys.modules if 'node_monitor.database.migration' in k]; "
+      "assert not leaked, "
+      "'migration leaked into web import: %r' % leaked"
+   )
+   repo_root = os.path.dirname(
+      os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+   result = subprocess.run(
+      [sys.executable, "-c", script],
+      capture_output=True,
+      text=True,
+      cwd=repo_root,
+   )
+   assert result.returncode == 0, (
+      "Fresh-process import of node_monitor.database.web leaked "
+      "node_monitor.database.migration.\n"
+      "stdout: %s\nstderr: %s" % (result.stdout, result.stderr)
+   )
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +548,7 @@ def test_preflight_rejects_database_temp_privilege(migrated_reader_engine):
    TEMP to the reader role and verifies preflight rejects it.
    """
    from node_monitor.database.web import WebDatabase, WebDatabaseError
-   with migrated_reader_engine.admin.connect() as conn:
+   with migrated_reader_engine.admin.begin() as conn:
       conn.exec_driver_sql(
          'GRANT TEMP ON DATABASE "%s" TO %s'
          % (migrated_reader_engine._db_name, migrated_reader_engine._role_name))
@@ -554,7 +567,7 @@ def test_preflight_rejects_database_create_privilege(migrated_reader_engine):
    failure.
    """
    from node_monitor.database.web import WebDatabase, WebDatabaseError
-   with migrated_reader_engine.admin.connect() as conn:
+   with migrated_reader_engine.admin.begin() as conn:
       conn.exec_driver_sql(
          'GRANT CREATE ON DATABASE "%s" TO %s'
          % (migrated_reader_engine._db_name, migrated_reader_engine._role_name))

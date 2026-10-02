@@ -26,6 +26,7 @@ the placeholder SQL body of migration 0001 with reviewed source-table
 DDL.
 """
 
+import dataclasses
 import re
 import time
 
@@ -151,8 +152,6 @@ class MigrationApplyError(MigrationError):
    """A pending migration could not be applied atomically."""
 
 
-import dataclasses
-
 
 @dataclasses.dataclass(frozen=True)
 class MigrationStatus:
@@ -213,7 +212,7 @@ class MigrationRunner:
             )
       except MigrationError:
          raise
-      except Exception:
+      except (SQLAlchemyError, RuntimeError, ValueError, TypeError) as exc:
          raise MigrationError("could not inspect migration status") from None
 
    def migrate(self):
@@ -281,7 +280,7 @@ class MigrationRunner:
          )
       except MigrationError:
          raise
-      except Exception:
+      except (SQLAlchemyError, RuntimeError, ValueError, TypeError):
          raise MigrationError("migration operation failed") from None
       finally:
          if connection is not None:
