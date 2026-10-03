@@ -1137,6 +1137,33 @@ def test_narrow_viewport_charts_visible_with_bounding_boxes(browser_page, live_w
         "Page body must not overflow horizontally at 400px viewport"
     )
 
+    # Every mode control must be wholly inside the viewport, visible, and
+    # hit-testable.  A body-width check alone can miss controls clipped by the
+    # chart article's overflow boundary.
+    mode_buttons = (
+        "mem-mode-gib", "mem-mode-percent",
+        "proc-mode-cpusum", "proc-mode-max", "proc-mode-rss",
+        "nl-network-p50", "nl-network-p95", "nl-network-max",
+        "nl-mode-lustre-p50", "nl-mode-lustre-p95",
+        "nl-mode-lustre-peak", "nl-mode-lustre-targets",
+    )
+    for testid in mode_buttons:
+        button = page.locator(f'[data-testid="{testid}"]')
+        assert button.is_visible(), f"{testid} must be visible at 400px"
+        button.scroll_into_view_if_needed()
+        box = button.bounding_box()
+        assert box is not None, f"{testid} must have a bounding box"
+        assert box["x"] >= 0 and box["x"] + box["width"] <= 400, (
+            f"{testid} must be wholly inside the 400px viewport; got {box}"
+        )
+        assert page.evaluate(
+            """([testid, x, y]) => {
+                const hit = document.elementFromPoint(x, y);
+                return Boolean(hit && hit.closest(`[data-testid="${testid}"]`));
+            }""",
+            [testid, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2],
+        ), f"{testid} center must be hit-testable (not clipped or covered)"
+
     assert errors == []
 
 
@@ -1176,17 +1203,17 @@ def test_no_external_requests_on_process_mode_switch(browser_page, live_web, sna
     # Click all process mode buttons
     page.locator('[data-testid="proc-mode-max"]').click()
     page.wait_for_function(
-        "() => window.__nodeMonitorTest.getChartLifecycle().createCount >= 8",
+        "() => window.__nodeMonitorTest.getChartRenderState().process.mode === 'proc-mode-max'",
         timeout=CONNECTED_TIMEOUT,
     )
     page.locator('[data-testid="proc-mode-rss"]').click()
     page.wait_for_function(
-        "() => window.__nodeMonitorTest.getChartLifecycle().createCount >= 12",
+        "() => window.__nodeMonitorTest.getChartRenderState().process.mode === 'proc-mode-rss'",
         timeout=CONNECTED_TIMEOUT,
     )
     page.locator('[data-testid="proc-mode-cpusum"]').click()
     page.wait_for_function(
-        "() => window.__nodeMonitorTest.getChartLifecycle().createCount >= 16",
+        "() => window.__nodeMonitorTest.getChartRenderState().process.mode === 'proc-mode-cpusum'",
         timeout=CONNECTED_TIMEOUT,
     )
 
