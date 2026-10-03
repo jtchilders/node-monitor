@@ -82,7 +82,7 @@
     <div class="chart-group">
       <article aria-label="CPU and load chart">
         <h3>CPU / Load</h3>
-        <canvas id="chart-cpu" data-testid="chart-cpu" aria-label="CPU p50 p95 max and load1 load5 load15 time series, one minute cadence; separate axes for unlike units"></canvas>
+        <div class="chart-canvas-wrap"><canvas id="chart-cpu" data-testid="chart-cpu" aria-label="CPU p50 p95 max and load1 load5 load15 time series, one minute cadence; separate axes for unlike units"></canvas></div>
         <table aria-label="CPU/load summary" class="chart-alt">
           <thead><tr><th>Metric</th><th>Aggregation</th><th>Cadence</th><th>Notes</th></tr></thead>
           <tbody>
@@ -94,12 +94,12 @@
       </article>
       <article aria-label="Memory chart">
         <h3>Memory (physical)</h3>
-        <canvas id="chart-memory" data-testid="chart-memory" aria-label="MemAvailable and MemTotal minus MemAvailable, percent or GiB toggle"></canvas>
+        <div class="chart-canvas-wrap"><canvas id="chart-memory" data-testid="chart-memory" aria-label="MemAvailable and MemTotal minus MemAvailable, percent or GiB toggle"></canvas></div>
         <div class="chart-note"><p>Used = MemTotal − MemAvailable. Percentage disabled if mem_total_kb is null or zero; GiB remains available. Missing values shown as null, not zero.</p></div>
       </article>
       <article aria-label="Process chart">
         <h3>Process</h3>
-        <canvas id="chart-process" data-testid="chart-process" aria-label="CPU sum (additive) or per-username-grain max process count / RSS with contributor"></canvas>
+        <div class="chart-canvas-wrap"><canvas id="chart-process" data-testid="chart-process" aria-label="CPU sum (additive) or per-username-grain max process count / RSS with contributor"></canvas></div>
         <table aria-label="Process summary" class="chart-alt">
           <thead><tr><th>Mode</th><th>Metric</th><th>Contributor</th></tr></thead>
           <tbody>
@@ -112,7 +112,7 @@
       </article>
       <article aria-label="Network and Lustre chart">
         <h3>Network / Lustre</h3>
-        <canvas id="chart-network-lustre" data-testid="chart-network-lustre" aria-label="Network RX/TX per interface (no loopback lo); Lustre p50-sum p95-sum peak-sum"></canvas>
+        <div class="chart-canvas-wrap"><canvas id="chart-network-lustre" data-testid="chart-network-lustre" aria-label="Network RX/TX per interface (no loopback lo); Lustre p50-sum p95-sum peak-sum"></canvas></div>
         <div class="chart-note"><p>Loopback (lo) excluded. Lustre peak-sum: sum of per-target maxima — not instantaneous/global peak. Target count shown per operation. Statistic: p50-sum / p95-sum / peak-sum (max_sum).</p></div>
       </article>
     </div>
