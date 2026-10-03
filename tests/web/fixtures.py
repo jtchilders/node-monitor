@@ -3,7 +3,7 @@
 All shapes here are derived directly from writer/collector contracts:
 
   * counter JSONB: writer._counter() -> rates["cpu_busy_pct"] / rates["network"] /
-    writer._lustre_summary(rates["lustre_md_ops"])
+   writer._lustre_summary(rates["lustre_md_ops"])
   * usage JSONB: usage._percentile_stats() -> {"p50", "p95", "max"}
 
 These fixtures are NOT from a live database; they encode the exact stored
@@ -37,8 +37,8 @@ def production_counter_row():
       # excluded by _compute_network_deltas (see metrics._LOOPBACK_IFACE).
       "network_rates": {
          "eth0": {
-            "rx_bytes_per_sec": {"p50": 1.0, "p95": 2.0, "max": 3.0},
-            "tx_bytes_per_sec": {"p50": 4.0, "p95": 5.0, "max": 6.0},
+         "rx_bytes_per_sec": {"p50": 1.0, "p95": 2.0, "max": 3.0},
+         "tx_bytes_per_sec": {"p50": 4.0, "p95": 5.0, "max": 6.0},
          },
       },
 
@@ -46,7 +46,7 @@ def production_counter_row():
       # written by writer._lustre_summary() which sums per-target stats.
       "lustre_md_summary": {
          "open": {
-            "p50_sum": 4.0, "p95_sum": 5.0, "max_sum": 6.0, "target_count": 1,
+         "p50_sum": 4.0, "p95_sum": 5.0, "max_sum": 6.0, "target_count": 1,
          },
       },
 

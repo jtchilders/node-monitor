@@ -158,15 +158,15 @@ def _counter_record(window_start_utc, window_end_utc, **overrides):
       "rates": {
          "cpu_busy_pct": {"p50": 10.0, "p95": 20.0, "max": 25.0},
          "network": {
-            "eth0": {
+         "eth0": {
                "rx_bytes_per_sec": {"p50": 1.0, "p95": 2.0, "max": 3.0},
                "tx_bytes_per_sec": {"p50": 4.0, "p95": 5.0, "max": 6.0},
-            },
+         },
          },
          "lustre_md_ops": {
-            "fs-MDT0000": {
+         "fs-MDT0000": {
                "open": {"p50": 4.0, "p95": 5.0, "max": 6.0},
-            },
+         },
          },
       },
       "audit": {
@@ -546,7 +546,7 @@ def test_collection_log_returns_system_events_without_node_filter(writer, conn):
       _ts(-20), event="stop"))
 
    result = load_collection_log(conn, "polaris", _WINDOW_START,
-                                end=_NOW + timedelta(hours=1))
+                        end=_NOW + timedelta(hours=1))
    assert len(result) == 2
    events = {r["event"] for r in result}
    assert events == {"start", "stop"}
@@ -571,8 +571,8 @@ def test_explain_counter_sql(writer, conn):
 
    plan = _explain(conn, COUNTER_SQL,
                    {"system": "polaris", "node": "login-04",
-                    "start": _WINDOW_START, "end": _NOW + timedelta(hours=1),
-                    "limit": COUNTER_ROW_LIMIT + 1})
+               "start": _WINDOW_START, "end": _NOW + timedelta(hours=1),
+               "limit": COUNTER_ROW_LIMIT + 1})
    print("\n--- EXPLAIN COUNTER_SQL ---\n" + plan)
    # Planner evidence: not asserting latency, just verifying plan is returned.
    assert "Seq Scan" in plan or "Index Scan" in plan or "Bitmap" in plan
@@ -625,8 +625,8 @@ def test_explain_poll_failures_sql(writer, conn):
    writer.write_record("node_poll_failures", _poll_failure_record(_ts(-5)))
    plan = _explain(conn, POLL_FAILURES_SQL,
                    {"system": "polaris", "node": "login-04",
-                    "start": _WINDOW_START, "end": _NOW + timedelta(hours=1),
-                    "limit": MAX_POLL_FAILURES})
+               "start": _WINDOW_START, "end": _NOW + timedelta(hours=1),
+               "limit": MAX_POLL_FAILURES})
    print("\n--- EXPLAIN POLL_FAILURES_SQL ---\n" + plan)
    assert "Seq Scan" in plan or "Index Scan" in plan or "Bitmap" in plan
 
@@ -636,7 +636,7 @@ def test_explain_collection_log_sql(writer, conn):
    writer.write_record("node_collection_log", _collection_log_record(_ts(-10)))
    plan = _explain(conn, COLLECTION_LOG_SQL,
                    {"system": "polaris", "start": _WINDOW_START,
-                    "end": _NOW + timedelta(hours=1),
-                    "limit": 200})
+               "end": _NOW + timedelta(hours=1),
+               "limit": 200})
    print("\n--- EXPLAIN COLLECTION_LOG_SQL ---\n" + plan)
    assert "Seq Scan" in plan or "Index Scan" in plan or "Bitmap" in plan

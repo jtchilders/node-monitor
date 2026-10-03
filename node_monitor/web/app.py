@@ -35,20 +35,27 @@ def create_app(service):
          content = f.read()
       return Response(content=content, media_type="text/html")
 
-   @app.get("/static/{filename}")
-   async def static_file(filename: str):
-      if filename not in allowed_files:
-         raise HTTPException(status_code=404)
-      file_path = os.path.join(static_dir, filename)
-      real_path = os.path.abspath(file_path)
-      static_abs = os.path.abspath(static_dir)
-      if not real_path.startswith(static_abs + "/") and real_path != static_abs:
-         raise HTTPException(status_code=404)
-      with open(real_path, "rb") as f:
-         content = f.read()
-      media = {".html": "text/html", ".css": "text/css",
-               ".js": "application/javascript"}.get(
-         os.path.splitext(filename)[1], "application/octet-stream")
-      return Response(content=content, media_type=media)
+   STATIC_ROUTES = {
+      "/static/index.html": ("index.html", "text/html"),
+      "/static/styles.css": ("styles.css", "text/css"),
+      "/static/app.js": ("app.js", "application/javascript"),
+      "/static/chart.umd.min.js": ("chart.umd.min.js", "application/javascript"),
+   }
+
+   @app.get("/static/index.html")
+   async def static_index():
+      return Response(open(os.path.join(static_dir, "index.html"), "rb").read(), media_type="text/html")
+
+   @app.get("/static/styles.css")
+   async def static_styles():
+      return Response(open(os.path.join(static_dir, "styles.css"), "rb").read(), media_type="text/css")
+
+   @app.get("/static/app.js")
+   async def static_app():
+      return Response(open(os.path.join(static_dir, "app.js"), "rb").read(), media_type="application/javascript")
+
+   @app.get("/static/chart.umd.min.js")
+   async def static_chart():
+      return Response(open(os.path.join(static_dir, "chart.umd.min.js"), "rb").read(), media_type="application/javascript")
 
    return app

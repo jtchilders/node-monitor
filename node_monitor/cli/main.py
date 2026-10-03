@@ -1352,26 +1352,27 @@ def web_command(config_path):
    from node_monitor.web.runtime import run_uvicorn
    from node_monitor.web.socket import bind_private_socket
 
-   # Config/schema/privilege/socket preflights
    config = load_web_config(config_path)
    db = WebDatabase(config.database)
-   try:
-      db.preflight()
-   finally:
-      db.dispose()
-
-   service = DashboardService(db, system=config.system)
-   app = create_app(service)
-
+   service = None
+   app = None
    sock = None
    try:
+      db.preflight()
+      service = DashboardService(db, system=config.system)
+      app = create_app(service)
       sock = bind_private_socket(config.socket_path)
       click.echo("PID %d" % os.getpid())
       click.echo("socket %s" % os.path.abspath(config.socket_path))
       run_uvicorn(app, sock)
    finally:
       if sock is not None:
-         sock.close()
+         try:
+            sock.close()
+         except Exception:
+            pass
+      if db is not None:
+         db.dispose()
 
 
 def main():

@@ -3,31 +3,31 @@
 Covers all 6 blockers identified in the second audit:
 
 (1) Independent hotspot ranking: rss_p50/p95/max and process_count_p50/p95/max
-    each use their OWN independently ranked DISTINCT ON query.  Different users
-    can maximize different statistics.  Six separate SQL constants required.
-    Each statistic exposes its own contributing username attribute.
+   each use their OWN independently ranked DISTINCT ON query.  Different users
+   can maximize different statistics.  Six separate SQL constants required.
+   Each statistic exposes its own contributing username attribute.
 
 (2) complete/partial is a computed property on CounterResult rows (not just
-    raw metadata echoed).  Complete iff coverage == 1, meets_minimum_samples
-    is True, invalid_pair_count == 0, excess_sample_count == 0.  Each false
-    condition tested individually.
+   raw metadata echoed).  Complete iff coverage == 1, meets_minimum_samples
+   is True, invalid_pair_count == 0, excess_sample_count == 0.  Each false
+   condition tested individually.
 
 (3) Bounded windows: all queries accept an :end upper bound parameter.
-    Counter: window_end <= :end.
-    Usage: interval_end <= :end.
-    Collection log: recorded_at <= :end.
-    Poll failures: recorded_at >= :start AND recorded_at <= :end (full range).
+   Counter: window_end <= :end.
+   Usage: interval_end <= :end.
+   Collection log: recorded_at <= :end.
+   Poll failures: recorded_at >= :start AND recorded_at <= :end (full range).
 
 (4) _validate_utc_datetime enforces ZERO UTC offset strictly.  A non-UTC
-    aware datetime (e.g. US/Eastern) raises QueryValidationError.
+   aware datetime (e.g. US/Eastern) raises QueryValidationError.
 
 (5) Public range-based facade: load_counters_for_range, load_usage_for_range,
-    load_poll_failures_for_range, load_collection_log_for_range.
-    These derive start = range_hours_to_start(hours, now_utc) internally.
-    Task 5 must not call private validators separately.
+   load_poll_failures_for_range, load_collection_log_for_range.
+   These derive start = range_hours_to_start(hours, now_utc) internally.
+   Task 5 must not call private validators separately.
 
 (6) API metric allowlist: map_metric_to_sql is a dict mapping API metric
-    name strings to their fixed SQL constant (no dynamic SQL formatting).
+   name strings to their fixed SQL constant (no dynamic SQL formatting).
 """
 
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -110,8 +110,8 @@ def _make_rss_row(interval_end=None, rss_p50_kb=4000.0, rss_p95_kb=8000.0,
 
 
 def _make_proc_row(interval_end=None, process_count_p50=1.0,
-                    process_count_p95=2.0, process_count_max=3.0,
-                    username="proc-user"):
+               process_count_p95=2.0, process_count_max=3.0,
+               username="proc-user"):
    ie = interval_end or (_NOW - timedelta(minutes=1))
    return {
       "interval_end": ie, "category": "ai_coding", "activity": "active",
@@ -387,7 +387,7 @@ class TestIndependentHotspotRanking:
          USAGE_PROCESS_COUNT_P95_HOTSPOT_SQL, USAGE_PROCESS_COUNT_MAX_HOTSPOT_SQL,
       ):
          assert ":username_is_null" in str(sql), (
-            "SQL must bind :username_is_null: %r" % str(sql)[:60])
+         "SQL must bind :username_is_null: %r" % str(sql)[:60])
 
    def test_api_metric_allowlist_exists(self):
       """METRIC_TO_SQL_MAP must exist and map API names to SQL constants."""
@@ -528,7 +528,7 @@ class TestBoundedWindowUpperBound:
       ):
          sql = str(sql_obj)
          assert ":end" in sql, (
-            "Hotspot SQL must bind :end upper bound: %r" % sql[:60])
+         "Hotspot SQL must bind :end upper bound: %r" % sql[:60])
 
    def test_d_state_and_ia_hotspot_sqls_have_end_bound(self):
       """D-state and interactivity hotspot SQL must also include :end."""
@@ -537,7 +537,7 @@ class TestBoundedWindowUpperBound:
       )
       for sql_obj in (USAGE_D_STATE_HOTSPOT_SQL, USAGE_INTERACTIVITY_HOTSPOT_SQL):
          assert ":end" in str(sql_obj), (
-            "Hotspot SQL must bind :end: %r" % str(sql_obj)[:60])
+         "Hotspot SQL must bind :end: %r" % str(sql_obj)[:60])
 
    def test_load_counters_passes_end_to_sql(self):
       """load_counters must pass 'end' (now_utc) to the SQL parameters."""
@@ -545,7 +545,7 @@ class TestBoundedWindowUpperBound:
       rows = [_make_counter_row(1)]
       conn = _make_conn([rows])
       load_counters(conn, "polaris", "login-04", _START, _INVENTORY,
-                    now_utc=_NOW)
+               now_utc=_NOW)
       call_params = conn.execute.call_args_list[0][0][1]
       assert "end" in call_params, (
          "load_counters must pass 'end' parameter to COUNTER_SQL; "
@@ -561,8 +561,8 @@ class TestBoundedWindowUpperBound:
       for i, c in enumerate(conn.execute.call_args_list):
          params = c[0][1] if len(c[0]) > 1 else {}
          assert "end" in params, (
-            "Query %d in load_usage must pass 'end' parameter; "
-            "got keys: %r" % (i, list(params.keys())))
+         "Query %d in load_usage must pass 'end' parameter; "
+         "got keys: %r" % (i, list(params.keys())))
 
    def test_load_poll_failures_passes_start_and_end(self):
       """load_poll_failures must pass both 'start' and 'end' to SQL."""
@@ -680,7 +680,7 @@ class TestStrictUTCValidation:
       dt = datetime(2026, 9, 30, 9, 0, tzinfo=eastern)
       with pytest.raises(QueryValidationError, match="UTC"):
          load_usage(conn, "polaris", "login-04", _START, _INVENTORY,
-                    now_utc=dt)
+               now_utc=dt)
 
 
 # ===========================================================================
@@ -743,7 +743,7 @@ class TestRangeBasedFacade:
       from node_monitor.web.queries import load_usage_for_range
       conn = _make_usage_conn_9q()
       load_usage_for_range(conn, "polaris", "login-04", 3, _INVENTORY,
-                            now_utc=_NOW)
+                     now_utc=_NOW)
       call_params = conn.execute.call_args_list[0][0][1]
       expected_start = _NOW - timedelta(hours=3)
       assert call_params["start"] == expected_start, (

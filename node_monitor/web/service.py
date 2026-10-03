@@ -191,7 +191,7 @@ class DashboardService:
       # 1. Validate range before touching the database.
       # ------------------------------------------------------------------
       if range_name not in RANGES:
-         raise DashboardServiceError(
+         raise DashboardRequestError(
             "invalid range %r; allowed: %s" % (range_name, sorted(RANGES)))
       range_hours = RANGES[range_name] // 3600
 
@@ -202,9 +202,9 @@ class DashboardService:
          try:
             byte_len = len(username.encode("utf-8"))
          except (AttributeError, UnicodeEncodeError):
-            raise DashboardServiceError("username must be a valid string")
+            raise DashboardRequestError("username must be a valid string")
          if byte_len > MAX_USERNAME_BYTES:
-            raise DashboardServiceError(
+            raise DashboardRequestError(
                "username exceeds %d UTF-8 bytes" % MAX_USERNAME_BYTES)
 
       # ------------------------------------------------------------------
@@ -487,7 +487,7 @@ def _run_dashboard_queries(conn, *, system, node, range_hours,
    ).mappings().first()
 
    if hw_row is None:
-      raise DashboardServiceError(
+      raise DashboardRequestError(
          "node %r is not in the known inventory" % (node,))
 
    hardware = {

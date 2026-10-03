@@ -33,6 +33,7 @@ from node_monitor.web.service import (
    DashboardService,
    DashboardServiceError,
    DashboardTooLarge,
+   DashboardRequestError,
    MAX_RESPONSE_BYTES,
    RANGES,
    serialize_dashboard,
@@ -491,7 +492,7 @@ def test_pg_dashboard_uses_one_connection_repeatable_read_read_only():
       svc = DashboardService(database=engine, system="test")
       # No rows in node_hardware: unknown node fails from in-transaction inventory.
       async def _test():
-         with pytest.raises(DashboardServiceError, match="node"):
+         with pytest.raises(DashboardRequestError, match="node"):
             await svc.dashboard(node="login-04", range_name="1h", username=None)
 
       asyncio.run(_test())
@@ -499,6 +500,18 @@ def test_pg_dashboard_uses_one_connection_repeatable_read_read_only():
       engine.dispose()
       cleanup = create_engine(admin_url, poolclass=NullPool)
       with cleanup.connect().execution_options(
-            isolation_level="AUTOCOMMIT") as conn:
+         isolation_level="AUTOCOMMIT") as conn:
          conn.execute(text("DROP DATABASE IF EXISTS %s" % test_db))
       cleanup.dispose()
+
+
+def test_request_error_is_422_boundary():
+   from node_monitor.web.service import DashboardRequestError, DashboardServiceError
+   assert issubclass(DashboardRequestError, DashboardServiceError)
+   assert DashboardRequestError is not DashboardServiceError
+
+def test_service_errors_remain_service_not_request():
+   from node_monitor.web.service import DashboardServiceError, DashboardService, DashboardRequestError
+   # Invalid range should now be request; unknown node request
+   # Database/runtime errors stay DashboardServiceError
+   assert DashboardServiceError is not DashboardRequestError

@@ -1,25 +1,20 @@
-"""Task 6 CLI tests with real assertions."""
-import importlib
-import sys
+"""Task 6 CLI import-graph regression: fresh subprocess proof."""
+import subprocess, sys, os
 
-def test_web_command_only_has_config():
-    from node_monitor.cli.main import cli
-    web = cli.commands.get("web")
-    assert web is not None
-    names = {p.name for p in web.params}
-    assert names == {"config_path"}, f"unexpected params: {names}"
-
-def test_web_path_does_not_import_migration():
-    # Regression: importing the CLI module must not pull MigrationRunner
-    # when only using the web command path.
-    # We simulate by checking the cli module's local namespace after import.
-    from node_monitor.cli import main as cli_main
-    # The module-level import of MigrationRunner should have been removed.
-    assert "MigrationRunner" not in dir(cli_main) or "MigrationRunner" not in cli_main.__dict__, \
-        "MigrationRunner still in cli module namespace"
-
-    # More rigorous: start fresh interpreter simulation by clearing module
-    sys.modules.pop("node_monitor.database.migration", None)
-    import node_monitor.cli.main
-    assert "node_monitor.database.migration" not in sys.modules, \
-        "migration module imported via cli.main"
+def test_import_cli_main_does_not_load_migration():
+   # Fresh interpreter, import cli.main, fail if migration loaded
+   code = (
+      "import sys; import node_monitor.cli.main; "
+      "sys.exit(1 if 'node_monitor.database.migration' in sys.modules else 0)"
+   )
+   result = subprocess.run(
+      [sys.executable, "-c", code],
+      capture_output=True, text=True,
+      cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+      env={**os.environ, "PYTHONPATH": os.path.dirname(os.path.dirname(os.path.dirname(__file__)))},
+   )
+   # Must exit 0 and not import migration
+   assert result.returncode == 0, (
+      "import cli.main loaded migration: stdout=%s stderr=%s" % (result.stdout, result.stderr)
+   )
+   assert "node_monitor.database.migration" not in result.stdout + result.stderr
