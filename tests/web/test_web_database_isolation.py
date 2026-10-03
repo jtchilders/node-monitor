@@ -20,18 +20,23 @@ touches ``pbs-monitor``, ``node_monitor_dev``, or the resident collector.
 """
 
 import os
-import uuid
 
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import NullPool
 
 from node_monitor.config import DatabaseConfig
 from node_monitor.database.migration import MigrationRunner
 from node_monitor.database.web import WebDatabase
 
-from tests.web.conftest import pg_skip
+from tests.web.conftest import (
+   disposable_identifier,
+   disposable_password,
+   pg_skip,
+   quote_identifier,
+)
 
 
 _PG_AVAILABLE = bool(os.environ.get("NODE_MONITOR_TEST_DATABASE_URL"))
@@ -55,15 +60,18 @@ def isolation_db():
       pytest.skip("NODE_MONITOR_TEST_DATABASE_URL is required")
 
    admin_url = make_url(os.environ["NODE_MONITOR_TEST_DATABASE_URL"])
-   db_name = "nm_isotest_" + uuid.uuid4().hex[:16]
-   role_name = "nm_isoreader_" + uuid.uuid4().hex[:16]
+   db_name = disposable_identifier("nm_isotest")
+   role_name = disposable_identifier("nm_isoreader")
+   password = disposable_password()
 
    admin_engine = create_engine(
       admin_url, poolclass=NullPool, isolation_level="AUTOCOMMIT")
    with admin_engine.connect() as conn:
-      conn.exec_driver_sql('CREATE DATABASE "%s"' % db_name)
       conn.exec_driver_sql(
-         "CREATE ROLE %s LOGIN PASSWORD 'test_only_pw'" % role_name)
+         'CREATE DATABASE "%s"' % quote_identifier(db_name))
+      conn.exec_driver_sql(
+         "CREATE ROLE %s LOGIN PASSWORD %%s" % quote_identifier(role_name),
+         (password,))
 
    db_admin_engine = create_engine(
       admin_url.set(database=db_name), poolclass=NullPool)
@@ -74,16 +82,18 @@ def isolation_db():
 
       with db_admin_engine.connect() as conn:
          conn.exec_driver_sql(
-            "GRANT CONNECT ON DATABASE \"%s\" TO %s" % (db_name, role_name))
+            "GRANT CONNECT ON DATABASE \"%s\" TO %s"
+            % (quote_identifier(db_name), quote_identifier(role_name)))
          conn.exec_driver_sql(
-            "GRANT USAGE ON SCHEMA node_monitor TO %s" % role_name)
+            "GRANT USAGE ON SCHEMA node_monitor TO %s"
+            % quote_identifier(role_name))
          conn.exec_driver_sql(
             "GRANT SELECT ON ALL TABLES IN SCHEMA node_monitor TO %s"
-            % role_name)
+            % quote_identifier(role_name))
          conn.commit()
 
       reader_url = admin_url.set(
-         database=db_name, username=role_name, password="test_only_pw")
+         database=db_name, username=role_name, password=password)
       reader_engine = create_engine(str(reader_url), poolclass=NullPool)
 
       reader_config = DatabaseConfig(
@@ -118,8 +128,10 @@ def isolation_db():
          conn.exec_driver_sql(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
             "WHERE datname = %s AND pid <> pg_backend_pid()", (db_name,))
-         conn.exec_driver_sql('DROP DATABASE IF EXISTS "%s"' % db_name)
-         conn.exec_driver_sql("DROP ROLE IF EXISTS %s" % role_name)
+         conn.exec_driver_sql(
+            'DROP DATABASE IF EXISTS "%s"' % quote_identifier(db_name))
+         conn.exec_driver_sql(
+            "DROP ROLE IF EXISTS %s" % quote_identifier(role_name))
       admin_engine.dispose()
 
 
@@ -145,7 +157,7 @@ def test_reader_cannot_mutate_or_run_ddl(isolation_db):
    )
    with isolation_db.reader_engine.connect() as reader_connection:
       for statement in statements:
-         with pytest.raises(Exception) as exc_info:
+         with pytest.raises(DBAPIError) as exc_info:
             reader_connection.exec_driver_sql(statement)
          # Real PostgreSQL permission-denied evidence, not a generic error.
          # INSERT/UPDATE/DELETE/CREATE TABLE raise "permission denied";
@@ -178,7 +190,7 @@ def test_reader_select_still_succeeds_after_rejections(isolation_db):
       try:
          reader_connection.exec_driver_sql(
             "DELETE FROM node_monitor.node_poll_failures")
-      except Exception:
+      except DBAPIError:
          pass
       reader_connection.rollback()
       count = reader_connection.execute(text(

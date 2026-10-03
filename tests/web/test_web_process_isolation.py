@@ -34,7 +34,6 @@ import sys
 import tempfile
 import threading
 import time
-import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -46,7 +45,12 @@ from sqlalchemy.pool import NullPool
 from node_monitor.database.migration import MigrationRunner
 from node_monitor.web.queries import COUNTER_STALENESS_SECONDS
 
-from tests.web.conftest import pg_skip
+from tests.web.conftest import (
+   disposable_identifier,
+   disposable_password,
+   pg_skip,
+   quote_identifier,
+)
 
 
 _PG_AVAILABLE = bool(os.environ.get("NODE_MONITOR_TEST_DATABASE_URL"))
@@ -82,15 +86,18 @@ def process_isolation_env():
       pytest.skip("NODE_MONITOR_TEST_DATABASE_URL is required")
 
    admin_url = make_url(os.environ["NODE_MONITOR_TEST_DATABASE_URL"])
-   db_name = "nm_procisotest_" + uuid.uuid4().hex[:16]
-   role_name = "nm_procisoreader_" + uuid.uuid4().hex[:16]
+   db_name = disposable_identifier("nm_procisotest")
+   role_name = disposable_identifier("nm_procisoreader")
+   password = disposable_password()
 
    admin_engine = create_engine(
       admin_url, poolclass=NullPool, isolation_level="AUTOCOMMIT")
    with admin_engine.connect() as conn:
-      conn.exec_driver_sql('CREATE DATABASE "%s"' % db_name)
       conn.exec_driver_sql(
-         "CREATE ROLE %s LOGIN PASSWORD 'test_only_pw'" % role_name)
+         'CREATE DATABASE "%s"' % quote_identifier(db_name))
+      conn.exec_driver_sql(
+         "CREATE ROLE %s LOGIN PASSWORD %%s" % quote_identifier(role_name),
+         (password,))
 
    db_admin_engine = create_engine(
       admin_url.set(database=db_name), poolclass=NullPool)
@@ -107,23 +114,26 @@ def process_isolation_env():
       # which performs this exact same revoke for the same reason).
       with admin_engine.connect() as conn:
          conn.exec_driver_sql(
-            'REVOKE TEMP ON DATABASE "%s" FROM PUBLIC' % db_name)
+            'REVOKE TEMP ON DATABASE "%s" FROM PUBLIC'
+            % quote_identifier(db_name))
 
       with db_admin_engine.connect() as conn:
          conn.exec_driver_sql(
-            "GRANT CONNECT ON DATABASE \"%s\" TO %s" % (db_name, role_name))
+            "GRANT CONNECT ON DATABASE \"%s\" TO %s"
+            % (quote_identifier(db_name), quote_identifier(role_name)))
          conn.exec_driver_sql(
-            "GRANT USAGE ON SCHEMA node_monitor TO %s" % role_name)
+            "GRANT USAGE ON SCHEMA node_monitor TO %s"
+            % quote_identifier(role_name))
          conn.exec_driver_sql(
             "GRANT SELECT ON ALL TABLES IN SCHEMA node_monitor TO %s"
-            % role_name)
+            % quote_identifier(role_name))
          conn.commit()
 
       env.db_name = db_name
       env.role_name = role_name
       env.admin_url = admin_url.set(database=db_name)
       env.reader_url = admin_url.set(
-         database=db_name, username=role_name, password="test_only_pw")
+         database=db_name, username=role_name, password=password)
       # The collector's OWN dedicated engine -- deliberately a brand-new
       # engine object, never reused by (or shared with) the web process.
       env.collector_engine = create_engine(
@@ -138,8 +148,10 @@ def process_isolation_env():
          conn.exec_driver_sql(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
             "WHERE datname = %s AND pid <> pg_backend_pid()", (db_name,))
-         conn.exec_driver_sql('DROP DATABASE IF EXISTS "%s"' % db_name)
-         conn.exec_driver_sql("DROP ROLE IF EXISTS %s" % role_name)
+         conn.exec_driver_sql(
+            'DROP DATABASE IF EXISTS "%s"' % quote_identifier(db_name))
+         conn.exec_driver_sql(
+            "DROP ROLE IF EXISTS %s" % quote_identifier(role_name))
       admin_engine.dispose()
 
 
@@ -219,7 +231,14 @@ class ResidentCollector:
                self._last_heartbeat_at = now
                self._tick_count += 1
             self._stop_event.wait(self._interval_sec)
-      except Exception as exc:  # pragma: no cover -- surfaced via self._error
+      except Exception as exc:
+         # Deliberately broad: this is a background thread with no caller
+         # on the stack to propagate to. Any failure here (DB error,
+         # connection loss, etc.) is stored and re-raised synchronously
+         # from stop() so the test body still sees it and fails loudly --
+         # narrowing this to a DB-specific exception type would silently
+         # swallow any other failure mode in this thread instead of
+         # surfacing it. The exception is never silently discarded.
          self._error = exc
 
    def start(self):
@@ -319,7 +338,10 @@ class WebSubprocess:
                client.close()
                if resp.status_code == 200:
                   return
-            except Exception:
+            except httpx.TransportError:
+               # Expected during the narrow window between socket-file
+               # creation and the server actually accepting connections
+               # (ECONNREFUSED/transport-level failure) -- retry.
                pass
          time.sleep(0.1)
       raise AssertionError("web subprocess never became ready")

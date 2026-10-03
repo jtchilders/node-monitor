@@ -12,6 +12,15 @@ host is not ``127.0.0.1``/``localhost`` (see conftest.py's ``route_request``)
 and appends aborted hosts to ``external`` -- every test below asserts
 ``external == []`` as its abort/fail-on-non-local-request proof.
 
+Isolation note: ``browser_page`` and ``live_web`` (tests/browser/conftest.py)
+are both plain function-scoped fixtures (no ``scope=`` override) -- every
+test in this module gets its own fresh Playwright browser context/page and
+its own fresh ``LiveWeb`` HTTP server instance and port. There is no shared
+mutable state across tests (the deliberate external-request abort list,
+``external``, and the server's mutable ``WebState`` are both created fresh
+per fixture instantiation), so no additional per-test reset/isolation
+assertion is added here -- it would be ceremonial rather than meaningful.
+
 Covers the full Task 9 Step 4 matrix:
   * all states (loading, connected/current, stale, partial, empty,
     connection failure, disconnect-after-first-load)

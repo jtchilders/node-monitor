@@ -34,7 +34,7 @@ from sqlalchemy import event, text
 
 from node_monitor.web.service import DashboardService
 
-from tests.web.conftest import pg_skip
+from tests.web.conftest import disposable_identifier, pg_skip, quote_identifier
 
 
 # ---------------------------------------------------------------------------
@@ -63,18 +63,68 @@ MAX_STATEMENT_SECONDS = 3.0
 MAX_REQUEST_SECONDS = 12.0
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_COUNTER_ROWS = 1440
-MAX_RSS_DELTA_BYTES = 256 * 1024 * 1024
+#: Maximum acceptable increase in this process's peak-RSS high-water mark
+#: (``ru_maxrss``) between a pre- and post-measurement snapshot taken
+#: around the ITERATIONS dashboard requests below. This is NOT the
+#: instantaneous RSS of any single request -- ``ru_maxrss`` is a
+#: monotonically non-decreasing high-water mark for the whole process
+#: lifetime, so ``rss_after - rss_before`` only ever captures growth that
+#: occurred during the measured window; it can never shrink even if the
+#: single most expensive request released memory afterward.
+MAX_RSS_HWM_DELTA_BYTES = 256 * 1024 * 1024
+
+
+def normalize_ru_maxrss(raw_ru_maxrss, platform):
+   """Pure, platform-unit normalization of a raw ``ru_maxrss`` value to
+   bytes.
+
+   ``resource.getrusage(...).ru_maxrss`` is documented to report its peak
+   resident-set-size high-water mark in platform-dependent units: bytes on
+   macOS/BSD (``sys.platform == "darwin"``), kibibytes (1024-byte units)
+   everywhere else (Linux). This function takes the raw value and the
+   platform string as plain arguments -- no OS call inside -- so the unit
+   conversion itself is directly unit-testable for both platforms without
+   needing to run on both operating systems or monkeypatch the ``resource``
+   module.
+   """
+   if platform == "darwin":
+      return raw_ru_maxrss
+   return raw_ru_maxrss * 1024
 
 
 def _max_rss_bytes():
-   """Return the current process's peak RSS in bytes, cross-platform.
+   """Return this process's current peak-RSS high-water mark in bytes,
+   cross-platform, by reading the real OS-reported ``ru_maxrss`` and
+   normalizing its units via ``normalize_ru_maxrss``.
 
-   ``ru_maxrss`` is reported in bytes on macOS/BSD and kibibytes on Linux.
+   This is a high-water mark, not an instantaneous sample: PostgreSQL's own
+   ``ru_maxrss`` semantics mean the value returned here only ever goes up
+   for the lifetime of the process, so two calls bracketing a block of work
+   measure how much additional peak memory that block caused the process
+   to touch at its worst moment -- not the memory used by any single
+   request in isolation.
    """
-   usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-   if sys.platform == "darwin":
-      return usage
-   return usage * 1024
+   raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+   return normalize_ru_maxrss(raw, sys.platform)
+
+
+# ---------------------------------------------------------------------------
+# Pure unit test: platform-unit normalization (no PostgreSQL, no OS call) --
+# the methodology itself (bytes on darwin, KiB->bytes elsewhere) is correct
+# and unchanged; this test makes the conversion explicit and reviewable via
+# the extracted pure helper rather than only exercising it implicitly
+# through a live measurement.
+# ---------------------------------------------------------------------------
+
+def test_normalize_ru_maxrss_is_identity_on_darwin_and_kib_to_bytes_elsewhere():
+   # macOS/BSD: ru_maxrss is already reported in bytes -- no conversion.
+   assert normalize_ru_maxrss(123456, "darwin") == 123456
+   assert normalize_ru_maxrss(0, "darwin") == 0
+   # Linux (and every other non-darwin platform string): ru_maxrss is
+   # reported in kibibytes (1024-byte units) -- multiply by 1024.
+   assert normalize_ru_maxrss(1000, "linux") == 1000 * 1024
+   assert normalize_ru_maxrss(0, "linux") == 0
+   assert normalize_ru_maxrss(1000, "freebsd12") == 1000 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -197,8 +247,16 @@ def _usage_rows_for_node(node, now, windows=USAGE_WINDOWS):
    disprove application-side raw-row loading: the dashboard must aggregate
    this large grid in SQL, never fetch it wholesale into Python.
 
-   A handful of combinations are deliberately skipped (gaps/partial
-   coverage), and a handful carry unmeasured_count > 0 (failures).
+   Every one of the ``windows * len(CATEGORIES) * len(ACTIVITIES) *
+   len(USERS)`` combinations is yielded exactly once -- this is an exact
+   cross product, not an approximate grid with deliberately missing rows.
+   Partial/failure coverage is represented IN those real rows via
+   ``unmeasured_count > 0`` and/or ``sample_count < expected_count``,
+   never by omitting a required combination outright. Genuine counter
+   timeline gaps (missing minutes) are a property of
+   ``node_counter_minute`` / ``_counter_rows_for_node`` only, and remain
+   modeled there as real missing rows -- that is a distinct requirement
+   from this table's exact-grid requirement.
    """
    interval_len = timedelta(minutes=15)
    for w in range(windows):
@@ -211,10 +269,17 @@ def _usage_rows_for_node(node, now, windows=USAGE_WINDOWS):
                   w * len(CATEGORIES) * len(ACTIVITIES) * len(USERS)
                   + cat_idx * len(ACTIVITIES) * len(USERS)
                   + act_idx * len(USERS) + user_idx)
-               # Deliberate gap: skip ~1-in-500 combos entirely.
-               if combo_id % 503 == 0:
-                  continue
-               unmeasured_count = 1 if combo_id % 401 == 0 else 0
+               # Failure/quality-degradation conditions are represented
+               # IN the row (unmeasured_count, reduced sample_count), not
+               # by skipping the combination -- every grain in the exact
+               # cross product is always present.
+               is_unmeasured = combo_id % 401 == 0
+               unmeasured_count = 1 if is_unmeasured else 0
+               # A second, disjoint ~1-in-500 subset simulates partial
+               # sample coverage (reduced sample_count) without ever
+               # omitting the row itself.
+               is_partial = combo_id % 503 == 0
+               sample_count = 3 if is_partial else 6
                rss_p50 = 1000 + (combo_id % 4000)
                yield {
                   "system": SYSTEM,
@@ -237,7 +302,7 @@ def _usage_rows_for_node(node, now, windows=USAGE_WINDOWS):
                   },
                   "d_state_fraction": (combo_id % 20) / 100.0,
                   "interactivity_fraction": (combo_id % 40) / 100.0,
-                  "sample_count": 6,
+                  "sample_count": sample_count,
                   "expected_count": 6,
                   "unmeasured_count": unmeasured_count,
                }
@@ -440,16 +505,35 @@ def seeded_engine_and_counts():
 
    base_url = make_url(os.environ["NODE_MONITOR_TEST_DATABASE_URL"])
    admin_url = base_url.set(database="postgres")
-   db_name = "nm_task9_perf_" + uuid.uuid4().hex[:16]
+   db_name = disposable_identifier("nm_task9_perf")
 
    admin_engine = create_engine(
       admin_url, poolclass=NullPool, isolation_level="AUTOCOMMIT")
    with admin_engine.connect() as conn:
-      conn.exec_driver_sql('CREATE DATABASE "%s"' % db_name)
+      conn.exec_driver_sql(
+         'CREATE DATABASE "%s"' % quote_identifier(db_name))
    admin_engine.dispose()
 
    db_url = admin_url.set(database=db_name)
-   engine = create_engine(str(db_url), poolclass=NullPool)
+   # Production-compatible session configuration via the real connect_args
+   # mechanism (same shape as DatabaseConfig.connect_args / WebDatabase's
+   # own connect_args plumbing in node_monitor/database/web.py): a
+   # PostgreSQL ``options`` connect_arg carrying ``-c statement_timeout=...
+   # -c lock_timeout=...``. This is the exact mechanism the real engines
+   # use, so the performance path's actual DB session genuinely enforces
+   # PostgreSQL's own server-side 3-second statement cancellation --
+   # measurement alone (a client-side stopwatch) can never prove this;
+   # only a real connect_args-configured session can. lock_timeout is
+   # preserved (2000ms) alongside statement_timeout, matching the same
+   # ratio used throughout the config examples and test fixtures (e.g.
+   # tests/web/test_web_config.py's own 3000/2000 pair).
+   engine = create_engine(
+      str(db_url), poolclass=NullPool,
+      connect_args={
+         "options": "-c statement_timeout=%d -c lock_timeout=%d" % (
+            int(MAX_STATEMENT_SECONDS * 1000), 2000),
+      },
+   )
    try:
       from node_monitor.database.migration import MigrationRunner
       runner = MigrationRunner(engine, "task9-perf-test")
@@ -464,7 +548,8 @@ def seeded_engine_and_counts():
          conn.exec_driver_sql(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
             "WHERE datname = %s AND pid <> pg_backend_pid()", (db_name,))
-         conn.exec_driver_sql('DROP DATABASE IF EXISTS "%s"' % db_name)
+         conn.exec_driver_sql(
+            'DROP DATABASE IF EXISTS "%s"' % quote_identifier(db_name))
       cleanup.dispose()
 
 
@@ -480,18 +565,35 @@ def test_fixture_seeds_exact_counter_window_count(seeded_engine_and_counts):
 
 
 @pg_skip
-def test_fixture_seeds_large_usage_grid(seeded_engine_and_counts):
-   """The usage grid is large enough to disprove application-side raw-row
-   loading: each node's full (window, category, activity, username) grid is
-   close to the documented expected_usage_rows_per_node() size (a handful
-   of rows are deliberately skipped to simulate gaps).
+def test_fixture_seeds_exact_usage_grid_per_node(seeded_engine_and_counts):
+   """Each node has EXACTLY the full (window, category, activity, username)
+   cross product of usage rows -- 96 windows x 5 categories x 3 activities
+   x 32 users per node, per the Task 9 Step 1 specification. This is an
+   exact cardinality requirement, not an approximate lower bound: partial
+   coverage / failure conditions are represented through
+   ``unmeasured_count`` and reduced ``sample_count`` on individual grains,
+   never by omitting a required (window, category, activity, username)
+   combination from the fixture.
+
+   Asserts real per-node row counts queried directly from the database
+   (grouped by source_hostname), not only the insertion-time bookkeeping
+   dict returned by ``seed_fixture_database``.
    """
-   _engine, counts, _now = seeded_engine_and_counts
+   engine, _counts, _now = seeded_engine_and_counts
    per_node_expected = expected_usage_rows_per_node()
-   # Deliberate gaps remove a small fraction; the total must still be close
-   # to (not equal to) the full per-node cross product across both nodes.
-   assert counts["node_usage_intervals"] > 0.95 * per_node_expected * len(NODES)
-   assert counts["node_usage_intervals"] <= per_node_expected * len(NODES)
+   with engine.connect() as conn:
+      rows = conn.execute(text(
+         "SELECT source_hostname, count(*) "
+         "FROM node_monitor.node_usage_intervals "
+         "GROUP BY source_hostname"
+      )).all()
+   counts_by_node = {node: count for node, count in rows}
+   assert set(counts_by_node) == set(NODES)
+   for node in NODES:
+      assert counts_by_node[node] == per_node_expected, (
+         "node %r has %d usage rows, expected exactly %d (the full "
+         "windows x categories x activities x users cross product)"
+         % (node, counts_by_node[node], per_node_expected))
 
 
 @pg_skip
@@ -532,6 +634,50 @@ def test_fixture_includes_poll_failures_and_collection_events(
    _engine, counts, _now = seeded_engine_and_counts
    assert counts["node_poll_failures"] == 5 * len(NODES)
    assert counts["node_collection_log"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Step 2 (statement timeout enforcement proof): the performance path's
+# actual DB session must have a REAL PostgreSQL statement_timeout of
+# exactly 3 seconds enforced server-side -- not merely a client-side
+# stopwatch around an unbounded statement.
+# ---------------------------------------------------------------------------
+
+@pg_skip
+def test_performance_engine_session_has_exact_statement_timeout(
+      seeded_engine_and_counts):
+   """The exact same engine used by ``_run_dashboard_request`` (and thus by
+   ``DashboardService``) must open sessions with PostgreSQL
+   ``statement_timeout`` set to exactly 3000ms (matching
+   ``MAX_STATEMENT_SECONDS``) and ``lock_timeout`` set to exactly 2000ms,
+   enforced server-side via ``current_setting()`` on a real connection --
+   not inferred from configuration alone.
+
+   This is a real enforcement proof, not a configuration-shape check: it
+   runs ``pg_sleep(3.5)`` (longer than the 3-second timeout) over the exact
+   connect_args-configured engine and asserts PostgreSQL itself cancels the
+   statement with ``QueryCanceled`` -- a client-side stopwatch could never
+   produce this failure mode on its own.
+   """
+   engine, _counts, _now = seeded_engine_and_counts
+
+   with engine.connect() as conn:
+      statement_timeout_ms = conn.execute(
+         text("SELECT current_setting('statement_timeout')")).scalar_one()
+      lock_timeout_ms = conn.execute(
+         text("SELECT current_setting('lock_timeout')")).scalar_one()
+   assert statement_timeout_ms == "3000ms" or statement_timeout_ms == "3s", (
+      "performance engine session statement_timeout must be exactly 3000ms, "
+      "got %r" % (statement_timeout_ms,))
+   assert lock_timeout_ms == "2000ms" or lock_timeout_ms == "2s", (
+      "performance engine session lock_timeout must be exactly 2000ms, "
+      "got %r" % (lock_timeout_ms,))
+
+   from sqlalchemy.exc import DBAPIError
+
+   with pytest.raises(DBAPIError, match="(?i)canceling statement|timeout"):
+      with engine.connect() as conn:
+         conn.execute(text("SELECT pg_sleep(3.5)"))
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +726,14 @@ def test_complete_24h_dashboard_request_meets_performance_bounds(
       seeded_engine_and_counts):
    """Repeatedly exercise the complete 24h endpoint (after one warm-up) and
    assert every Task 9 performance bound.
+
+   The RSS assertion measures the process's peak-RSS HIGH-WATER DELTA
+   across the measured ITERATIONS requests (``_max_rss_bytes() after -
+   _max_rss_bytes() before``, floored at zero) -- not the instantaneous
+   resident-set size of any single request. ``ru_maxrss`` is a
+   monotonically non-decreasing high-water mark for the whole process
+   lifetime, so this delta captures how much additional peak memory the
+   measured block of work caused the process to touch at its worst moment.
    """
    engine, _counts, now = seeded_engine_and_counts
 
@@ -591,13 +745,13 @@ def test_complete_24h_dashboard_request_meets_performance_bounds(
    statement_times_all = []
    last_payload = None
 
-   rss_before = _max_rss_bytes()
+   rss_hwm_before = _max_rss_bytes()
    for _ in range(ITERATIONS):
       payload, elapsed, statement_times = _run_dashboard_request(engine, now)
       latencies.append(elapsed)
       statement_times_all.extend(statement_times)
       last_payload = payload
-   rss_after = _max_rss_bytes()
+   rss_hwm_after = _max_rss_bytes()
 
    latencies.sort()
    median_latency = latencies[len(latencies) // 2]
@@ -610,7 +764,7 @@ def test_complete_24h_dashboard_request_meets_performance_bounds(
    returned_counter_rows = len(data["counters"]["rows"])
    returned_aggregate_rows = len(data["usage"]["grains"])
    response_bytes = len(last_payload)
-   rss_delta = max(0, rss_after - rss_before)
+   rss_delta = max(0, rss_hwm_after - rss_hwm_before)
 
    print("\n--- Task 9 performance evidence ---")
    print("median_latency_sec=%.4f p95_latency_sec=%.4f" %
@@ -621,8 +775,8 @@ def test_complete_24h_dashboard_request_meets_performance_bounds(
    print("returned_counter_rows=%d returned_aggregate_rows=%d" %
          (returned_counter_rows, returned_aggregate_rows))
    print("response_bytes=%d" % response_bytes)
-   print("rss_before=%d rss_after=%d rss_delta=%d" %
-         (rss_before, rss_after, rss_delta))
+   print("rss_hwm_before=%d rss_hwm_after=%d rss_hwm_delta=%d" %
+         (rss_hwm_before, rss_hwm_after, rss_delta))
 
    # ---- Blocking acceptance assertions (plan Task 9, Step 2) ----
    assert statement_times_all, "expected at least one SQL statement to be timed"
@@ -641,9 +795,9 @@ def test_complete_24h_dashboard_request_meets_performance_bounds(
    assert returned_counter_rows <= MAX_COUNTER_ROWS, (
       "returned %d counter rows exceeds cap of %d"
       % (returned_counter_rows, MAX_COUNTER_ROWS))
-   assert rss_delta <= MAX_RSS_DELTA_BYTES, (
-      "process RSS delta %d bytes exceeds cap of %d bytes"
-      % (rss_delta, MAX_RSS_DELTA_BYTES))
+   assert rss_delta <= MAX_RSS_HWM_DELTA_BYTES, (
+      "process peak-RSS high-water-mark delta %d bytes exceeds cap of "
+      "%d bytes" % (rss_delta, MAX_RSS_HWM_DELTA_BYTES))
 
    # The aggregate (GROUP BY/DISTINCT ON) usage result set must be far
    # smaller than the raw usage grid -- proof the aggregation happens in
