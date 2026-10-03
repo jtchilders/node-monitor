@@ -1366,8 +1366,8 @@ def web_command(config_path):
    db = WebDatabase(config.database)
    try:
       db.preflight()
-   except Exception as exc:
-      click.echo("database preflight failed: %s" % exc, err=True)
+   except Exception:
+      click.echo("database preflight failed", err=True)
       try:
          db.dispose()
       except Exception:
@@ -1380,17 +1380,16 @@ def web_command(config_path):
       sock = bind_private_socket(config.socket_path)
    except (ConfigError, WebDatabaseError, SocketError) as exc:
       click.echo("service initialization failed: %s" % exc, err=True)
-      for target in (sock, db):
-         try:
-            if sock is not None:
-               sock.close()
-         except Exception:
-            pass
-         try:
-            if db is not None:
-               db.dispose()
-         except Exception:
-            pass
+      try:
+         if sock is not None:
+            sock.close()
+      except Exception:
+         pass
+      try:
+         if db is not None:
+            db.dispose()
+      except Exception:
+         pass
       sys.exit(1)
    # One bounded startup line: PID + expanded socket path
    click.echo("PID %d socket %s" % (os.getpid(), os.path.abspath(config.socket_path)))
