@@ -1,3 +1,89 @@
 <!DOCTYPE html>
-<html><head><title>Dashboard</title><link rel="stylesheet" href="/static/styles.css"></head>
-<body><h1>Dashboard</h1><script src="/static/app.js"></script></body></html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Node Monitor Dashboard</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+  <h1>Node Monitor — <span data-testid="system-name">system</span> / <span data-testid="node-name">node</span></h1>
+  <div aria-live="polite" id="connectivity-status" data-testid="connectivity-status">Loading…</div>
+</header>
+
+<section aria-label="Controls" class="controls">
+  <div class="range-buttons" role="group" aria-label="Time range">
+    <button type="button" data-testid="range-btn" data-range="1h">1h</button>
+    <button type="button" data-testid="range-btn" data-range="3h">3h</button>
+    <button type="button" data-testid="range-btn" data-range="6h">6h</button>
+    <button type="button" data-testid="range-btn" data-range="12h">12h</button>
+    <button type="button" data-testid="range-btn" data-range="24h">24h</button>
+  </div>
+  <form id="node-form" aria-label="Switch node">
+    <label for="node-input">Node</label>
+    <input id="node-input" type="text" data-testid="node-input" placeholder="login-04" />
+    <button type="submit" data-testid="node-submit">Switch</button>
+  </form>
+  <form id="user-form" aria-label="Username filter">
+    <label for="user-input">Username</label>
+    <input id="user-input" type="text" data-testid="user-input" placeholder="alice" />
+    <button type="submit" data-testid="user-submit">Filter</button>
+  </form>
+</section>
+
+<section aria-label="Status cards">
+  <article data-testid="counter-card" aria-label="Counter status">
+    <h2>Counter</h2>
+    <div data-testid="counter-status">—</div>
+    <div data-testid="counter-freshness">Age: —</div>
+    <div data-testid="data-age"><span data-testid="data-age-value">—</span> <span data-testid="data-age-seconds">—</span></div>
+  </article>
+  <article data-testid="usage-card" aria-label="Usage status">
+    <h2>Usage</h2>
+    <div data-testid="usage-status">—</div>
+    <div data-testid="usage-freshness">Usage age: —</div>
+  </article>
+  <article data-testid="poll-card" aria-label="Poll failures">
+    <h2>Poll failures</h2>
+    <div data-testid="poll-failures">—</div>
+    <div data-testid="poll-breaker">—</div>
+  </article>
+</section>
+
+<section aria-label="Telemetry cards">
+  <article data-testid="cpu-card" aria-label="CPU busy">
+    <h3>CPU busy p50</h3>
+    <div data-testid="cpu-busy">—</div>
+  </article>
+  <article data-testid="load-card" aria-label="Load averages">
+    <h3>Load</h3>
+    <div>load1 <span data-testid="load1">—</span></div>
+    <div>load5 <span data-testid="load5">—</span></div>
+    <div>load15 <span data-testid="load15">—</span></div>
+  </article>
+  <article data-testid="mem-card" aria-label="Physical memory">
+    <h3>Memory (physical used)</h3>
+    <div data-testid="mem-used">—</div>
+    <div data-testid="mem-note">MemTotal − MemAvailable (incl. kernel/cache)</div>
+  </article>
+  <article data-testid="process-card" aria-label="Processes">
+    <h3>Processes (latest)</h3>
+    <div>running <span data-testid="procs-running">—</span></div>
+    <div>total <span data-testid="procs-total">—</span></div>
+  </article>
+  <article data-testid="usage-hotspot-card" aria-label="Usage hotspot">
+    <h3>D-state hotspot (15m)</h3>
+    <div data-testid="d-state">—</div>
+    <div data-testid="usage-timestamp">—</div>
+    <div data-testid="usage-username">—</div>
+  </article>
+</section>
+
+<section aria-label="Retry" id="retry-section" hidden>
+  <button type="button" data-testid="retry-btn" id="retry-btn">Retry connection</button>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
