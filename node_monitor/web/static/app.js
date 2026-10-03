@@ -1,162 +1,293 @@
 (function() {
    'use strict';
 
-   // State
-   let snapshot = null;
-   let connected = false;
-   let receivedMonotonicMs = 0;
-   let serverAgeAtReceiptSec = 0;
-   let refreshTimer = null;
+   const state = {
+      snapshot: null,
+      connected: false,
+      receivedMonotonicMs: 0,
+      counterAgeAtReceiptSec: null,
+      usageAgeAtReceiptSec: null,
+      currentNode: 'login-04',
+      currentRange: '1h',
+      currentUsername: null,
+      refreshTimer: null,
+      ageTimer: null,
+   };
 
    const endpoint = '/api/dashboard';
+   const qs = function(selector) { return document.querySelector(selector); };
+   const qsa = function(selector) { return document.querySelectorAll(selector); };
 
-   function qs(sel) { return document.querySelector(sel); }
-   function qsa(sel) { return document.querySelectorAll(sel); }
-
-   function formatAge(sec) {
-      if (sec == null || isNaN(sec)) return '—';
-      return Math.max(0, Math.round(sec)) + 's';
+   function finiteNumber(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
    }
 
-   async function fetchDashboard(node, rangeName, username) {
+   function formatAge(seconds) {
+      const value = finiteNumber(seconds);
+      return value === null ? '-' : Math.max(0, Math.floor(value)) + 's';
+   }
+
+   function ageAtReceipt(serverNow, timestamp) {
+      if (!serverNow || !timestamp) return null;
+      const serverMs = Date.parse(serverNow);
+      const valueMs = Date.parse(timestamp);
+      if (!Number.isFinite(serverMs) || !Number.isFinite(valueMs)) return null;
+      return Math.max(0, (serverMs - valueMs) / 1000);
+   }
+
+   function freshnessLabel(section) {
+      const status = section && section.status ? section.status : 'empty';
+      if (status === 'empty') return 'Empty';
+      if (status === 'partial') return 'Partial';
+      if (status === 'stale' || !section.is_fresh) return 'Stale';
+      return 'Current';
+   }
+
+   function setActiveRange() {
+      qsa('[data-testid="range-btn"]').forEach(function(button) {
+         const active = button.getAttribute('data-range') === state.currentRange;
+         button.setAttribute('aria-pressed', active ? 'true' : 'false');
+      });
+   }
+
+   function dashboardUrl() {
       const url = new URL(endpoint, location.origin);
-      url.searchParams.set('node', node || 'login-04');
-      url.searchParams.set('range', rangeName || '1h');
-      if (username) url.searchParams.set('username', username);
-      const resp = await fetch(url.toString(), { cache: 'no-store', signal: AbortSignal.timeout(15000) });
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      return await resp.json();
+      url.searchParams.set('node', state.currentNode);
+      url.searchParams.set('range', state.currentRange);
+      if (state.currentUsername) url.searchParams.set('username', state.currentUsername);
+      return url.toString();
    }
 
-   function applySnapshot(data, nodeName, rangeName) {
-      snapshot = data;
-      connected = true;
-      receivedMonotonicMs = performance.now();
+   async function fetchDashboard() {
+      const response = await fetch(dashboardUrl(), {
+         cache: 'no-store',
+         signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) throw new Error('refresh failed');
+      return response.json();
+   }
 
-      const newestEnd = data.counters && data.counters.newest_window_end ? new Date(data.counters.newest_window_end) : null;
-      const serverNowStr = data.server_utc_now || null;
-      const serverNow = serverNowStr ? new Date(serverNowStr) : null;
+   function latestCounter(counters) {
+      return counters && counters.latest ? counters.latest : null;
+   }
 
-      let baseAgeSec = 0;
-      if (newestEnd && serverNow) {
-         baseAgeSec = Math.max(0, (serverNow - newestEnd) / 1000);
+   function renderCounterQuality(counters) {
+      const rows = counters && Array.isArray(counters.rows) ? counters.rows : [];
+      const latest = rows.length ? rows[rows.length - 1] : null;
+      if (!latest) {
+         qs('[data-testid="counter-quality"]').textContent = 'No counter samples in range';
+         return;
       }
-      serverAgeAtReceiptSec = baseAgeSec;
-
-      // Update cards
-      qs('[data-testid="counter-status"]').textContent = (data.counters && data.counters.status) ? data.counters.status : '—';
-      qs('[data-testid="counter-freshness"]').textContent = 'Age: ' + formatAge(baseAgeSec);
-
-      qs('[data-testid="usage-status"]').textContent = (data.usage && data.usage.status) ? data.usage.status : '—';
-      qs('[data-testid="usage-freshness"]').textContent = 'Usage age: —';
-
-      qs('[data-testid="poll-failures"]').textContent = (data.poll_failures && data.poll_failures.length >= 0) ? String(data.poll_failures.length) : '—';
-      qs('[data-testid="poll-breaker"]').textContent = data.poll_failures && data.poll_failures[0] ? (data.poll_failures[0].breaker_state || '—') : '—';
-
-      // Telemetry
-      if (data.counters && data.counters.latest && data.counters.latest.cpu_busy_pct) {
-         qs('[data-testid="cpu-busy"]').textContent = String(data.counters.latest.cpu_busy_pct.p50 !== null ? data.counters.latest.cpu_busy_pct.p50 : '—');
-      } else {
-         qs('[data-testid="cpu-busy"]').textContent = '—';
-      }
-      qs('[data-testid="load1"]').textContent = (data.counters && data.counters.latest && data.counters.latest.load1 != null) ? String(data.counters.latest.load1) : '—';
-      qs('[data-testid="load5"]').textContent = (data.counters && data.counters.latest && data.counters.latest.load5 != null) ? String(data.counters.latest.load5) : '—';
-      qs('[data-testid="load15"]').textContent = (data.counters && data.counters.latest && data.counters.latest.load15 != null) ? String(data.counters.latest.load15) : '—';
-
-      // Memory
-      const memUsed = (data.counters && data.counters.latest && data.counters.latest.mem_used_physical_kb != null) ? data.counters.latest.mem_used_physical_kb : null;
-      const totalKb = (data.hardware && data.hardware.mem_total_kb != null) ? data.hardware.mem_total_kb : null;
-      qs('[data-testid="mem-used"]').textContent = (memUsed != null && totalKb != null && totalKb > 0) ? (memUsed / (1024*1024)).toFixed(2) + ' GiB / ' + (totalKb / (1024*1024)).toFixed(2) + ' GiB' : (memUsed != null ? String(memUsed) + ' KiB' : '—');
-
-      qs('[data-testid="procs-running"]').textContent = (data.counters && data.counters.latest && data.counters.latest.procs_running != null) ? String(data.counters.latest.procs_running) : '—';
-      qs('[data-testid="procs-total"]').textContent = (data.counters && data.counters.latest && data.counters.latest.procs_total != null) ? String(data.counters.latest.procs_total) : '—';
-
-      // Usage hotspot
-      const grains = (data.usage && data.usage.grains) ? data.usage.grains : [];
-      const dStateGrain = grains.find(function(g) { return g.d_state_fraction != null; }) || null;
-      qs('[data-testid="d-state"]').textContent = dStateGrain ? String(dStateGrain.d_state_fraction) : '—';
-      qs('[data-testid="usage-timestamp"]').textContent = dStateGrain ? (dStateGrain.interval_end || '—') : '—';
-      qs('[data-testid="usage-username"]').textContent = dStateGrain ? (dStateGrain.d_state_username || '—') : '—';
-
-      // Age tick uses server-reported base + monotonic elapsed
-      qs('[data-testid="data-age-value"]').textContent = new Date(newestEnd ? newestEnd.toISOString() : '').toISOString().split('T')[1] ? 'timestamp' : '—';
-      qs('[data-testid="data-age-seconds"]').textContent = 'age seconds: ' + formatAge(baseAgeSec + (performance.now() - receivedMonotonicMs) / 1000);
-
-      qs('#retry-section').hidden = true;
-      qs('[data-testid="connectivity-status"]').textContent = 'Connected';
+      const coverage = finiteNumber(latest.coverage);
+      const coverageText = coverage === null ? '-' : (coverage * 100).toFixed(1) + '%';
+      const samples = latest.sample_count == null ? '-' : String(latest.sample_count);
+      const expected = latest.expected_count == null ? '-' : String(latest.expected_count);
+      const gaps = counters.gaps && counters.gaps.missing_count != null
+         ? String(counters.gaps.missing_count) : '-';
+      qs('[data-testid="counter-quality"]').textContent =
+         'Coverage ' + coverageText + '; samples ' + samples + '/' + expected
+         + '; missing windows ' + gaps;
    }
 
-   function showDisconnected(msg) {
-      connected = false;
-      qs('[data-testid="connectivity-status"]').textContent = msg || 'Web server disconnected';
-      qs('#retry-section').hidden = false;
-   }
-
-   async function load(node, rangeName, username) {
-      try {
-         const data = await fetchDashboard(node, rangeName, username);
-         applySnapshot(data, node, rangeName);
-         return true;
-      } catch (e) {
-         if (snapshot === null) {
-            showDisconnected('Connection failure');
+   function renderMemory(data, latest) {
+      const usedKb = latest ? finiteNumber(latest.mem_used_physical_kb) : null;
+      const totalKb = data.hardware ? finiteNumber(data.hardware.mem_total_kb) : null;
+      let text = '-';
+      if (usedKb !== null) {
+         text = (usedKb / (1024 * 1024)).toFixed(2) + ' GiB';
+         if (totalKb !== null && totalKb > 0) {
+            text += ' / ' + (totalKb / (1024 * 1024)).toFixed(2) + ' GiB ('
+               + ((usedKb / totalKb) * 100).toFixed(1) + '%)';
          } else {
-            showDisconnected('Web server disconnected');
+            text += ' (percentage unavailable)';
          }
+      }
+      qs('[data-testid="mem-used"]').textContent = text;
+   }
+
+   function renderUsage(data) {
+      const usage = data.usage || {};
+      const grains = Array.isArray(usage.grains) ? usage.grains : [];
+      let hotspot = null;
+      grains.forEach(function(grain) {
+         const value = finiteNumber(grain.d_state_fraction);
+         if (value !== null && (!hotspot || value > hotspot.value)) {
+            hotspot = {value: value, grain: grain};
+         }
+      });
+      qs('[data-testid="d-state"]').textContent = hotspot
+         ? (hotspot.value * 100).toFixed(1) + '%' : '-';
+      qs('[data-testid="usage-timestamp"]').textContent = hotspot
+         ? (hotspot.grain.interval_end || '-') : '-';
+      qs('[data-testid="usage-username"]').textContent = hotspot
+         ? (hotspot.grain.d_state_username || '-') : '-';
+
+      let matchText = 'All usernames';
+      if (state.currentUsername) {
+         matchText = grains.length ? 'Username matched' : 'No matching usage';
+      }
+      qs('[data-testid="username-result"]').textContent = matchText;
+   }
+
+   function renderFailures(data) {
+      const failures = Array.isArray(data.poll_failures)
+         ? data.poll_failures.slice(0, 10) : [];
+      qs('[data-testid="poll-failures"]').textContent = String(failures.length);
+      qs('[data-testid="poll-breaker"]').textContent = failures.length
+         ? (failures[0].breaker_state || '-') : '-';
+      qs('[data-testid="poll-failures-text"]').textContent = failures.length
+         ? failures.map(function(failure) {
+            return (failure.recorded_at || '-') + ' '
+               + (failure.loop || '-') + ' ' + (failure.failure_type || '-')
+               + (failure.detail ? ': ' + failure.detail : '');
+         }).join('; ')
+         : 'No recent poll failures';
+   }
+
+   function renderAges() {
+      if (!state.snapshot || !state.receivedMonotonicMs) return;
+      const elapsed = (performance.now() - state.receivedMonotonicMs) / 1000;
+      const counterAge = state.counterAgeAtReceiptSec === null
+         ? null : state.counterAgeAtReceiptSec + elapsed;
+      const usageAge = state.usageAgeAtReceiptSec === null
+         ? null : state.usageAgeAtReceiptSec + elapsed;
+      const ageElement = qs('[data-testid="data-age-seconds"]');
+      ageElement.textContent = formatAge(counterAge);
+      ageElement.setAttribute('data-age-seconds', counterAge === null
+         ? '' : String(Math.floor(counterAge)));
+      qs('[data-testid="counter-age"]').textContent = 'Counter age ' + formatAge(counterAge);
+      qs('[data-testid="usage-age"]').textContent = 'Usage age ' + formatAge(usageAge);
+   }
+
+   function render(data) {
+      const counters = data.counters || {};
+      const usage = data.usage || {};
+      const latest = latestCounter(counters);
+      state.snapshot = data;
+      state.connected = true;
+      state.receivedMonotonicMs = performance.now();
+      state.counterAgeAtReceiptSec = ageAtReceipt(
+         data.server_utc_now, counters.newest_window_end);
+      state.usageAgeAtReceiptSec = ageAtReceipt(
+         data.server_utc_now, usage.newest_interval_end);
+
+      qs('[data-testid="connectivity-status"]').textContent = 'Connected';
+      qs('[data-testid="counter-status"]').textContent = counters.status || 'empty';
+      qs('[data-testid="counter-freshness"]').textContent = freshnessLabel(counters);
+      qs('[data-testid="usage-status"]').textContent = usage.status || 'empty';
+      qs('[data-testid="usage-freshness"]').textContent = freshnessLabel(usage);
+      qs('[data-testid="data-age-value"]').textContent =
+         counters.newest_window_end || '-';
+      qs('[data-testid="newest-timestamp"]').textContent =
+         counters.newest_window_end || '-';
+
+      qs('[data-testid="cpu-busy"]').textContent = latest
+         && latest.cpu_busy_pct && finiteNumber(latest.cpu_busy_pct.p50) !== null
+         ? finiteNumber(latest.cpu_busy_pct.p50).toFixed(1) + '%' : '-';
+      ['load1', 'load5', 'load15', 'procs_running', 'procs_total'].forEach(
+         function(name) {
+            qs('[data-testid="' + name.replace('_', '-') + '"]').textContent =
+               latest && latest[name] != null ? String(latest[name]) : '-';
+         });
+
+      renderCounterQuality(counters);
+      renderMemory(data, latest);
+      renderUsage(data);
+      renderFailures(data);
+
+      const hardware = data.hardware || {};
+      qs('[data-testid="system-name"]').textContent = hardware.system || '-';
+      qs('[data-testid="node-name"]').textContent = data.node || state.currentNode;
+      qs('[data-testid="current-node"]').textContent = data.node || state.currentNode;
+      qs('[data-testid="current-range"]').textContent = state.currentRange;
+      qs('[data-testid="current-username"]').textContent = state.currentUsername || '-';
+      qs('[data-testid="hardware-context"]').textContent =
+         (hardware.cpu_model || 'CPU unavailable') + '; '
+         + (hardware.cpu_logical == null ? '-' : hardware.cpu_logical)
+         + ' logical CPUs; ' + (hardware.os_pretty_name || 'OS unavailable')
+         + '; memory total ' + (hardware.mem_total_kb == null
+            ? 'unavailable' : String(hardware.mem_total_kb) + ' KiB');
+      setActiveRange();
+      renderAges();
+      qs('#retry-section').hidden = true;
+   }
+
+   function renderFailure(firstLoad) {
+      state.connected = false;
+      qs('[data-testid="connectivity-status"]').textContent = firstLoad
+         ? 'Connection failure' : 'Web server disconnected';
+      qs('#retry-section').hidden = !firstLoad;
+   }
+
+   async function refreshDashboard() {
+      try {
+         render(await fetchDashboard());
+         return true;
+      } catch (_error) {
+         renderFailure(state.snapshot === null);
          return false;
       }
    }
 
-   // One-second local display timer updates age only; no fetch
-   setInterval(function() {
-      if (snapshot && receivedMonotonicMs) {
-         const elapsedSec = (performance.now() - receivedMonotonicMs) / 1000;
-         const totalAge = serverAgeAtReceiptSec + elapsedSec;
-         const valEl = qs('[data-testid="data-age-seconds"]');
-         if (valEl) valEl.textContent = 'age seconds: ' + formatAge(totalAge);
-         const freshEl = qs('[data-testid="counter-freshness"]');
-         if (freshEl && freshEl.textContent && freshEl.textContent.indexOf('Age:') === 0) {
-            freshEl.textContent = 'Age: ' + formatAge(totalAge);
-         }
-      }
-   }, 1000);
-
-   // 60-second refresh interval — started once after setup
-   function startRefresh(node, rangeName, username) {
-      if (refreshTimer) return;
-      refreshTimer = setInterval(async function() {
-         await load(node, rangeName, username);
-      }, 60000);
+   function updateSelection(node, rangeName, username) {
+      if (node) state.currentNode = node;
+      if (rangeName) state.currentRange = rangeName;
+      state.currentUsername = username ? username : null;
+      setActiveRange();
    }
 
-   // Controls
-   qsa('[data-testid="range-btn"]').forEach(function(btn) {
-      btn.addEventListener('click', async function() {
-         await load(qs('#node-input').value || 'login-04', btn.getAttribute('data-range'), qs('#user-input').value || null);
-         startRefresh(qs('#node-input').value || 'login-04', btn.getAttribute('data-range'), qs('#user-input').value || null);
+   function startTimers() {
+      if (state.ageTimer === null) {
+         state.ageTimer = setInterval(renderAges, 1000);
+      }
+      if (state.refreshTimer === null) {
+         state.refreshTimer = setInterval(refreshDashboard, 60000);
+      }
+   }
+
+   qsa('[data-testid="range-btn"]').forEach(function(button) {
+      button.addEventListener('click', async function() {
+         updateSelection(null, button.getAttribute('data-range'),
+                         qs('#user-input').value);
+         await refreshDashboard();
       });
    });
 
-   document.getElementById('node-form').addEventListener('submit', async function(e) {
-      e.preventDefault();
-      await load(qs('#node-input').value || 'login-04', '1h', qs('#user-input').value || null);
-      startRefresh(qs('#node-input').value || 'login-04', '1h', qs('#user-input').value || null);
+   qs('#node-form').addEventListener('submit', async function(event) {
+      event.preventDefault();
+      updateSelection(qs('#node-input').value, null, qs('#user-input').value);
+      await refreshDashboard();
    });
 
-   document.getElementById('user-form').addEventListener('submit', async function(e) {
-      e.preventDefault();
-      await load(qs('#node-input').value || 'login-04', '1h', qs('#user-input').value || null);
-      startRefresh(qs('#node-input').value || 'login-04', '1h', qs('#user-input').value || null);
+   qs('#user-form').addEventListener('submit', async function(event) {
+      event.preventDefault();
+      updateSelection(qs('#node-input').value, null, qs('#user-input').value);
+      await refreshDashboard();
    });
 
-   qs('#retry-btn').addEventListener('click', async function() {
-      await load(qs('#node-input').value || 'login-04', '1h', qs('#user-input').value || null);
-      startRefresh(qs('#node-input').value || 'login-04', '1h', qs('#user-input').value || null);
+   qs('#retry-btn').addEventListener('click', refreshDashboard);
+
+   window.__nodeMonitorTest = Object.freeze({
+      getTimerState: function() {
+         return Object.freeze({
+            refreshIntervals: state.refreshTimer === null ? 0 : 1,
+            ageIntervals: state.ageTimer === null ? 0 : 1,
+         });
+      },
+      getState: function() {
+         return Object.freeze({
+            node: state.currentNode,
+            range: state.currentRange,
+            username: state.currentUsername,
+            connected: state.connected,
+            receivedMonotonicMs: state.receivedMonotonicMs,
+            counterAgeAtReceiptSec: state.counterAgeAtReceiptSec,
+            usageAgeAtReceiptSec: state.usageAgeAtReceiptSec,
+         });
+      },
    });
 
-   // Initial load
-   (async function init() {
-      await load('login-04', '1h', null);
-      startRefresh('login-04', '1h', null);
-   })();
+   startTimers();
+   refreshDashboard();
 })();
