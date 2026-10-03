@@ -27,14 +27,14 @@ def _valid(url="postgresql+psycopg2://reader@localhost/node_monitor_dev"):
       "system": "polaris",
       "web": {
          "database": {
-         "url": url,
-         "schema": "node_monitor",
-         "pool_size": 1,
-         "max_overflow": 0,
-         "connect_args": {
+            "url": url,
+            "schema": "node_monitor",
+            "pool_size": 1,
+            "max_overflow": 0,
+            "connect_args": {
                "connect_timeout": 3,
                "options": "-c statement_timeout=3000 -c lock_timeout=2000",
-         },
+            },
          },
          "socket_path": "~/.node-monitor/run/web.sock",
       },

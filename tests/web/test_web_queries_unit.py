@@ -4,14 +4,14 @@ Tests cover:
   - Production JSONB shapes from writer/collector contracts (Step 1).
   - Range/node/username/quality/aggregation semantics (Step 2).
   - Parameter validation: exact ranges, inventory-based node validation,
-   256-byte UTF-8 username boundary.
+    256-byte UTF-8 username boundary.
   - SQL constant properties: no identifier binding, no SELECT *.
   - Counter row cap: 1440 accepted, 1441 rejected with QueryBoundsError.
   - Counter SQL uses LIMIT sentinel (COUNTER_ROW_LIMIT+1) to cap DB output.
   - LUSTRE_PEAK_SUM_SOURCE = "max_sum" constant and API label "peak-sum".
   - UsageResult.by_key key shape and grain attribute semantics.
   - Non-additive hotspots: rss p50/p95/max, process_count p50/p95/max,
-   interactivity_fraction with username, d_state_fraction with username.
+    interactivity_fraction with username, d_state_fraction with username.
   - Loopback exclusion is enforced by writer (not re-checked in query layer).
   - Gaps are not zero-filled (two distinct interval_end values tested).
   - Staleness thresholds including future-timestamp rejection.
@@ -277,7 +277,7 @@ def test_counter_limit_rejects_1441():
    conn = _make_conn([rows])
    with pytest.raises(QueryBoundsError, match="counter row limit exceeded"):
       load_counters(conn, "polaris", "login-04", _START, _INVENTORY,
-               now_utc=_NOW)
+                    now_utc=_NOW)
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +369,7 @@ def test_load_counters_rejects_naive_now_utc():
    naive = datetime(2026, 9, 30, 14, 0)
    with pytest.raises(QueryValidationError, match="UTC-aware"):
       load_counters(conn, "polaris", "login-04", _START, _INVENTORY,
-               now_utc=naive)
+                    now_utc=naive)
 
 
 def test_load_counters_rejects_non_datetime_now_utc():
@@ -377,7 +377,7 @@ def test_load_counters_rejects_non_datetime_now_utc():
    conn = _make_conn([[]])
    with pytest.raises(QueryValidationError, match="UTC-aware"):
       load_counters(conn, "polaris", "login-04", _START, _INVENTORY,
-               now_utc="2026-09-30T14:00:00Z")
+                    now_utc="2026-09-30T14:00:00Z")
 
 
 def test_load_counters_rejects_naive_start():
@@ -386,7 +386,7 @@ def test_load_counters_rejects_naive_start():
    naive_start = datetime(2026, 9, 30, 13, 0)
    with pytest.raises(QueryValidationError, match="UTC-aware"):
       load_counters(conn, "polaris", "login-04", naive_start, _INVENTORY,
-               now_utc=_NOW)
+                    now_utc=_NOW)
 
 
 # ---------------------------------------------------------------------------
@@ -432,8 +432,8 @@ def _make_d_row(interval_end=None, d_state_fraction=0.40, username="blocked-user
 
 
 def _make_proc_row(interval_end=None, process_count_p50=1.0,
-               process_count_p95=2.0, process_count_max=3.0,
-               username="largest-user"):
+                    process_count_p95=2.0, process_count_max=3.0,
+                    username="largest-user"):
    ie = interval_end or _END
    return {
       "interval_end": ie,
@@ -602,7 +602,7 @@ def test_usage_username_filter_is_bound_data_not_sql():
       params = c[0][1] if len(c[0]) > 1 else c[1].get("parameters", {})
       if "username" in params:
          assert params["username"] == hostile, (
-         "username must be a bound value, not embedded in SQL")
+            "username must be a bound value, not embedded in SQL")
 
 
 def test_gaps_are_not_zero_filled():
@@ -669,7 +669,7 @@ def test_usage_grain_carries_process_count_p50_and_max():
    """_UsageGrain must expose process_count_p50 and process_count_max."""
    conn = _make_usage_conn(
       proc=[_make_proc_row(process_count_p50=1.0, process_count_p95=2.0,
-                     process_count_max=3.0)],
+                            process_count_max=3.0)],
    )
    result = load_usage(conn, "polaris", "login-04", _START, _INVENTORY,
                        now_utc=_NOW)
@@ -988,7 +988,7 @@ def test_load_counters_rejects_unknown_node_before_sql():
    conn = MagicMock()
    with pytest.raises(QueryValidationError):
       load_counters(conn, "polaris", "login-99", _START, _INVENTORY,
-               now_utc=_NOW)
+                    now_utc=_NOW)
    conn.execute.assert_not_called()
 
 

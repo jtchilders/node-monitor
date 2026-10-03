@@ -147,7 +147,7 @@ def test_no_task_exception_never_retrieved_on_timeout():
 
       with pytest.raises((DashboardTimeout, asyncio.CancelledError)):
          await run_dashboard_with_deadline(
-         engine, op_that_raises_after_cancel, timeout_sec=0.05)
+            engine, op_that_raises_after_cancel, timeout_sec=0.05)
 
       gc.collect()
 
@@ -245,7 +245,7 @@ def test_worker_rollbacks_not_commit_when_cancel_requested():
 
       with pytest.raises((DashboardTimeout, asyncio.CancelledError)):
          await run_dashboard_with_deadline(
-         engine, op_returns_after_cancel, timeout_sec=0.05)
+            engine, op_returns_after_cancel, timeout_sec=0.05)
 
    asyncio.run(_run())
 
@@ -296,7 +296,7 @@ def test_cancel_failure_invalidates_before_close_even_if_op_returns_normally():
 
       with pytest.raises((DashboardTimeout, asyncio.CancelledError)):
          await run_dashboard_with_deadline(
-         engine, op_returns_after_unblock, timeout_sec=0.05)
+            engine, op_returns_after_unblock, timeout_sec=0.05)
 
    asyncio.run(_run())
 

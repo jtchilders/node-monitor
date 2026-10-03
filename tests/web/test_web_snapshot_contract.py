@@ -181,9 +181,9 @@ def test_run_dashboard_queries_hardware_select_first_on_same_conn():
 
    # Patch the load_* functions to avoid full SQL execution
    with patch("node_monitor.web.service.load_counters_for_range") as mock_ctr, \
-      patch("node_monitor.web.service.load_usage_for_range") as mock_usg, \
-      patch("node_monitor.web.service.load_poll_failures_for_range") as mock_pf, \
-      patch("node_monitor.web.service.load_collection_log_for_range") as mock_cl:
+        patch("node_monitor.web.service.load_usage_for_range") as mock_usg, \
+        patch("node_monitor.web.service.load_poll_failures_for_range") as mock_pf, \
+        patch("node_monitor.web.service.load_collection_log_for_range") as mock_cl:
 
       # Setup return values
       ctr_result = MagicMock()
@@ -257,9 +257,9 @@ def test_run_dashboard_queries_server_utc_now_has_plus_00_00():
    conn.execute.side_effect = _execute
 
    with patch("node_monitor.web.service.load_counters_for_range") as mock_ctr, \
-      patch("node_monitor.web.service.load_usage_for_range") as mock_usg, \
-      patch("node_monitor.web.service.load_poll_failures_for_range") as mock_pf, \
-      patch("node_monitor.web.service.load_collection_log_for_range") as mock_cl:
+        patch("node_monitor.web.service.load_usage_for_range") as mock_usg, \
+        patch("node_monitor.web.service.load_poll_failures_for_range") as mock_pf, \
+        patch("node_monitor.web.service.load_collection_log_for_range") as mock_cl:
 
       ctr_result = MagicMock()
       ctr_result.rows = []
@@ -351,8 +351,8 @@ def _minimal_snapshot_with_counters():
       "hardware": _minimal_hardware(),
       "counters": {
          "rows": [
-         _counter_row(row1_end),
-         _counter_row(row2_end),
+            _counter_row(row1_end),
+            _counter_row(row2_end),
          ],
          "newest_window_end": row2_end.isoformat(),
          "is_fresh": True,
@@ -668,9 +668,9 @@ def test_response_carries_usage_gap_metadata_with_deduplicated_timestamps():
       s["counters"]["is_fresh"] = False
       s["usage"] = {
          "grains": [
-         _usage_grain(end1, category="ai_coding", activity="active"),
-         _usage_grain(end1, category="build", activity="active"),
-         _usage_grain(end2, category="ai_coding", activity="active"),
+            _usage_grain(end1, category="ai_coding", activity="active"),
+            _usage_grain(end1, category="build", activity="active"),
+            _usage_grain(end2, category="ai_coding", activity="active"),
          ],
          "newest_interval_end": end2.isoformat(),
          "is_fresh": True,
@@ -715,8 +715,8 @@ def test_usage_gap_metadata_zero_when_contiguous():
       s["counters"]["is_fresh"] = False
       s["usage"] = {
          "grains": [
-         _usage_grain(end1),
-         _usage_grain(end2),
+            _usage_grain(end1),
+            _usage_grain(end2),
          ],
          "newest_interval_end": end2.isoformat(),
          "is_fresh": True,

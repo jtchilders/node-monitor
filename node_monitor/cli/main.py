@@ -1343,36 +1343,71 @@ def _run_daemon_postgres(nested, config_path, run_id, probe_version, home,
               type=click.Path(dir_okay=False, exists=True),
               help="Path to the web-only YAML config file.")
 def web_command(config_path):
-   """Run the private web dashboard service (Task 6)."""
    import os
-   from node_monitor.config import load_web_config
-   from node_monitor.database.web import WebDatabase
+   from node_monitor.config import load_web_config, ConfigError
+   from node_monitor.database.web import WebDatabase, WebDatabaseError
    from node_monitor.web.service import DashboardService
    from node_monitor.web.app import create_app
    from node_monitor.web.runtime import run_uvicorn
-   from node_monitor.web.socket import bind_private_socket
+   from node_monitor.web.socket import bind_private_socket, SocketError
 
-   config = load_web_config(config_path)
-   db = WebDatabase(config.database)
+   config = None
+   db = None
    service = None
    app = None
    sock = None
+   # Config preflight
+   try:
+      config = load_web_config(config_path)
+   except (ConfigError, WebDatabaseError, SocketError) as exc:
+      click.echo("preflight failed: %s" % exc, err=True)
+      sys.exit(1)
+   # DB preflight with dispose on failure; never binds
+   db = WebDatabase(config.database)
    try:
       db.preflight()
+   except Exception as exc:
+      click.echo("database preflight failed: %s" % exc, err=True)
+      try:
+         db.dispose()
+      except Exception:
+         pass
+      sys.exit(1)
+   # Service/app construction
+   try:
       service = DashboardService(db, system=config.system)
       app = create_app(service)
       sock = bind_private_socket(config.socket_path)
-      click.echo("PID %d" % os.getpid())
-      click.echo("socket %s" % os.path.abspath(config.socket_path))
+   except (ConfigError, WebDatabaseError, SocketError) as exc:
+      click.echo("service initialization failed: %s" % exc, err=True)
+      for target in (sock, db):
+         try:
+            if sock is not None:
+               sock.close()
+         except Exception:
+            pass
+         try:
+            if db is not None:
+               db.dispose()
+         except Exception:
+            pass
+      sys.exit(1)
+   # One bounded startup line: PID + expanded socket path
+   click.echo("PID %d socket %s" % (os.getpid(), os.path.abspath(config.socket_path)))
+   try:
       run_uvicorn(app, sock)
    finally:
+      # Cleanup: close socket, then dispose DB — deterministic precedence.
       if sock is not None:
          try:
             sock.close()
          except Exception:
             pass
       if db is not None:
-         db.dispose()
+         try:
+            db.dispose()
+         except Exception:
+            pass
 
 
 def main():
