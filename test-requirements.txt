@@ -1,0 +1,6 @@
+# Test-only dependencies for web packaging/browser tests (Task 6)
+# Keep Playwright/build tooling out of production runtime requirements.
+pytest>=7.0.0
+build
+wheel
+importlib-resources>=5.0

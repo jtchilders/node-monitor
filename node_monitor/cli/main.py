@@ -88,7 +88,6 @@ from node_monitor.daemon_control import (
    current_process_start_ticks,
 )
 from node_monitor.database.connection import NodeMonitorDB
-from node_monitor.database.migration import MigrationError, MigrationRunner
 from node_monitor.database.writer import DatabaseWriter
 from node_monitor.output.jsonl import (
    Phase0Sink,
@@ -754,6 +753,7 @@ def _create_migration_engine(database):
 
 
 def _run_database_command(config_path, home, operation):
+   from node_monitor.database.migration import MigrationError, MigrationRunner
    home = home if home is not None else os.path.expanduser("~")
    database_config = _load_database_config_or_exit(config_path, home)
    engine = None
@@ -1175,6 +1175,7 @@ class _EngineAdapter:
 
 
 def _schema_gate_or_exit(engine, app_version):
+   from node_monitor.database.migration import MigrationError, MigrationRunner
    """Run ``MigrationRunner.status()`` read-only.
 
    Returns normally when the schema is fully current:
@@ -1357,18 +1358,20 @@ def web_command(config_path):
    try:
       db.preflight()
    finally:
-      pass
+      db.dispose()
 
    service = DashboardService(db, system=config.system)
    app = create_app(service)
 
-   sock = bind_private_socket(config.socket_path)
+   sock = None
    try:
+      sock = bind_private_socket(config.socket_path)
       click.echo("PID %d" % os.getpid())
       click.echo("socket %s" % os.path.abspath(config.socket_path))
       run_uvicorn(app, sock)
    finally:
-      sock.close()
+      if sock is not None:
+         sock.close()
 
 
 def main():

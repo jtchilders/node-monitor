@@ -23,8 +23,6 @@ def create_app(service):
          raise HTTPException(status_code=422, detail="invalid dashboard request") from None
       except DashboardServiceError:
          raise HTTPException(status_code=503, detail="dashboard refresh failed") from None
-      except Exception:
-         raise HTTPException(status_code=503, detail="dashboard refresh failed") from None
 
    # Exact static allowlist only
    static_dir = os.path.join(_APP_DIR, "static")
