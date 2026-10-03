@@ -1,0 +1,6 @@
+[build-system]
+# setuptools>=61 is required to produce Requires-Dist headers in the
+# top-level sdist PKG-INFO (older versions emit them only in egg-info).
+# wheel is the standard backend for building wheels.
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"

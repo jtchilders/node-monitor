@@ -1,3 +1,4 @@
+include pyproject.toml
 include requirements.txt
 include node_monitor/web/static/index.html
 include node_monitor/web/static/styles.css

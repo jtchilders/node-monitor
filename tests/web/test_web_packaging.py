@@ -314,22 +314,41 @@ def _extract_wheel_metadata(wheel_path):
 
 
 def _extract_sdist_pkginfo(sdist_path):
-   """Return the PKG-INFO text from the sdist (top-level PKG-INFO)."""
+   """Return the top-level PKG-INFO text from the sdist.
+
+   The top-level PKG-INFO is the one at the root of the sdist archive
+   (e.g. node_monitor-0.1.0/PKG-INFO), not the egg-info copy.
+   With setuptools>=61, this file contains all Requires-Dist headers.
+   """
    with tarfile.open(sdist_path, "r:gz") as tf:
-      for member in tf.getmembers():
-         if member.name.endswith("PKG-INFO"):
-            f = tf.extractfile(member)
-            if f:
-               return f.read().decode("utf-8", errors="replace")
+      # Collect all PKG-INFO members, prefer the top-level one
+      # (depth == 2 path components: <pkg-version>/PKG-INFO)
+      candidates = [
+         m for m in tf.getmembers()
+         if m.name.endswith("/PKG-INFO") or m.name == "PKG-INFO"
+      ]
+      # Sort by path depth; top-level PKG-INFO has fewest components
+      candidates.sort(key=lambda m: m.name.count("/"))
+      for member in candidates:
+         # Exclude egg-info copies
+         if "egg-info" in member.name:
+            continue
+         f = tf.extractfile(member)
+         if f:
+            return f.read().decode("utf-8", errors="replace")
+      # Fallback: try any PKG-INFO
+      for member in candidates:
+         f = tf.extractfile(member)
+         if f:
+            return f.read().decode("utf-8", errors="replace")
    raise AssertionError("PKG-INFO not found in sdist: %s" % sdist_path)
 
 
 def _extract_sdist_requires(sdist_path):
-   """Return the requires.txt content from the sdist egg-info.
+   """Return the requires.txt content from the sdist egg-info (supplemental).
 
-   For legacy setup.py packages, Requires-Dist is often absent from PKG-INFO
-   but the egg-info/requires.txt carries the actual install_requires list.
-   Parse it to produce the same normalized set of package names.
+   egg-info/requires.txt is checked for consistency with the top-level
+   PKG-INFO Requires-Dist headers.  It is optional (not all builds emit it).
    """
    with tarfile.open(sdist_path, "r:gz") as tf:
       for member in tf.getmembers():
@@ -429,13 +448,13 @@ def test_wheel_metadata_production_deps():
 
 
 def test_sdist_pkginfo_production_deps():
-   """Sdist: all expected production deps present in egg-info/requires.txt;
-   no test-only packages; requirements.txt present in sdist.
+   """Sdist: all expected production deps present in top-level PKG-INFO
+   Requires-Dist headers; no test-only packages; requirements.txt present
+   in sdist.
 
-   Note: Legacy setup.py sdists embed install_requires in egg-info/requires.txt
-   rather than as Requires-Dist headers in PKG-INFO.  Both formats are checked:
-   the PKG-INFO is inspected for existence and the requires.txt carries the
-   authoritative dependency list for this package format.
+   The top-level PKG-INFO is the authoritative metadata for the sdist
+   (pyproject.toml declares setuptools>=61 which emits Requires-Dist there).
+   egg-info/requires.txt is checked as a supplemental consistency assertion.
    """
    with tempfile.TemporaryDirectory() as tmp:
       outdir = os.path.join(tmp, "dist")
@@ -455,20 +474,25 @@ def test_sdist_pkginfo_production_deps():
 
       sdist_path = os.path.join(outdir, sdists[0])
 
-      # Check PKG-INFO exists
-      _extract_sdist_pkginfo(sdist_path)  # raises AssertionError if missing
+      # Primary assertion: top-level PKG-INFO must contain all 8 Requires-Dist.
+      pkginfo_text = _extract_sdist_pkginfo(sdist_path)
+      _assert_metadata_production_deps(pkginfo_text, "sdist PKG-INFO")
 
-      # For legacy setup.py sdists, Requires-Dist headers may be absent from
-      # PKG-INFO; the authoritative dependency list is in egg-info/requires.txt.
+      # Supplemental: egg-info/requires.txt must also be consistent.
       requires_txt = _extract_sdist_requires(sdist_path)
-      assert requires_txt is not None, (
-         "egg-info/requires.txt not found in sdist; cannot verify production deps"
-      )
-      _assert_requires_txt_production_deps(requires_txt, "sdist egg-info/requires.txt")
+      if requires_txt is not None:
+         _assert_requires_txt_production_deps(requires_txt, "sdist egg-info/requires.txt")
+
       _assert_sdist_contains_requirements_txt(sdist_path)
+
       # Print for report
-      print("\n--- sdist egg-info/requires.txt ---")
-      print(requires_txt)
+      print("\n--- sdist PKG-INFO Requires-Dist ---")
+      for line in pkginfo_text.splitlines():
+         if line.startswith("Requires-Dist"):
+            print(line)
+      if requires_txt:
+         print("\n--- sdist egg-info/requires.txt (supplemental) ---")
+         print(requires_txt)
 
 
 def test_red_evidence_missing_metadata_fixture():
