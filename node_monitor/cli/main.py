@@ -1372,17 +1372,28 @@ def web_command(config_path):
    # Config preflight
    try:
       config = load_web_config(config_path)
-   except (ConfigError, WebDatabaseError, SocketError) as exc:
-      click.echo("preflight failed: %s" % exc, err=True)
+   except (ConfigError, yaml.YAMLError) as exc:
+      click.echo("preflight failed", err=True)
       sys.exit(1)
-   # DB preflight with dispose on failure; never binds
-   db = WebDatabase(config.database)
+   # DB preflight with protected boundary: construct inside try, dispose on every failure
+   db = None
+   try:
+      db = WebDatabase(config.database)
+   except Exception:
+      click.echo("database initialization failed", err=True)
+      try:
+         if db is not None:
+            db.dispose()
+      except Exception:
+         pass
+      sys.exit(1)
    try:
       db.preflight()
    except Exception:
       click.echo("database preflight failed", err=True)
       try:
-         db.dispose()
+         if db is not None:
+            db.dispose()
       except Exception:
          pass
       sys.exit(1)
@@ -1391,7 +1402,7 @@ def web_command(config_path):
       service = DashboardService(db, system=config.system)
       app = create_app(service)
       sock = bind_private_socket(config.socket_path)
-   except (ConfigError, WebDatabaseError, SocketError, OSError, PermissionError) as exc:
+   except (ConfigError, WebDatabaseError, SocketError, OSError, PermissionError, RuntimeError) as exc:
       msg = "service initialization failed"
       click.echo(msg, err=True)
       try:
@@ -1409,6 +1420,9 @@ def web_command(config_path):
    click.echo("PID %d socket %s" % (os.getpid(), os.path.abspath(config.socket_path)))
    try:
       run_uvicorn(app, sock)
+   except RuntimeError:
+      click.echo("service initialization failed", err=True)
+      raise SystemExit(1)
    finally:
       # Cleanup: close socket, then dispose DB — deterministic precedence.
       if sock is not None:

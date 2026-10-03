@@ -29,6 +29,7 @@ from click.testing import CliRunner
 
 import node_monitor.cli.main as cli_module
 from node_monitor.cli.main import cli
+from node_monitor.database.migration import MigrationError
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +193,7 @@ def _patch_daemon_run(
                return _sr
          runner_class = RunnerWithStatus
 
-   monkeypatch.setattr(cli_module, "MigrationRunner", runner_class)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, runner_class))
 
    _diag_sink = _DiagnosticSink()
    captures["diag_sink"] = _diag_sink
@@ -468,7 +469,7 @@ def test_daemon_run_status_exception_sanitized(tmp_path, monkeypatch):
       def migrate(self):
          raise AssertionError("migrate must not be called")
 
-   monkeypatch.setattr(cli_module, "MigrationRunner", BadRunner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, BadRunner))
 
    result = _invoke([
       "daemon", "run",
@@ -508,11 +509,11 @@ def test_daemon_run_never_calls_migrate(tmp_path, monkeypatch):
          migrate_calls.append(1)
          raise AssertionError("migrate() was called!")
 
-   monkeypatch.setattr(cli_module, "MigrationRunner", Runner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, Runner))
    # Patch the rest to no-ops
    _patch_daemon_run(monkeypatch, tmp_path)
    # Re-apply the specific ones needed (monkeypatch is cumulative)
-   monkeypatch.setattr(cli_module, "MigrationRunner", Runner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, Runner))
 
    # With patched runner
    captures = _patch_daemon_run(monkeypatch, tmp_path, daemon_exit_code=0)
@@ -655,7 +656,7 @@ def test_daemon_dry_run_never_constructs_engine_or_runner(monkeypatch):
          runner_constructed.append(1)
          raise AssertionError("daemon dry-run constructed MigrationRunner")
 
-   monkeypatch.setattr(cli_module, "MigrationRunner", ForbiddenRunner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, ForbiddenRunner))
 
    result = _invoke(["daemon", "dry-run", "--help"])
    assert result.exit_code == 0
@@ -675,7 +676,7 @@ def test_daemon_smoke_never_constructs_engine_or_runner(monkeypatch):
          runner_constructed.append(1)
          raise AssertionError("daemon smoke constructed MigrationRunner")
 
-   monkeypatch.setattr(cli_module, "MigrationRunner", ForbiddenRunner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, ForbiddenRunner))
 
    result = _invoke(["daemon", "smoke", "--help"])
    assert result.exit_code == 0
@@ -694,7 +695,7 @@ def test_daemon_run_help_never_constructs_engine_or_runner(monkeypatch):
       def __init__(self, *args, **kwargs):
          runner_constructed.append(1)
 
-   monkeypatch.setattr(cli_module, "MigrationRunner", ForbiddenRunner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, ForbiddenRunner))
 
    result = _invoke(["daemon", "run", "--help"])
    assert result.exit_code == 0
@@ -759,7 +760,7 @@ def test_daemon_run_engine_disposed_on_runner_construction_error(
       def migrate(self):
          raise AssertionError
 
-   monkeypatch.setattr(cli_module, "MigrationRunner", FailingRunner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, FailingRunner))
 
    result = _invoke([
       "daemon", "run",
@@ -793,7 +794,7 @@ def test_database_writer_receives_engine_backed_begin(tmp_path, monkeypatch):
       def migrate(self):
          raise AssertionError
 
-   monkeypatch.setattr(cli_module, "MigrationRunner", Runner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, Runner))
 
    real_DBWriter = cli_module.__dict__.get("DatabaseWriter")
 
@@ -875,7 +876,7 @@ def test_daemon_run_never_prints_db_url(tmp_path, monkeypatch):
       def migrate(self):
          raise AssertionError
 
-   monkeypatch.setattr(cli_module, "MigrationRunner", Runner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, Runner))
 
    result = _invoke([
       "daemon", "run",
@@ -1259,7 +1260,7 @@ def test_dry_run_real_invocation_never_creates_engine_or_runner(
          runner_constructed.append(1)
          raise AssertionError("daemon dry-run must never construct MigrationRunner")
 
-   monkeypatch.setattr(cli_module, "MigrationRunner", ForbiddenRunner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, ForbiddenRunner))
 
    result = _invoke_isolation([
       "daemon", "dry-run",
@@ -1297,7 +1298,7 @@ def test_smoke_real_invocation_never_creates_engine_or_runner(
          runner_constructed.append(1)
          raise AssertionError("daemon smoke must never construct MigrationRunner")
 
-   monkeypatch.setattr(cli_module, "MigrationRunner", ForbiddenRunner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, ForbiddenRunner))
 
    result = _invoke_isolation([
       "daemon", "smoke",

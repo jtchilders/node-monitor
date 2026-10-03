@@ -9,6 +9,7 @@ from click.testing import CliRunner
 import node_monitor.cli.main as cli_module
 from node_monitor.cli.main import cli
 from node_monitor.database.migration import (
+   MigrationError,
    MigrationApplyError,
    MigrationDriftError,
    MigrationLockError,
@@ -74,7 +75,7 @@ def test_database_status_loads_nested_config_and_is_read_only(tmp_path, monkeypa
          raise AssertionError("status must never migrate")
 
    monkeypatch.setattr(cli_module, "_create_migration_engine", fake_engine)
-   monkeypatch.setattr(cli_module, "MigrationRunner", Runner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, Runner))
    result = _invoke(["database", "status", "--config", config_path,
                      "--home", str(tmp_path)])
 
@@ -106,7 +107,7 @@ def test_database_migrate_uses_file_url_over_environment(tmp_path, monkeypatch):
             applied_versions=(1,), current_version=1, latest_version=1)
 
    monkeypatch.setattr(cli_module, "_create_migration_engine", fake_engine)
-   monkeypatch.setattr(cli_module, "MigrationRunner", Runner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, Runner))
    result = _invoke(
       ["database", "migrate", "--config", config_path,
        "--home", str(tmp_path)],
@@ -142,7 +143,7 @@ def test_database_uses_environment_url_when_file_omits_it(tmp_path, monkeypatch)
             pending_versions=(1,), drift=False)
 
    monkeypatch.setattr(cli_module, "_create_migration_engine", fake_engine)
-   monkeypatch.setattr(cli_module, "MigrationRunner", Runner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, Runner))
    env_url = "postgresql://env_user:env_password@envhost/node_monitor"
    result = _invoke(
       ["database", "status", "--config", config_path,
@@ -180,7 +181,7 @@ def test_database_failures_are_nonzero_and_sanitized(tmp_path, monkeypatch):
             "migration failed; rejected credential %s" % secret)
 
    monkeypatch.setattr(cli_module, "_create_migration_engine", lambda config: _Engine())
-   monkeypatch.setattr(cli_module, "MigrationRunner", Runner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, Runner))
    result = _invoke(["database", "migrate", "--config", config_path,
                      "--home", str(tmp_path)])
    assert result.exit_code != 0
@@ -202,7 +203,7 @@ def test_database_lock_and_drift_fail_nonzero(tmp_path, monkeypatch, error):
          raise error
 
    monkeypatch.setattr(cli_module, "_create_migration_engine", lambda config: _Engine())
-   monkeypatch.setattr(cli_module, "MigrationRunner", Runner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, Runner))
    result = _invoke(["database", "migrate", "--config", config_path,
                      "--home", str(tmp_path)])
    assert result.exit_code != 0
@@ -219,7 +220,7 @@ def test_daemon_dry_run_and_smoke_never_construct_migration_runner(monkeypatch):
       def __init__(self, *args, **kwargs):
          raise AssertionError("JSONL-only path constructed MigrationRunner")
 
-   monkeypatch.setattr(cli_module, "MigrationRunner", ForbiddenRunner)
+   monkeypatch.setattr(cli_module, "_migration_api", (MigrationError, ForbiddenRunner))
 
    result_help = _invoke(["daemon", "--help"])
    assert result_help.exit_code == 0
