@@ -280,6 +280,14 @@
       // Per-name render counts
       renders: {},
    };
+   // Current render state: mode and last rendered datasets per chart
+   // Used by getChartRenderState() test API
+   const chartRenderState = {
+      cpu: { mode: 'cpu', labels: [], datasets: [] },
+      memory: { mode: 'mem-mode-gib', labels: [], datasets: [] },
+      process: { mode: 'proc-mode-cpusum', labels: [], datasets: [], contributorSummary: null },
+      networkLustre: { mode: 'nl-mode-network', labels: [], datasets: [] },
+   };
 
    function replaceChart(name, canvasId, config) {
       const canvas = document.getElementById(canvasId);
@@ -400,11 +408,12 @@
 
       // Build aggregated interval objects: one per distinct interval_end
       // processCPU: SUM of cpu_seconds (additive)
-      // dState, countMax, rssMax, countP50, countP95, rssP50, rssP95:
+      // dState, interactivity, countMax, rssMax, countP50, countP95, rssP50, rssP95:
       //   MAX-grain selection with independently attributed username
       const aggregatedIntervals = sortedIntervalEnds.map(function(iend) {
          var cpuSum = null;
          var dStateFrac = null, dStateUser = null;
+         var interactFrac = null, interactUser = null;
          var cntMax = null, cntMaxUser = null;
          var cntP50 = null, cntP50User = null;
          var cntP95 = null, cntP95User = null;
@@ -425,6 +434,13 @@
                 (dStateFrac === null || g.d_state_fraction > dStateFrac)) {
                dStateFrac = g.d_state_fraction;
                dStateUser = g.d_state_username || null;
+            }
+
+            // interactivity_fraction: maximum grain wins (observation-weighted per grain)
+            if (g.interactivity_fraction != null &&
+                (interactFrac === null || g.interactivity_fraction > interactFrac)) {
+               interactFrac = g.interactivity_fraction;
+               interactUser = g.interactivity_username || null;
             }
 
             // process_count_max: hotspot grain wins independently
@@ -474,6 +490,7 @@
             interval_end: iend,
             cpuSum: cpuSum,
             dStateFrac: dStateFrac, dStateUser: dStateUser,
+            interactFrac: interactFrac, interactUser: interactUser,
             cntMax: cntMax, cntMaxUser: cntMaxUser,
             cntP50: cntP50, cntP50User: cntP50User,
             cntP95: cntP95, cntP95User: cntP95User,
@@ -489,6 +506,16 @@
             interval_end: iv.interval_end,
             value: iv.dStateFrac,
             username: iv.dStateUser,
+         };
+      });
+
+      // Interactivity: one point per distinct interval, max fraction + winning username
+      // observation-weighted per stored grain; not node-wide or clock-time weighted
+      const interactivityPoints = aggregatedIntervals.map(function(iv) {
+         return {
+            interval_end: iv.interval_end,
+            value: iv.interactFrac,
+            username: iv.interactUser,
          };
       });
 
@@ -537,7 +564,7 @@
       });
       const ifaceList = Object.keys(ifaceSet).sort();
 
-      // Build per-interface RX/TX p50 time series over expanded labels
+      // Build per-interface RX/TX p50/p95/max time series over expanded labels
       const networkRXP50 = {};
       const networkTXP50 = {};
       const networkRXP95 = {};
@@ -647,6 +674,7 @@
          memoryUsedKbLatest: memoryUsedKbLatest,
          dStatePoints: dStatePoints,
          dStateGrains: grains,
+         interactivityPoints: interactivityPoints,
          processGrains: grains,
          processLabels: processLabels,
          processCPU: processCPU,
@@ -682,11 +710,52 @@
       };
    }
 
+   // ---- D-state/Interactivity hotspot table update ----
+   // Renders/updates the table inside the CPU chart article
+   function updateDStateHotspotTable(dStatePoints, interactivityPoints) {
+      var table = document.querySelector('[data-testid="dstate-hotspot-table"]');
+      if (!table) return;
+
+      // Build rows HTML
+      var rows = '';
+      var points = dStatePoints || [];
+      var iPoints = interactivityPoints || [];
+      // Align by index (both arrays have same length - one per interval)
+      var len = Math.max(points.length, iPoints.length);
+      for (var i = 0; i < len; i++) {
+         var dp = points[i] || {};
+         var ip = iPoints[i] || {};
+         var interval = dp.interval_end || ip.interval_end || '-';
+         var dsVal = dp.value != null ? (dp.value * 100).toFixed(1) + '%' : '-';
+         var dsUser = dp.username || '-';
+         var intVal = ip.value != null ? (ip.value * 100).toFixed(1) + '%' : '-';
+         var intUser = ip.username || '-';
+         rows += '<tr>'
+            + '<td>' + interval.slice(0, 16) + '</td>'
+            + '<td>' + dsVal + '</td>'
+            + '<td>' + dsUser + '</td>'
+            + '<td>' + intVal + '</td>'
+            + '<td>' + intUser + '</td>'
+            + '</tr>';
+      }
+      if (len === 0) {
+         rows = '<tr><td colspan="5">No D-state/interactivity data in range</td></tr>';
+      }
+
+      var tbody = table.querySelector('tbody');
+      if (tbody) {
+         tbody.innerHTML = rows;
+      }
+   }
+
    // ---- Chart rendering ----
 
    function renderCharts(snapshot) {
       const input = buildChartData(snapshot);
       const totalKb = input.memoryTotalKb;
+
+      // Update D-state hotspot table
+      updateDStateHotspotTable(input.dStatePoints, input.interactivityPoints);
 
       // 1. CPU / Load chart
       replaceChart('cpu', 'chart-cpu', {
@@ -791,6 +860,11 @@
             },
          },
       });
+      chartRenderState.cpu = {
+         mode: 'cpu',
+         labels: input.cpu.labels.slice(),
+         datasets: [],
+      };
 
       // 2. Memory chart (GiB, with optional Percent toggle)
       (function() {
@@ -832,30 +906,32 @@
          const memAvailDisplay = input.memoryAvailableSeries.map(toDisplayVal);
          const yLabel = isPercent ? 'Percent (%)' : 'GiB';
 
+         const memDatasets = [
+            {
+               label: 'Used (' + yLabel + ')',
+               data: memUsedDisplay,
+               borderColor: '#880000',
+               backgroundColor: 'rgba(136,0,0,0.1)',
+               spanGaps: false,
+               pointStyle: 'rect',
+               fill: false,
+            },
+            {
+               label: 'Available (' + yLabel + ')',
+               data: memAvailDisplay,
+               borderColor: '#005fcc',
+               backgroundColor: 'rgba(0,95,204,0.1)',
+               spanGaps: false,
+               pointStyle: 'circle',
+               fill: false,
+            },
+         ];
+
          replaceChart('memory', 'chart-memory', {
             type: 'line',
             data: {
                labels: input.memoryLabels,
-               datasets: [
-                  {
-                     label: 'Used (' + yLabel + ')',
-                     data: memUsedDisplay,
-                     borderColor: '#880000',
-                     backgroundColor: 'rgba(136,0,0,0.1)',
-                     spanGaps: false,
-                     pointStyle: 'rect',
-                     fill: false,
-                  },
-                  {
-                     label: 'Available (' + yLabel + ')',
-                     data: memAvailDisplay,
-                     borderColor: '#005fcc',
-                     backgroundColor: 'rgba(0,95,204,0.1)',
-                     spanGaps: false,
-                     pointStyle: 'circle',
-                     fill: false,
-                  },
-               ],
+               datasets: memDatasets,
             },
             options: {
                responsive: true,
@@ -879,6 +955,13 @@
                },
             },
          });
+         chartRenderState.memory = {
+            mode: mode,
+            labels: input.memoryLabels.slice(),
+            datasets: memDatasets.map(function(ds) {
+               return { label: ds.label, data: ds.data.slice() };
+            }),
+         };
 
          // Re-bind toggle handlers each time (buttons may be recreated)
          memControls.querySelectorAll('button').forEach(function(btn) {
@@ -929,18 +1012,20 @@
             usernameArr = null;
          }
 
+         const procDatasets = [
+            {
+               label: yText,
+               data: dataArr,
+               backgroundColor: '#005fcc',
+               spanGaps: false,
+            },
+         ];
+
          replaceChart('process', 'chart-process', {
             type: 'bar',
             data: {
                labels: input.processLabels,
-               datasets: [
-                  {
-                     label: yText,
-                     data: dataArr,
-                     backgroundColor: '#005fcc',
-                     spanGaps: false,
-                  },
-               ],
+               datasets: procDatasets,
             },
             options: {
                responsive: true,
@@ -965,6 +1050,14 @@
                },
             },
          });
+         chartRenderState.process = {
+            mode: mode,
+            labels: input.processLabels.slice(),
+            datasets: procDatasets.map(function(ds) {
+               return { label: ds.label, data: ds.data ? ds.data.slice() : [] };
+            }),
+            contributorSummary: usernameArr ? usernameArr.slice() : null,
+         };
 
          procControls.querySelectorAll('button').forEach(function(btn) {
             btn.addEventListener('click', function() {
@@ -978,6 +1071,8 @@
       })();
 
       // 4. Network / Lustre chart (mode toggle)
+      // Network has three statistic sub-modes: p50, p95, max
+      // Lustre sub-modes: p50-sum, p95-sum, peak-sum, target-count
       (function() {
          let nlControls = document.getElementById('nl-controls');
          if (!nlControls) {
@@ -985,7 +1080,11 @@
             nlControls.id = 'nl-controls';
             nlControls.setAttribute('data-testid', 'nl-controls');
             nlControls.innerHTML =
-               '<button type="button" data-testid="nl-mode-network" aria-pressed="true">Network (p50)</button>'
+               // Network family (three statistic modes)
+               '<button type="button" data-testid="nl-network-p50" aria-pressed="true">Network (p50)</button>'
+               + '<button type="button" data-testid="nl-network-p95" aria-pressed="false">Network (p95)</button>'
+               + '<button type="button" data-testid="nl-network-max" aria-pressed="false">Network (max)</button>'
+               // Lustre family
                + '<button type="button" data-testid="nl-mode-lustre-p50" aria-pressed="false">Lustre p50-sum</button>'
                + '<button type="button" data-testid="nl-mode-lustre-p95" aria-pressed="false">Lustre p95-sum</button>'
                + '<button type="button" data-testid="nl-mode-lustre-peak" aria-pressed="false">Lustre peak-sum</button>'
@@ -994,10 +1093,17 @@
             if (canvas && canvas.parentElement) {
                canvas.parentElement.insertBefore(nlControls, canvas);
             }
+
+            // --- BACKWARD COMPAT: keep nl-mode-network button functional ---
+            // Tests using nl-mode-network testid still work via the button group logic below
          }
 
          const activeBtn = nlControls.querySelector('button[aria-pressed="true"]');
-         const mode = activeBtn ? activeBtn.getAttribute('data-testid') : 'nl-mode-network';
+         // Determine active mode using data-testid
+         const mode = activeBtn ? activeBtn.getAttribute('data-testid') : 'nl-network-p50';
+
+         // Also support legacy nl-mode-network as alias for nl-network-p50
+         const effectiveMode = mode === 'nl-mode-network' ? 'nl-network-p50' : mode;
 
          const nlLabels = input.networkLabels.length ? input.networkLabels : ['—'];
          const datasets = [];
@@ -1006,7 +1112,7 @@
          const colors = ['#005fcc', '#cc6600', '#228833', '#880000', '#660099', '#aa8800'];
          const dashes = [[], [6, 4], [2, 2], [8, 2, 2, 2], [4, 4], [10, 2]];
 
-         if (mode === 'nl-mode-network') {
+         if (effectiveMode === 'nl-network-p50') {
             // Per-interface RX/TX p50 time series (default)
             input.ifaceList.forEach(function(iface, idx) {
                const rxColor = colors[idx * 2 % colors.length];
@@ -1030,10 +1136,59 @@
                   pointStyle: 'rectRot',
                });
             });
-         } else if (mode === 'nl-mode-lustre-p50') {
+         } else if (effectiveMode === 'nl-network-p95') {
+            // Per-interface RX/TX p95 time series
+            input.ifaceList.forEach(function(iface, idx) {
+               const rxColor = colors[idx * 2 % colors.length];
+               const txColor = colors[(idx * 2 + 1) % colors.length];
+               datasets.push({
+                  label: iface + ' RX p95 (B/s)',
+                  data: input.networkRXP95[iface],
+                  borderColor: rxColor,
+                  backgroundColor: rxColor,
+                  borderDash: dashes[idx % dashes.length],
+                  spanGaps: false,
+                  pointStyle: 'circle',
+               });
+               datasets.push({
+                  label: iface + ' TX p95 (B/s)',
+                  data: input.networkTXP95[iface],
+                  borderColor: txColor,
+                  backgroundColor: txColor,
+                  borderDash: dashes[(idx + 1) % dashes.length],
+                  spanGaps: false,
+                  pointStyle: 'rectRot',
+               });
+            });
+         } else if (effectiveMode === 'nl-network-max') {
+            // Per-interface RX/TX max time series
+            input.ifaceList.forEach(function(iface, idx) {
+               const rxColor = colors[idx * 2 % colors.length];
+               const txColor = colors[(idx * 2 + 1) % colors.length];
+               datasets.push({
+                  label: iface + ' RX max (B/s)',
+                  data: input.networkRXMax[iface],
+                  borderColor: rxColor,
+                  backgroundColor: rxColor,
+                  borderDash: dashes[idx % dashes.length],
+                  spanGaps: false,
+                  pointStyle: 'circle',
+               });
+               datasets.push({
+                  label: iface + ' TX max (B/s)',
+                  data: input.networkTXMax[iface],
+                  borderColor: txColor,
+                  backgroundColor: txColor,
+                  borderDash: dashes[(idx + 1) % dashes.length],
+                  spanGaps: false,
+                  pointStyle: 'rectRot',
+               });
+            });
+         } else if (effectiveMode === 'nl-mode-lustre-p50') {
+            // p50-sum is sum of per-target p50 values (NOT maxima)
             input.lustreOps.forEach(function(op, idx) {
                datasets.push({
-                  label: op + ' p50-sum (caveat: sum of per-target maxima)',
+                  label: op + ' p50-sum (sum of per-target p50)',
                   data: input.lustreP50Sum[op],
                   borderColor: colors[idx % colors.length],
                   backgroundColor: colors[idx % colors.length],
@@ -1042,10 +1197,11 @@
                   pointStyle: 'circle',
                });
             });
-         } else if (mode === 'nl-mode-lustre-p95') {
+         } else if (effectiveMode === 'nl-mode-lustre-p95') {
+            // p95-sum is sum of per-target p95 values (NOT maxima)
             input.lustreOps.forEach(function(op, idx) {
                datasets.push({
-                  label: op + ' p95-sum (caveat: sum of per-target maxima)',
+                  label: op + ' p95-sum (sum of per-target p95)',
                   data: input.lustreP95Sum[op],
                   borderColor: colors[idx % colors.length],
                   backgroundColor: colors[idx % colors.length],
@@ -1054,10 +1210,11 @@
                   pointStyle: 'rectRot',
                });
             });
-         } else if (mode === 'nl-mode-lustre-peak') {
+         } else if (effectiveMode === 'nl-mode-lustre-peak') {
+            // peak-sum/max_sum: sum of per-target maxima (correct - this is where maxima caveat belongs)
             input.lustreOps.forEach(function(op, idx) {
                datasets.push({
-                  label: op + ' peak-sum/max_sum (caveat: sum of per-target maxima)',
+                  label: op + ' peak-sum/max_sum (sum of per-target maxima)',
                   data: input.lustreMaxSum[op],
                   borderColor: colors[idx % colors.length],
                   backgroundColor: colors[idx % colors.length],
@@ -1066,7 +1223,7 @@
                   pointStyle: 'triangle',
                });
             });
-         } else if (mode === 'nl-mode-lustre-targets') {
+         } else if (effectiveMode === 'nl-mode-lustre-targets') {
             input.lustreOps.forEach(function(op, idx) {
                datasets.push({
                   label: op + ' target_count',
@@ -1079,6 +1236,10 @@
                });
             });
          }
+
+         const nlYText = (effectiveMode === 'nl-network-p50' || effectiveMode === 'nl-network-p95' || effectiveMode === 'nl-network-max')
+            ? 'Bytes/sec (' + effectiveMode.replace('nl-network-', '') + ')'
+            : 'Sum / count';
 
          replaceChart('networkLustre', 'chart-network-lustre', {
             type: 'line',
@@ -1094,7 +1255,7 @@
                      beginAtZero: true,
                      title: {
                         display: true,
-                        text: mode === 'nl-mode-network' ? 'Bytes/sec (p50)' : 'Sum / count',
+                        text: nlYText,
                      },
                   },
                },
@@ -1110,6 +1271,14 @@
                },
             },
          });
+         // Store effective mode for getChartRenderState
+         chartRenderState.networkLustre = {
+            mode: effectiveMode,
+            labels: nlLabels.slice(),
+            datasets: datasets.map(function(ds) {
+               return { label: ds.label, data: ds.data ? ds.data.slice() : [] };
+            }),
+         };
 
          nlControls.querySelectorAll('button').forEach(function(btn) {
             btn.addEventListener('click', function() {
@@ -1172,6 +1341,33 @@
                createCount: chartLifecycle.createCount,
                destroyCount: chartLifecycle.destroyCount,
                renders: Object.freeze(Object.assign({}, chartLifecycle.renders)),
+            });
+         },
+         // Read-only render state: current mode, dataset labels, cloned dataset values
+         // No Chart instances exposed; no mutation methods.
+         getChartRenderState: function() {
+            return deepClone({
+               cpu: {
+                  mode: chartRenderState.cpu.mode,
+                  labels: chartRenderState.cpu.labels,
+                  datasets: chartRenderState.cpu.datasets,
+               },
+               memory: {
+                  mode: chartRenderState.memory.mode,
+                  labels: chartRenderState.memory.labels,
+                  datasets: chartRenderState.memory.datasets,
+               },
+               process: {
+                  mode: chartRenderState.process.mode,
+                  labels: chartRenderState.process.labels,
+                  datasets: chartRenderState.process.datasets,
+                  contributorSummary: chartRenderState.process.contributorSummary,
+               },
+               networkLustre: {
+                  mode: chartRenderState.networkLustre.mode,
+                  labels: chartRenderState.networkLustre.labels,
+                  datasets: chartRenderState.networkLustre.datasets,
+               },
             });
          },
       };

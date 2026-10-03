@@ -91,6 +91,24 @@
             <tr><td>D-state</td><td>per-grain max, contributor + own interval</td><td>15 min usage</td><td>Observation-weighted fraction; not node-wide/time-weighted</td></tr>
           </tbody>
         </table>
+        <details class="chart-note" open>
+          <summary>D-state / Interactivity hotspots (15-min intervals)</summary>
+          <table data-testid="dstate-hotspot-table" aria-label="D-state and interactivity hotspot table" class="chart-alt">
+            <caption>observation-weighted per stored grain; not node-wide or clock-time weighted</caption>
+            <thead>
+              <tr>
+                <th>Interval</th>
+                <th>D-state max</th>
+                <th>D-state user</th>
+                <th>Interactivity max</th>
+                <th>Interactivity user</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td colspan="5">Loading…</td></tr>
+            </tbody>
+          </table>
+        </details>
       </article>
       <article aria-label="Memory chart">
         <h3>Memory (physical)</h3>
@@ -113,7 +131,7 @@
       <article aria-label="Network and Lustre chart">
         <h3>Network / Lustre</h3>
         <div class="chart-canvas-wrap"><canvas id="chart-network-lustre" data-testid="chart-network-lustre" aria-label="Network RX/TX per interface (no loopback lo); Lustre p50-sum p95-sum peak-sum"></canvas></div>
-        <div class="chart-note"><p>Loopback (lo) excluded. Lustre peak-sum: sum of per-target maxima — not instantaneous/global peak. Target count shown per operation. Statistic: p50-sum / p95-sum / peak-sum (max_sum).</p></div>
+        <div class="chart-note"><p>Loopback (lo) excluded. Lustre p50-sum: sum of per-target p50 values. Lustre p95-sum: sum of per-target p95 values. Lustre peak-sum (max_sum): sum of per-target maxima — not instantaneous/global peak. Target count shown per operation. Statistic: p50-sum / p95-sum / peak-sum (max_sum).</p></div>
       </article>
     </div>
   </section>

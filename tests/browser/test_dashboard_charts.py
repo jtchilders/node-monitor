@@ -147,7 +147,7 @@ def test_d_state_sparse_maxima_exact_values_and_username(browser_page, live_web,
         f"Second interval_end wrong: {d_points[1]['interval_end']}"
 
     # The HTML table note mentions observation-weighted fraction
-    obs_note = page.locator('[aria-label="CPU and load chart"] .chart-alt').inner_text()
+    obs_note = page.locator('[aria-label="CPU/load summary"]').inner_text()
     assert "observation-weighted" in obs_note.lower() or "Observation-weighted" in obs_note, \
         f"Observation-weighted note missing from CPU/load table: {obs_note!r}"
 

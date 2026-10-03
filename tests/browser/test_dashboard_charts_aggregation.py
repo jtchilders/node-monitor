@@ -547,10 +547,10 @@ def test_interactivity_max_semantics_per_interval(multi_grain_web):
 
     # The CPU/load chart must have an observation-weighted note in its accessible element
     # (this verifies D-state points are represented, not silently omitted)
-    obs_note = page.locator('[aria-label="CPU and load chart"] .chart-alt').inner_text()
-    assert "observation-weighted" in obs_note.lower() or len(obs_note) > 0, (
-        f"CPU/load chart must have an accessible alt element (observation-weighted note "
-        f"or D-state data), got: {obs_note!r}"
+    obs_note = page.locator('[aria-label="CPU/load summary"]').inner_text()
+    assert "observation-weighted" in obs_note.lower(), (
+        f"CPU/load summary table must contain 'observation-weighted' note. "
+        f"Got: {obs_note!r}"
     )
 
     assert errors == []
@@ -825,6 +825,6 @@ def test_nl_lustre_p50_button_click_causes_chart_redraw(browser_page, live_web):
 
     # aria-pressed must update
     assert page.locator('[data-testid="nl-mode-lustre-p50"]').get_attribute("aria-pressed") == "true"
-    assert page.locator('[data-testid="nl-mode-network"]').get_attribute("aria-pressed") == "false"
+    assert page.locator('[data-testid="nl-network-p50"]').get_attribute("aria-pressed") == "false"
 
     assert errors == []
