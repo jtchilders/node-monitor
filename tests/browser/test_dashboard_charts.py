@@ -258,14 +258,18 @@ def test_process_cpu_sum_exact_grouped_by_interval(browser_page, live_web, snaps
     cpu_sum = data["processCPU"]
     labels = data["processLabels"]
 
-    # Fixture: grain0 cpu_seconds=120.5, grain1 cpu_seconds=300.2
-    assert len(cpu_sum) == 2, f"Expected 2 process grains, got {len(cpu_sum)}"
-    assert cpu_sum[0] == 120.5, f"Grain0 cpu_seconds wrong: {cpu_sum[0]}"
-    assert cpu_sum[1] == 300.2, f"Grain1 cpu_seconds wrong: {cpu_sum[1]}"
+    # Fixture: grain0 (11:30/interactive) cpu_seconds=120.5, grain1 (11:45/batch) cpu_seconds=300.2
+    # Each grain has a distinct interval_end; aggregation produces one entry per interval.
+    assert len(cpu_sum) == 2, f"Expected 2 interval entries, got {len(cpu_sum)}"
+    assert cpu_sum[0] == 120.5, f"Interval0 cpu_seconds wrong: {cpu_sum[0]}"
+    assert cpu_sum[1] == 300.2, f"Interval1 cpu_seconds wrong: {cpu_sum[1]}"
 
-    # Labels contain interval_end + category
-    assert "interactive" in labels[0], f"Grain0 label missing category: {labels[0]}"
-    assert "batch" in labels[1], f"Grain1 label missing category: {labels[1]}"
+    # Labels show interval_end only (not category/activity) -- per-interval aggregation
+    assert "11:30" in labels[0], f"Interval0 label must contain 11:30: {labels[0]}"
+    assert "11:45" in labels[1], f"Interval1 label must contain 11:45: {labels[1]}"
+    # Must NOT contain category/activity (pre-fix incorrect behavior)
+    assert "interactive" not in labels[0], f"Label must not contain grain category: {labels[0]}"
+    assert "batch" not in labels[1], f"Label must not contain grain category: {labels[1]}"
 
     assert errors == []
 

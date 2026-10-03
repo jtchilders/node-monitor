@@ -390,47 +390,139 @@
          return memTotalKb - r.mem_available_kb;
       });
 
-      // D-state: sparse per-grain maxima with exact interval_end and username
-      const dStatePoints = grains.map(function(g) {
+      // ---- Aggregate grains by interval_end ----
+      // Collect distinct interval_end values in sorted order
+      const intervalEndSet = {};
+      grains.forEach(function(g) {
+         if (g.interval_end) intervalEndSet[g.interval_end] = true;
+      });
+      const sortedIntervalEnds = Object.keys(intervalEndSet).sort();
+
+      // Build aggregated interval objects: one per distinct interval_end
+      // processCPU: SUM of cpu_seconds (additive)
+      // dState, countMax, rssMax, countP50, countP95, rssP50, rssP95:
+      //   MAX-grain selection with independently attributed username
+      const aggregatedIntervals = sortedIntervalEnds.map(function(iend) {
+         var cpuSum = null;
+         var dStateFrac = null, dStateUser = null;
+         var cntMax = null, cntMaxUser = null;
+         var cntP50 = null, cntP50User = null;
+         var cntP95 = null, cntP95User = null;
+         var rssMax = null, rssMaxUser = null;
+         var rssP50 = null, rssP50User = null;
+         var rssP95 = null, rssP95User = null;
+
+         grains.forEach(function(g) {
+            if (g.interval_end !== iend) return;
+
+            // cpu_seconds: additive sum
+            if (g.cpu_seconds != null) {
+               cpuSum = (cpuSum === null ? 0 : cpuSum) + g.cpu_seconds;
+            }
+
+            // d_state_fraction: maximum grain wins, carry that grain's username
+            if (g.d_state_fraction != null &&
+                (dStateFrac === null || g.d_state_fraction > dStateFrac)) {
+               dStateFrac = g.d_state_fraction;
+               dStateUser = g.d_state_username || null;
+            }
+
+            // process_count_max: hotspot grain wins independently
+            if (g.process_count_max != null &&
+                (cntMax === null || g.process_count_max > cntMax)) {
+               cntMax = g.process_count_max;
+               cntMaxUser = g.process_count_max_username || null;
+            }
+
+            // process_count_p50: max-grain selection
+            if (g.process_count_p50 != null &&
+                (cntP50 === null || g.process_count_p50 > cntP50)) {
+               cntP50 = g.process_count_p50;
+               cntP50User = g.process_count_p50_username || null;
+            }
+
+            // process_count_p95: max-grain selection
+            if (g.process_count_p95 != null &&
+                (cntP95 === null || g.process_count_p95 > cntP95)) {
+               cntP95 = g.process_count_p95;
+               cntP95User = g.process_count_p95_username || null;
+            }
+
+            // rss_max_kb: independently attributed max
+            if (g.rss_max_kb != null &&
+                (rssMax === null || g.rss_max_kb > rssMax)) {
+               rssMax = g.rss_max_kb;
+               rssMaxUser = g.rss_max_username || null;
+            }
+
+            // rss_p50_kb: max-grain selection
+            if (g.rss_p50_kb != null &&
+                (rssP50 === null || g.rss_p50_kb > rssP50)) {
+               rssP50 = g.rss_p50_kb;
+               rssP50User = g.rss_p50_username || null;
+            }
+
+            // rss_p95_kb: max-grain selection
+            if (g.rss_p95_kb != null &&
+                (rssP95 === null || g.rss_p95_kb > rssP95)) {
+               rssP95 = g.rss_p95_kb;
+               rssP95User = g.rss_p95_username || null;
+            }
+         });
+
          return {
-            interval_end: g.interval_end || null,
-            value: g.d_state_fraction != null ? g.d_state_fraction : null,
-            username: g.d_state_username || null,
+            interval_end: iend,
+            cpuSum: cpuSum,
+            dStateFrac: dStateFrac, dStateUser: dStateUser,
+            cntMax: cntMax, cntMaxUser: cntMaxUser,
+            cntP50: cntP50, cntP50User: cntP50User,
+            cntP95: cntP95, cntP95User: cntP95User,
+            rssMax: rssMax, rssMaxUser: rssMaxUser,
+            rssP50: rssP50, rssP50User: rssP50User,
+            rssP95: rssP95, rssP95User: rssP95User,
          };
       });
 
-      // Process grains data
-      const processLabels = grains.map(function(g) {
-         return (g.interval_end ? g.interval_end.slice(0, 16) : '-')
-            + (g.category ? ' ' + g.category : '');
+      // D-state: one point per distinct interval, max fraction + winning username
+      const dStatePoints = aggregatedIntervals.map(function(iv) {
+         return {
+            interval_end: iv.interval_end,
+            value: iv.dStateFrac,
+            username: iv.dStateUser,
+         };
       });
-      const processCPU = grains.map(function(g) {
-         return g.cpu_seconds != null ? g.cpu_seconds : null;
+
+      // Process series: one entry per distinct interval (aggregated)
+      const processLabels = aggregatedIntervals.map(function(iv) {
+         return iv.interval_end ? iv.interval_end.slice(0, 16) : '-';
       });
-      const processCountP50 = grains.map(function(g) {
-         return g.process_count_p50 != null ? g.process_count_p50 : null;
+      const processCPU = aggregatedIntervals.map(function(iv) {
+         return iv.cpuSum;
       });
-      const processCountMax = grains.map(function(g) {
-         return g.process_count_max != null ? g.process_count_max : null;
+      const processCountP50 = aggregatedIntervals.map(function(iv) {
+         return iv.cntP50;
       });
-      const processCountP95 = grains.map(function(g) {
-         return g.process_count_p95 != null ? g.process_count_p95 : null;
+      const processCountMax = aggregatedIntervals.map(function(iv) {
+         return iv.cntMax;
       });
-      const processRSSP50 = grains.map(function(g) {
-         return g.rss_p50_kb != null ? g.rss_p50_kb : null;
+      const processCountP95 = aggregatedIntervals.map(function(iv) {
+         return iv.cntP95;
       });
-      const processRSSMax = grains.map(function(g) {
-         return g.rss_max_kb != null ? g.rss_max_kb : null;
+      const processRSSP50 = aggregatedIntervals.map(function(iv) {
+         return iv.rssP50;
       });
-      const processRSSP95 = grains.map(function(g) {
-         return g.rss_p95_kb != null ? g.rss_p95_kb : null;
+      const processRSSMax = aggregatedIntervals.map(function(iv) {
+         return iv.rssMax;
       });
-      // Per-grain contributor usernames
-      const processCountMaxUsername = grains.map(function(g) {
-         return g.process_count_max_username || null;
+      const processRSSP95 = aggregatedIntervals.map(function(iv) {
+         return iv.rssP95;
       });
-      const processRSSMaxUsername = grains.map(function(g) {
-         return g.rss_max_username || null;
+      // Per-interval contributor usernames (independently attributed)
+      const processCountMaxUsername = aggregatedIntervals.map(function(iv) {
+         return iv.cntMaxUser;
+      });
+      const processRSSMaxUsername = aggregatedIntervals.map(function(iv) {
+         return iv.rssMaxUser;
       });
 
       // Network: collect all non-lo interfaces across all rows
@@ -716,10 +808,17 @@
                canvas.parentElement.insertBefore(memControls, canvas);
             }
          }
+         // Disable Percent button when total memory is unavailable
+         const percentBtn = memControls.querySelector('[data-testid="mem-mode-percent"]');
+         const percentAvailable = totalKb != null && totalKb > 0;
+         if (percentBtn) {
+            percentBtn.disabled = !percentAvailable;
+         }
+
          // Determine current mode
          const activeBtn = memControls.querySelector('button[aria-pressed="true"]');
          const mode = activeBtn ? activeBtn.getAttribute('data-testid') : 'mem-mode-gib';
-         const isPercent = mode === 'mem-mode-percent' && totalKb != null && totalKb > 0;
+         const isPercent = mode === 'mem-mode-percent' && percentAvailable;
 
          function toDisplayVal(kb) {
             if (kb == null) return null;
