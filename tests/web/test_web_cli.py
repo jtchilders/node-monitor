@@ -572,3 +572,469 @@ def test_startup_line_format_only_after_bind(monkeypatch):
    assert os.path.isabs(m.group(2)), (
       "socket path in startup line must be absolute: %r" % m.group(2)
    )
+
+
+# ---------------------------------------------------------------------------
+# New sentinel tests (Task 6 correction)
+# ---------------------------------------------------------------------------
+# Each test below uses a unique string sentinel that cannot appear in the
+# command output if exception objects are interpolated into the message.
+# Sentinel strings are chosen to be distinctive and not substrings of
+# any fixed bounded message.
+
+_YAML_SENTINEL = "YAML-PARSE-SENTINEL-a1b2c3d4"
+_DB_CTOR_SENTINEL = "DB-CTOR-SENTINEL-e5f6g7h8"
+_SERVICE_CTOR_SENTINEL = "SVC-CTOR-SENTINEL-i9j0k1l2"
+_OSERROR_SENTINEL = "OSERROR-SENTINEL-m3n4o5p6"
+_RUNTIME_SENTINEL = "RUNTIME-SENTINEL-q7r8s9t0"
+_PLAIN_EXC_SENTINEL = "PLAIN-EXC-SENTINEL-u1v2w3x4"
+
+
+def test_malformed_yaml_exits_nonzero_no_sentinel(monkeypatch):
+   """Malformed YAML / parser failure: nonzero exit; sentinel never in output."""
+   import node_monitor.config as config_mod
+   import yaml as yaml_mod
+
+   def fail_load(path, **kwargs):
+      raise yaml_mod.YAMLError(_YAML_SENTINEL)
+
+   monkeypatch.setattr(config_mod, "load_web_config", fail_load)
+
+   runner = CliRunner()
+   with tempfile.NamedTemporaryFile(
+      mode="w", suffix=".yaml", delete=False
+   ) as fh:
+      fh.write("system: test\n")
+      cfg = fh.name
+   try:
+      result = runner.invoke(web_command, ["--config", cfg])
+   finally:
+      os.unlink(cfg)
+
+   assert result.exit_code != 0, (
+      "expected nonzero exit on YAML error; got %d" % result.exit_code
+   )
+   assert _YAML_SENTINEL not in result.output, (
+      "YAML sentinel must not appear in output (raw exception interpolated); output=%r"
+      % result.output
+   )
+   assert "Traceback" not in result.output
+   # Bounded message must be present
+   assert "preflight failed" in result.output
+
+
+def test_web_database_constructor_failure_nonzero_no_sentinel(monkeypatch):
+   """WebDatabase(...) constructor failure: nonzero; sentinel absent; DB dispose called."""
+   tracker = _Tracker()
+
+   import node_monitor.config as config_mod
+   import node_monitor.database.web as db_web_mod
+
+   monkeypatch.setattr(
+      config_mod, "load_web_config",
+      lambda path, **kwargs: _make_fake_config()
+   )
+
+   def fail_ctor(database_config):
+      tracker.record("db_ctor_fail")
+      raise RuntimeError(_DB_CTOR_SENTINEL)
+
+   monkeypatch.setattr(db_web_mod, "WebDatabase", fail_ctor)
+
+   runner = CliRunner()
+   with tempfile.NamedTemporaryFile(
+      mode="w", suffix=".yaml", delete=False
+   ) as fh:
+      _write_valid_config(fh.name)
+      cfg = fh.name
+   try:
+      result = runner.invoke(web_command, ["--config", cfg])
+   finally:
+      os.unlink(cfg)
+
+   assert result.exit_code != 0, (
+      "expected nonzero exit on DB ctor failure; got %d" % result.exit_code
+   )
+   assert _DB_CTOR_SENTINEL not in result.output, (
+      "DB ctor sentinel must not appear in output; output=%r" % result.output
+   )
+   assert "Traceback" not in result.output
+   assert "db_ctor_fail" in tracker.events
+
+
+def test_service_construction_failure_no_sentinel(monkeypatch):
+   """Service construction failure (sentinel in exc): sentinel absent in output; DB dispose."""
+   tracker = _Tracker()
+
+   class OkDB:
+      def preflight(self):
+         tracker.record("db_preflight")
+
+      def dispose(self):
+         tracker.record("db_dispose")
+
+   import node_monitor.config as config_mod
+   import node_monitor.database.web as db_web_mod
+   import node_monitor.web.app as app_mod
+
+   monkeypatch.setattr(
+      config_mod, "load_web_config",
+      lambda path, **kwargs: _make_fake_config()
+   )
+   monkeypatch.setattr(db_web_mod, "WebDatabase", lambda cfg: OkDB())
+
+   def fail_create_app(service):
+      tracker.record("create_app_fail")
+      raise ValueError(_SERVICE_CTOR_SENTINEL)
+
+   monkeypatch.setattr(app_mod, "create_app", fail_create_app)
+
+   runner = CliRunner()
+   with tempfile.NamedTemporaryFile(
+      mode="w", suffix=".yaml", delete=False
+   ) as fh:
+      _write_valid_config(fh.name)
+      cfg = fh.name
+   try:
+      result = runner.invoke(web_command, ["--config", cfg])
+   finally:
+      os.unlink(cfg)
+
+   assert result.exit_code != 0
+   assert _SERVICE_CTOR_SENTINEL not in result.output, (
+      "service sentinel must not appear in output; output=%r" % result.output
+   )
+   assert "Traceback" not in result.output
+   assert "db_dispose" in tracker.events
+   # No startup line before bind
+   assert not any(
+      re.match(r"PID \d+", l) for l in result.output.splitlines()
+   ), "startup line must not appear after service failure"
+
+
+def test_bare_oserror_bind_failure_no_sentinel(monkeypatch):
+   """Bare OSError bind failure: sentinel absent; socket close (if opened) then DB dispose."""
+   tracker = _Tracker()
+
+   class OkDB:
+      def preflight(self):
+         tracker.record("db_preflight")
+
+      def dispose(self):
+         tracker.record("db_dispose")
+
+   import node_monitor.config as config_mod
+   import node_monitor.database.web as db_web_mod
+   import node_monitor.web.app as app_mod
+   import node_monitor.web.socket as sock_mod
+
+   monkeypatch.setattr(
+      config_mod, "load_web_config",
+      lambda path, **kwargs: _make_fake_config()
+   )
+   monkeypatch.setattr(db_web_mod, "WebDatabase", lambda cfg: OkDB())
+   monkeypatch.setattr(
+      app_mod, "create_app",
+      lambda service: (tracker.record("create_app") or object())
+   )
+
+   def fail_bind_oserror(path, backlog=128):
+      tracker.record("bind_oserror")
+      raise OSError(_OSERROR_SENTINEL)
+
+   monkeypatch.setattr(sock_mod, "bind_private_socket", fail_bind_oserror)
+
+   runner = CliRunner()
+   with tempfile.NamedTemporaryFile(
+      mode="w", suffix=".yaml", delete=False
+   ) as fh:
+      _write_valid_config(fh.name)
+      cfg = fh.name
+   try:
+      result = runner.invoke(web_command, ["--config", cfg])
+   finally:
+      os.unlink(cfg)
+
+   assert result.exit_code != 0
+   assert _OSERROR_SENTINEL not in result.output, (
+      "OSError sentinel must not appear in output; output=%r" % result.output
+   )
+   assert "Traceback" not in result.output
+   assert "bind_oserror" in tracker.events
+   assert "db_dispose" in tracker.events
+   # No startup line
+   assert not any(
+      re.match(r"PID \d+", l) for l in result.output.splitlines()
+   ), "startup line must not appear after OSError bind failure"
+
+
+def test_run_uvicorn_plain_exception_no_sentinel(monkeypatch):
+   """run_uvicorn raising ordinary (non-RuntimeError) Exception: nonzero; sentinel absent;
+   socket close precedes DB dispose."""
+   tracker = _Tracker()
+
+   class OkDB:
+      def preflight(self):
+         tracker.record("db_preflight")
+
+      def dispose(self):
+         tracker.record("db_dispose")
+
+   class OkSock:
+      def close(self):
+         tracker.record("sock_close")
+
+   import node_monitor.config as config_mod
+   import node_monitor.database.web as db_web_mod
+   import node_monitor.web.app as app_mod
+   import node_monitor.web.socket as sock_mod
+   import node_monitor.web.runtime as rt_mod
+
+   monkeypatch.setattr(
+      config_mod, "load_web_config",
+      lambda path, **kwargs: _make_fake_config()
+   )
+   monkeypatch.setattr(db_web_mod, "WebDatabase", lambda cfg: OkDB())
+   monkeypatch.setattr(
+      app_mod, "create_app",
+      lambda service: (tracker.record("create_app") or object())
+   )
+   monkeypatch.setattr(
+      sock_mod, "bind_private_socket",
+      lambda path, backlog=128: (tracker.record("bind") or OkSock())
+   )
+
+   def fail_plain(app, sock):
+      tracker.record("run_uvicorn_plain_fail")
+      raise ValueError(_PLAIN_EXC_SENTINEL)
+
+   monkeypatch.setattr(rt_mod, "run_uvicorn", fail_plain)
+
+   runner = CliRunner()
+   with tempfile.NamedTemporaryFile(
+      mode="w", suffix=".yaml", delete=False
+   ) as fh:
+      _write_valid_config(fh.name)
+      cfg = fh.name
+   try:
+      result = runner.invoke(web_command, ["--config", cfg])
+   finally:
+      os.unlink(cfg)
+
+   events = tracker.events
+   assert result.exit_code != 0, (
+      "expected nonzero exit; got %d output=%r" % (result.exit_code, result.output)
+   )
+   assert _PLAIN_EXC_SENTINEL not in result.output, (
+      "plain exception sentinel must not appear in output; output=%r" % result.output
+   )
+   assert "Traceback" not in result.output
+   assert "sock_close" in events, "socket must be closed; events=%s" % events
+   assert "db_dispose" in events, "DB must be disposed; events=%s" % events
+   sock_idx = events.index("sock_close")
+   dispose_idx = events.index("db_dispose")
+   assert sock_idx < dispose_idx, (
+      "sock_close must precede db_dispose; events=%s" % events
+   )
+
+
+def test_run_uvicorn_runtime_error_no_sentinel(monkeypatch):
+   """run_uvicorn raising RuntimeError (sentinel in msg): nonzero; sentinel absent;
+   socket close precedes DB dispose."""
+   tracker = _Tracker()
+
+   class OkDB:
+      def preflight(self):
+         tracker.record("db_preflight")
+
+      def dispose(self):
+         tracker.record("db_dispose")
+
+   class OkSock:
+      def close(self):
+         tracker.record("sock_close")
+
+   import node_monitor.config as config_mod
+   import node_monitor.database.web as db_web_mod
+   import node_monitor.web.app as app_mod
+   import node_monitor.web.socket as sock_mod
+   import node_monitor.web.runtime as rt_mod
+
+   monkeypatch.setattr(
+      config_mod, "load_web_config",
+      lambda path, **kwargs: _make_fake_config()
+   )
+   monkeypatch.setattr(db_web_mod, "WebDatabase", lambda cfg: OkDB())
+   monkeypatch.setattr(
+      app_mod, "create_app",
+      lambda service: (tracker.record("create_app") or object())
+   )
+   monkeypatch.setattr(
+      sock_mod, "bind_private_socket",
+      lambda path, backlog=128: (tracker.record("bind") or OkSock())
+   )
+
+   def fail_runtime(app, sock):
+      tracker.record("run_uvicorn_runtime_fail")
+      raise RuntimeError(_RUNTIME_SENTINEL)
+
+   monkeypatch.setattr(rt_mod, "run_uvicorn", fail_runtime)
+
+   runner = CliRunner()
+   with tempfile.NamedTemporaryFile(
+      mode="w", suffix=".yaml", delete=False
+   ) as fh:
+      _write_valid_config(fh.name)
+      cfg = fh.name
+   try:
+      result = runner.invoke(web_command, ["--config", cfg])
+   finally:
+      os.unlink(cfg)
+
+   events = tracker.events
+   assert result.exit_code != 0, (
+      "expected nonzero exit; got %d output=%r" % (result.exit_code, result.output)
+   )
+   assert _RUNTIME_SENTINEL not in result.output, (
+      "RuntimeError sentinel must not appear in output; output=%r" % result.output
+   )
+   assert "Traceback" not in result.output
+   assert "sock_close" in events, "socket must be closed; events=%s" % events
+   assert "db_dispose" in events, "DB must be disposed; events=%s" % events
+   sock_idx = events.index("sock_close")
+   dispose_idx = events.index("db_dispose")
+   assert sock_idx < dispose_idx, (
+      "sock_close must precede db_dispose; events=%s" % events
+   )
+
+
+def test_keyboard_interrupt_propagates_after_bind(monkeypatch):
+   """KeyboardInterrupt after socket creation must propagate (not be swallowed);
+   cleanup (socket close + DB dispose) must still happen."""
+   tracker = _Tracker()
+
+   class OkDB:
+      def preflight(self):
+         tracker.record("db_preflight")
+
+      def dispose(self):
+         tracker.record("db_dispose")
+
+   class OkSock:
+      def close(self):
+         tracker.record("sock_close")
+
+   import node_monitor.config as config_mod
+   import node_monitor.database.web as db_web_mod
+   import node_monitor.web.app as app_mod
+   import node_monitor.web.socket as sock_mod
+   import node_monitor.web.runtime as rt_mod
+
+   monkeypatch.setattr(
+      config_mod, "load_web_config",
+      lambda path, **kwargs: _make_fake_config()
+   )
+   monkeypatch.setattr(db_web_mod, "WebDatabase", lambda cfg: OkDB())
+   monkeypatch.setattr(
+      app_mod, "create_app",
+      lambda service: (tracker.record("create_app") or object())
+   )
+   monkeypatch.setattr(
+      sock_mod, "bind_private_socket",
+      lambda path, backlog=128: (tracker.record("bind") or OkSock())
+   )
+
+   def raise_ki(app, sock):
+      tracker.record("run_uvicorn_ki")
+      raise KeyboardInterrupt
+
+   monkeypatch.setattr(rt_mod, "run_uvicorn", raise_ki)
+
+   runner = CliRunner()
+   with tempfile.NamedTemporaryFile(
+      mode="w", suffix=".yaml", delete=False
+   ) as fh:
+      _write_valid_config(fh.name)
+      cfg = fh.name
+   try:
+      # CliRunner catches BaseException; KeyboardInterrupt surfaces as exception
+      result = runner.invoke(web_command, ["--config", cfg])
+   finally:
+      os.unlink(cfg)
+
+   # KeyboardInterrupt propagates past our 'except Exception:' (which does NOT catch
+   # BaseException subclasses like KeyboardInterrupt).  Click's own group runner
+   # converts it to SystemExit(1) with "Aborted!" -- that is fine; what must NOT
+   # happen is for our code to silently swallow it or produce a raw traceback.
+   events = tracker.events
+   # "Aborted!" is Click's own bounded message for KeyboardInterrupt -- acceptable.
+   assert "Traceback" not in result.output
+   # Cleanup must still happen due to the finally block
+   assert "sock_close" in events, (
+      "socket must be closed even on KeyboardInterrupt; events=%s" % events
+   )
+   assert "db_dispose" in events, (
+      "DB must be disposed even on KeyboardInterrupt; events=%s" % events
+   )
+
+
+def test_system_exit_not_swallowed_after_bind(monkeypatch):
+   """SystemExit from run_uvicorn propagates (not swallowed by inner except Exception)."""
+   tracker = _Tracker()
+
+   class OkDB:
+      def preflight(self):
+         tracker.record("db_preflight")
+
+      def dispose(self):
+         tracker.record("db_dispose")
+
+   class OkSock:
+      def close(self):
+         tracker.record("sock_close")
+
+   import node_monitor.config as config_mod
+   import node_monitor.database.web as db_web_mod
+   import node_monitor.web.app as app_mod
+   import node_monitor.web.socket as sock_mod
+   import node_monitor.web.runtime as rt_mod
+
+   monkeypatch.setattr(
+      config_mod, "load_web_config",
+      lambda path, **kwargs: _make_fake_config()
+   )
+   monkeypatch.setattr(db_web_mod, "WebDatabase", lambda cfg: OkDB())
+   monkeypatch.setattr(
+      app_mod, "create_app",
+      lambda service: (tracker.record("create_app") or object())
+   )
+   monkeypatch.setattr(
+      sock_mod, "bind_private_socket",
+      lambda path, backlog=128: (tracker.record("bind") or OkSock())
+   )
+
+   def raise_sysexit(app, sock):
+      tracker.record("run_uvicorn_sysexit")
+      raise SystemExit(42)
+
+   monkeypatch.setattr(rt_mod, "run_uvicorn", raise_sysexit)
+
+   runner = CliRunner()
+   with tempfile.NamedTemporaryFile(
+      mode="w", suffix=".yaml", delete=False
+   ) as fh:
+      _write_valid_config(fh.name)
+      cfg = fh.name
+   try:
+      result = runner.invoke(web_command, ["--config", cfg])
+   finally:
+      os.unlink(cfg)
+
+   # SystemExit must propagate; cleanup must happen.
+   events = tracker.events
+   assert "sock_close" in events, (
+      "socket must be closed even on SystemExit; events=%s" % events
+   )
+   assert "db_dispose" in events, (
+      "DB must be disposed even on SystemExit; events=%s" % events
+   )

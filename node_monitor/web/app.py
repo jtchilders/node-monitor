@@ -1,13 +1,13 @@
 """node_monitor.web.app -- FastAPI routes, exact static allowlist."""
 from fastapi import FastAPI, HTTPException, Response
 
-from node_monitor.web.static_impl import STATIC_ROUTES, read_static, ALLOWLIST
+from node_monitor.web.static_impl import STATIC_ROUTES, read_static
 
 
 def _make_static_handler(route_name, media):
    def handler():
-      name = route_name.split("/")[-1]
-      return Response(content=read_static(name), media_type=media)
+      filename = route_name.split("/")[-1]
+      return Response(content=read_static(filename), media_type=media)
    return handler
 
 
@@ -34,7 +34,6 @@ def create_app(service):
             status_code=503, detail="dashboard refresh failed") from None
 
    for route, meta in STATIC_ROUTES.items():
-      name = meta[0] if isinstance(meta, tuple) else route.split("/")[-1]
       media = meta[1] if isinstance(meta, tuple) and len(meta) > 1 else meta[0]
       app.get(route)(_make_static_handler(route, media))
 

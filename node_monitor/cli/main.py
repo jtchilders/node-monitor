@@ -1369,13 +1369,20 @@ def web_command(config_path):
    service = None
    app = None
    sock = None
-   # Config preflight
+   # Config preflight — YAML parse errors are caught separately to avoid
+   # interpolating parser exception objects into output.
    try:
       config = load_web_config(config_path)
-   except (ConfigError, yaml.YAMLError) as exc:
+   except yaml.YAMLError:
       click.echo("preflight failed", err=True)
       sys.exit(1)
-   # DB preflight with protected boundary: construct inside try, dispose on every failure
+   except ConfigError:
+      click.echo("preflight failed", err=True)
+      sys.exit(1)
+   except Exception:
+      click.echo("preflight failed", err=True)
+      sys.exit(1)
+   # DB constructor: construct inside try; dispose on every failure path.
    db = None
    try:
       db = WebDatabase(config.database)
@@ -1397,14 +1404,14 @@ def web_command(config_path):
       except Exception:
          pass
       sys.exit(1)
-   # Service/app construction
+   # Service/app/socket construction — OSError and all Exception subclasses
+   # caught here; KeyboardInterrupt/SystemExit propagate through.
    try:
       service = DashboardService(db, system=config.system)
       app = create_app(service)
       sock = bind_private_socket(config.socket_path)
-   except (ConfigError, WebDatabaseError, SocketError, OSError, PermissionError, RuntimeError) as exc:
-      msg = "service initialization failed"
-      click.echo(msg, err=True)
+   except Exception:
+      click.echo("service initialization failed", err=True)
       try:
          if sock is not None:
             sock.close()
@@ -1420,11 +1427,14 @@ def web_command(config_path):
    click.echo("PID %d socket %s" % (os.getpid(), os.path.abspath(config.socket_path)))
    try:
       run_uvicorn(app, sock)
-   except RuntimeError:
-      click.echo("service initialization failed", err=True)
+   except Exception:
+      # Catch ordinary Exception (not BaseException) so KeyboardInterrupt
+      # and SystemExit propagate.  A fixed message prevents interpolating
+      # exception objects into output.
+      click.echo("service failed", err=True)
       raise SystemExit(1)
    finally:
-      # Cleanup: close socket, then dispose DB — deterministic precedence.
+      # Cleanup: close socket first, then dispose DB — deterministic order.
       if sock is not None:
          try:
             sock.close()

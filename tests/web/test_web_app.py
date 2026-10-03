@@ -178,3 +178,111 @@ def test_production_service_username_too_long():
 
    with pytest.raises(DashboardRequestError):
       asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Task 6 correction: static security and route introspection tests
+# ---------------------------------------------------------------------------
+
+def test_read_static_traversal_raises_fixed_message():
+   """read_static('../../secret-SENTINEL') raises ValueError with fixed message,
+   never reflecting attacker input in the exception message."""
+   from node_monitor.web.static_impl import read_static
+
+   attacker_input = "../../secret-SENTINEL-x9y8z7w6"
+   try:
+      read_static(attacker_input)
+      assert False, "expected ValueError"
+   except ValueError as exc:
+      msg = str(exc)
+      # Fixed message must be present
+      assert msg == "invalid static file name", (
+         "ValueError message must be 'invalid static file name'; got %r" % msg
+      )
+      # Attacker input must NOT be reflected in exception message
+      assert attacker_input not in msg, (
+         "attacker input reflected in ValueError message: %r" % msg
+      )
+      assert "secret" not in msg, (
+         "attacker input reflected in ValueError message: %r" % msg
+      )
+
+
+def test_read_static_does_not_reflect_attacker_input():
+   """Attacker-supplied names that are not in the allowlist produce only the
+   fixed ValueError message -- no reflection of the attacker-controlled value."""
+   from node_monitor.web.static_impl import read_static
+
+   attacker_names = [
+      "../../etc/passwd",
+      "secret-data.db",
+      "/absolute/path",
+      "index.html; rm -rf /",
+      "\x00null",
+   ]
+   for name in attacker_names:
+      try:
+         read_static(name)
+         assert False, "expected ValueError for %r" % name
+      except ValueError as exc:
+         assert name not in str(exc), (
+            "attacker name reflected in error: input=%r msg=%r" % (name, str(exc))
+         )
+
+
+def test_static_route_handlers_no_query_params():
+   """Static route handlers expose no query parameters (name/media cannot affect response)."""
+   from fastapi.testclient import TestClient
+   from node_monitor.web.app import create_app
+
+   client = TestClient(create_app(None))
+
+   # The four allowed static routes exist and return 200
+   static_routes = [
+      "/static/index.html",
+      "/static/styles.css",
+      "/static/app.js",
+      "/static/chart.umd.min.js",
+   ]
+   for route in static_routes:
+      # Normal request
+      normal = client.get(route)
+      assert normal.status_code == 200, "expected 200 for %s" % route
+      normal_bytes = normal.content
+      normal_ct = normal.headers.get("content-type", "")
+
+      # Attempt to inject attacker 'name' and 'media' query params
+      injected = client.get(route, params={"name": "../../etc/passwd",
+                                            "media": "text/dangerous"})
+      assert injected.status_code == 200, (
+         "injected params must not break route; got %d for %s"
+         % (injected.status_code, route)
+      )
+      # Response bytes must be identical (attacker params ignored)
+      assert injected.content == normal_bytes, (
+         "injected 'name' param must not change response bytes for %s" % route
+      )
+      # Content-type must be identical (attacker 'media' param ignored)
+      assert injected.headers.get("content-type", "") == normal_ct, (
+         "injected 'media' param must not change content-type for %s" % route
+      )
+
+
+def test_static_fallback_arbitrary_paths_404():
+   """Arbitrary paths under /static/{path:path} return 404."""
+   from fastapi.testclient import TestClient
+   from node_monitor.web.app import create_app
+
+   client = TestClient(create_app(None))
+   arbitrary_paths = [
+      "/static/notexist.js",
+      "/static/config.yaml",
+      "/static/secrets.env",
+      "/static/foo/bar/baz",
+      "/static/",
+   ]
+   for path in arbitrary_paths:
+      resp = client.get(path)
+      assert resp.status_code == 404, (
+         "expected 404 for %s; got %d" % (path, resp.status_code)
+      )
