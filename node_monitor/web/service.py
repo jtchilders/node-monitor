@@ -86,6 +86,10 @@ _HARDWARE_SQL = text(
 # ---------------------------------------------------------------------------
 
 class DashboardServiceError(RuntimeError):
+   """Bounded, sanitized dashboard service failure."""
+
+
+class DashboardRequestError(DashboardServiceError):
    """Bounded, sanitized dashboard service failure.
 
    Never contains URL, role, SQL text, or driver exception details.

@@ -11,6 +11,7 @@ sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.0
 
 # Web runtime
+fastapi>=0.100.0,<1.0
 uvicorn>=0.20.0,<1.0
 
 # Development and testing

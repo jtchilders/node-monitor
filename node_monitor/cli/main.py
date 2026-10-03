@@ -1337,6 +1337,40 @@ def _run_daemon_postgres(nested, config_path, run_id, probe_version, home,
    return exit_code
 
 
+@cli.command("web")
+@click.option("--config", "config_path", required=True,
+              type=click.Path(dir_okay=False, exists=True),
+              help="Path to the web-only YAML config file.")
+def web_command(config_path):
+   """Run the private web dashboard service (Task 6)."""
+   import os
+   from node_monitor.config import load_web_config
+   from node_monitor.database.web import WebDatabase
+   from node_monitor.web.service import DashboardService
+   from node_monitor.web.app import create_app
+   from node_monitor.web.runtime import run_uvicorn
+   from node_monitor.web.socket import bind_private_socket
+
+   # Config/schema/privilege/socket preflights
+   config = load_web_config(config_path)
+   db = WebDatabase(config.database)
+   try:
+      db.preflight()
+   finally:
+      pass
+
+   service = DashboardService(db, system=config.system)
+   app = create_app(service)
+
+   sock = bind_private_socket(config.socket_path)
+   try:
+      click.echo("PID %d" % os.getpid())
+      click.echo("socket %s" % os.path.abspath(config.socket_path))
+      run_uvicorn(app, sock)
+   finally:
+      sock.close()
+
+
 def main():
    cli()
 

@@ -51,6 +51,12 @@ setup(
    include_package_data=True,
    package_data={
       "node_monitor.database.migrations.versions": ["*.sql", "*.sql.mode"],
+      "node_monitor.web": [
+         "static/index.html",
+         "static/styles.css",
+         "static/app.js",
+         "static/chart.umd.min.js",
+      ],
    },
    zip_safe=False,
 )
