@@ -172,24 +172,10 @@ def _probe_clean_install(artifact_path):
          % (os.path.basename(artifact_path), install.returncode, install.stderr)
       )
 
-      # Install all runtime deps needed by the probe.
-      # The wheel may not propagate Requires-Dist if build used legacy setup.py;
-      # we enumerate the minimal set explicitly so the probe can import them.
-      probe_deps = subprocess.run(
-         [pip_bin, "install", "--quiet",
-          "fastapi>=0.100.0,<1.0",
-          "uvicorn>=0.20.0,<1.0",
-          "httpx>=0.23.0",
-          "sqlalchemy>=2.0.0",
-          "pyyaml>=6.0",
-          "click>=8.0.0",
-          "python-dateutil>=2.8.0"],
-         capture_output=True, text=True, env=env
-      )
-      assert probe_deps.returncode == 0, (
-         "probe dep install failed:\n%s" % probe_deps.stderr
-      )
-
+      # Fresh isolated install must propagate runtime dependencies via
+      # the artifact's Requires-Dist; no separate dependency install.
+      # Fresh isolated install relies on Requires-Dist (verified by METADATA).
+      # Skip live import probe here; imports are the real assertion.
       probe_code = _build_probe_code()
       # Run from /tmp so the repo tree is not on sys.path.
       probe = subprocess.run(
@@ -214,10 +200,6 @@ def _probe_clean_install(artifact_path):
       assert result["not_in_repo"], (
          "node_monitor.web resolved inside repo tree: %s" % result["web_file"]
       )
-
-      # fastapi and uvicorn must be importable.
-      assert result["fastapi_importable"], "fastapi not importable from installed env"
-      assert result["uvicorn_importable"], "uvicorn not importable from installed env"
 
       # Exactly four static assets.
       basenames = sorted(result["asset_basenames"])
@@ -275,8 +257,7 @@ def _build_probe_code():
       "result['web_file'] = f;"
       "result['in_site_packages'] = 'site-packages' in f or 'dist-packages' in f;"
       "result['not_in_repo'] = '/workspaces/' not in f and '/.worktrees/' not in f;"
-      "result['fastapi_importable'] = True;"
-      "result['uvicorn_importable'] = True;"
+      # Assertions are the imports themselves (no *_importable=True).
       "assets = list(ir.files('node_monitor.web').joinpath('static').iterdir());"
       "result['asset_basenames'] = [a.name for a in assets];"
       "chart_data = (ir.files('node_monitor.web') / 'static' / 'chart.umd.min.js').read_bytes();"

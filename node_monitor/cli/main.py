@@ -739,6 +739,19 @@ def _load_database_config_or_exit(config_path, home):
    return loaded.database
 
 
+# Lazy/injected migration API seam: cli.main never imports
+# node_monitor.database.migration at module load time; the seam is
+# filled at runtime by _run_database_command/_schema_gate_or_exit.
+_migration_api = None  # set by test monkeypatch
+
+
+def _load_migration_runner():
+   if _migration_api is not None:
+      return _migration_api
+   from node_monitor.database.migration import MigrationError, MigrationRunner
+   return MigrationError, MigrationRunner
+
+
 def _create_migration_engine(database):
    return create_engine(
       database.url,
@@ -753,7 +766,7 @@ def _create_migration_engine(database):
 
 
 def _run_database_command(config_path, home, operation):
-   from node_monitor.database.migration import MigrationError, MigrationRunner
+   MigrationError, MigrationRunner = _load_migration_runner()
    home = home if home is not None else os.path.expanduser("~")
    database_config = _load_database_config_or_exit(config_path, home)
    engine = None
@@ -1175,7 +1188,7 @@ class _EngineAdapter:
 
 
 def _schema_gate_or_exit(engine, app_version):
-   from node_monitor.database.migration import MigrationError, MigrationRunner
+   MigrationError, MigrationRunner = _load_migration_runner()
    """Run ``MigrationRunner.status()`` read-only.
 
    Returns normally when the schema is fully current:
@@ -1378,8 +1391,9 @@ def web_command(config_path):
       service = DashboardService(db, system=config.system)
       app = create_app(service)
       sock = bind_private_socket(config.socket_path)
-   except (ConfigError, WebDatabaseError, SocketError) as exc:
-      click.echo("service initialization failed: %s" % exc, err=True)
+   except (ConfigError, WebDatabaseError, SocketError, OSError, PermissionError) as exc:
+      msg = "service initialization failed"
+      click.echo(msg, err=True)
       try:
          if sock is not None:
             sock.close()

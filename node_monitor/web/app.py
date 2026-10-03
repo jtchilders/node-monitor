@@ -1,7 +1,14 @@
 """node_monitor.web.app -- FastAPI routes, exact static allowlist."""
 from fastapi import FastAPI, HTTPException, Response
 
-from node_monitor.web.static_impl import STATIC_ROUTES, read_static
+from node_monitor.web.static_impl import STATIC_ROUTES, read_static, ALLOWLIST
+
+
+def _make_static_handler(route_name, media):
+   def handler():
+      name = route_name.split("/")[-1]
+      return Response(content=read_static(name), media_type=media)
+   return handler
 
 
 def create_app(service):
@@ -29,10 +36,12 @@ def create_app(service):
    for route, meta in STATIC_ROUTES.items():
       name = meta[0] if isinstance(meta, tuple) else route.split("/")[-1]
       media = meta[1] if isinstance(meta, tuple) and len(meta) > 1 else meta[0]
+      app.get(route)(_make_static_handler(route, media))
 
-      async def handler(name=name, media=media):
-         return Response(content=read_static(name), media_type=media)
-      app.get(route)(handler)
+   @app.get("/static/{path:path}")
+   async def static_fallback():
+      from fastapi import HTTPException
+      raise HTTPException(status_code=404, detail="static file not found")
 
    @app.get("/")
    async def root():
