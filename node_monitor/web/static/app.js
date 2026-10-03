@@ -109,11 +109,12 @@
    function renderUsage(data) {
       const usage = data.usage || {};
       const grains = Array.isArray(usage.grains) ? usage.grains : [];
+      // Per-interval maximum d_state with exact username and interval_end
       let hotspot = null;
       grains.forEach(function(grain) {
          const value = finiteNumber(grain.d_state_fraction);
          if (value !== null && (!hotspot || value > hotspot.value)) {
-            hotspot = {value: value, grain: grain};
+            hotspot = { value: value, grain: grain };
          }
       });
       qs('[data-testid="d-state"]').textContent = hotspot
@@ -208,6 +209,7 @@
          + ' logical CPUs; ' + (hardware.os_pretty_name || 'OS unavailable')
          + '; memory total ' + (hardware.mem_total_kb == null
             ? 'unavailable' : String(hardware.mem_total_kb) + ' KiB');
+      renderCharts(data);
       setActiveRange();
       renderAges();
       qs('#retry-section').hidden = true;
@@ -268,25 +270,815 @@
 
    qs('#retry-btn').addEventListener('click', refreshDashboard);
 
-   window.__nodeMonitorTest = Object.freeze({
-      getTimerState: function() {
-         return Object.freeze({
-            refreshIntervals: state.refreshTimer === null ? 0 : 1,
-            ageIntervals: state.ageTimer === null ? 0 : 1,
+   // ---- Chart registry with lifecycle tracking ----
+   // Maps chart name -> Chart instance
+   const chartRegistry = {};
+   // Lifecycle counters exposed to tests
+   const chartLifecycle = {
+      createCount: 0,
+      destroyCount: 0,
+      // Per-name render counts
+      renders: {},
+   };
+
+   function replaceChart(name, canvasId, config) {
+      const canvas = document.getElementById(canvasId);
+      if (!canvas) return null;
+      if (chartRegistry[name]) {
+         chartRegistry[name].destroy();
+         chartLifecycle.destroyCount++;
+      }
+      const chart = new Chart(canvas, config);
+      chartRegistry[name] = chart;
+      chartLifecycle.createCount++;
+      chartLifecycle.renders[name] = (chartLifecycle.renders[name] || 0) + 1;
+      return chart;
+   }
+
+   // ---- Aligned gap expansion for counter time series ----
+   // Input: sorted rows with window_end ISO strings, cadence 60s
+   // Output: { labels, indices } where indices map expanded positions to original row positions (null = gap)
+   // Bound: between first and last row timestamp; max 1440 insertions (24h at 1min cadence)
+   function buildExpandedCounterSeries(sortedRows) {
+      if (!sortedRows || !sortedRows.length) {
+         return { labels: [], rowIndices: [] };
+      }
+      const CADENCE_MS = 60000;
+      const MAX_INSERTIONS = 1440; // 24h * 60min - bounds for range queries
+      const labels = [];
+      const rowIndices = []; // null = gap insertion, integer = original sortedRows index
+
+      labels.push(sortedRows[0].window_end ? sortedRows[0].window_end.slice(0, 16) : '');
+      rowIndices.push(0);
+
+      let totalInserted = 0;
+
+      for (let i = 1; i < sortedRows.length; i++) {
+         const prevTime = sortedRows[i - 1].window_end
+            ? new Date(sortedRows[i - 1].window_end).getTime() : null;
+         const currTime = sortedRows[i].window_end
+            ? new Date(sortedRows[i].window_end).getTime() : null;
+
+         if (prevTime !== null && currTime !== null && currTime > prevTime + CADENCE_MS + 30000) {
+            // Gap detected: insert null slots for each missing aligned minute
+            // Align to cadence from prevTime
+            let nextAligned = prevTime + CADENCE_MS;
+            while (nextAligned < currTime - 30000 && totalInserted < MAX_INSERTIONS) {
+               const gapLabel = new Date(nextAligned).toISOString().slice(0, 16) + ' (gap)';
+               labels.push(gapLabel);
+               rowIndices.push(null);
+               nextAligned += CADENCE_MS;
+               totalInserted++;
+            }
+         }
+         labels.push(sortedRows[i].window_end ? sortedRows[i].window_end.slice(0, 16) : '');
+         rowIndices.push(i);
+      }
+
+      return { labels: labels, rowIndices: rowIndices };
+   }
+
+   // ---- Build complete chart data from a snapshot ----
+   function buildChartData(snapshot) {
+      const counters = snapshot && snapshot.counters ? snapshot.counters : {};
+      const usage = snapshot && snapshot.usage ? snapshot.usage : {};
+      const rows = counters.rows || [];
+      const grains = usage.grains || [];
+      const hardware = snapshot && snapshot.hardware ? snapshot.hardware : {};
+      const memTotalKb = hardware.mem_total_kb != null ? hardware.mem_total_kb : null;
+
+      // Sort counter rows by window_end ascending
+      const sortedRows = rows.slice().sort(function(a, b) {
+         const ta = a.window_end ? new Date(a.window_end).getTime() : 0;
+         const tb = b.window_end ? new Date(b.window_end).getTime() : 0;
+         return ta - tb;
+      });
+
+      // Build gap-expanded label/index mapping
+      const expanded = buildExpandedCounterSeries(sortedRows);
+      const expandedLabels = expanded.labels;
+      const rowIndices = expanded.rowIndices;
+
+      // Extract scalar series from expanded mapping (null for gap slots)
+      function extractSeries(extractor) {
+         return rowIndices.map(function(idx) {
+            if (idx === null) return null; // gap: null not zero
+            return extractor(sortedRows[idx]);
          });
-      },
-      getState: function() {
-         return Object.freeze({
-            node: state.currentNode,
-            range: state.currentRange,
-            username: state.currentUsername,
-            connected: state.connected,
-            receivedMonotonicMs: state.receivedMonotonicMs,
-            counterAgeAtReceiptSec: state.counterAgeAtReceiptSec,
-            usageAgeAtReceiptSec: state.usageAgeAtReceiptSec,
+      }
+
+      const cpuP50 = extractSeries(function(r) {
+         return (r.cpu_busy_pct && r.cpu_busy_pct.p50 != null) ? r.cpu_busy_pct.p50 : null;
+      });
+      const cpuP95 = extractSeries(function(r) {
+         return (r.cpu_busy_pct && r.cpu_busy_pct.p95 != null) ? r.cpu_busy_pct.p95 : null;
+      });
+      const cpuMax = extractSeries(function(r) {
+         return (r.cpu_busy_pct && r.cpu_busy_pct.max != null) ? r.cpu_busy_pct.max : null;
+      });
+      const load1 = extractSeries(function(r) { return r.load1 != null ? r.load1 : null; });
+      const load5 = extractSeries(function(r) { return r.load5 != null ? r.load5 : null; });
+      const load15 = extractSeries(function(r) { return r.load15 != null ? r.load15 : null; });
+
+      // Memory: per-row MemAvailable; derived used = MemTotal - MemAvailable (null if total missing)
+      const memAvailableSeries = extractSeries(function(r) {
+         return r.mem_available_kb != null ? r.mem_available_kb : null;
+      });
+      const memUsedSeries = extractSeries(function(r) {
+         // Used = MemTotal_kb - MemAvailable_kb; null if total missing, zero, or avail missing
+         if (memTotalKb == null || memTotalKb <= 0 || r.mem_available_kb == null) return null;
+         return memTotalKb - r.mem_available_kb;
+      });
+
+      // D-state: sparse per-grain maxima with exact interval_end and username
+      const dStatePoints = grains.map(function(g) {
+         return {
+            interval_end: g.interval_end || null,
+            value: g.d_state_fraction != null ? g.d_state_fraction : null,
+            username: g.d_state_username || null,
+         };
+      });
+
+      // Process grains data
+      const processLabels = grains.map(function(g) {
+         return (g.interval_end ? g.interval_end.slice(0, 16) : '-')
+            + (g.category ? ' ' + g.category : '');
+      });
+      const processCPU = grains.map(function(g) {
+         return g.cpu_seconds != null ? g.cpu_seconds : null;
+      });
+      const processCountP50 = grains.map(function(g) {
+         return g.process_count_p50 != null ? g.process_count_p50 : null;
+      });
+      const processCountMax = grains.map(function(g) {
+         return g.process_count_max != null ? g.process_count_max : null;
+      });
+      const processCountP95 = grains.map(function(g) {
+         return g.process_count_p95 != null ? g.process_count_p95 : null;
+      });
+      const processRSSP50 = grains.map(function(g) {
+         return g.rss_p50_kb != null ? g.rss_p50_kb : null;
+      });
+      const processRSSMax = grains.map(function(g) {
+         return g.rss_max_kb != null ? g.rss_max_kb : null;
+      });
+      const processRSSP95 = grains.map(function(g) {
+         return g.rss_p95_kb != null ? g.rss_p95_kb : null;
+      });
+      // Per-grain contributor usernames
+      const processCountMaxUsername = grains.map(function(g) {
+         return g.process_count_max_username || null;
+      });
+      const processRSSMaxUsername = grains.map(function(g) {
+         return g.rss_max_username || null;
+      });
+
+      // Network: collect all non-lo interfaces across all rows
+      // For each interface, build a time series (one value per expanded counter slot)
+      const ifaceSet = {};
+      sortedRows.forEach(function(r) {
+         if (r.network_rates) {
+            Object.keys(r.network_rates).forEach(function(iface) {
+               if (iface !== 'lo') ifaceSet[iface] = true;
+            });
+         }
+      });
+      const ifaceList = Object.keys(ifaceSet).sort();
+
+      // Build per-interface RX/TX p50 time series over expanded labels
+      const networkRXP50 = {};
+      const networkTXP50 = {};
+      const networkRXP95 = {};
+      const networkTXP95 = {};
+      const networkRXMax = {};
+      const networkTXMax = {};
+      ifaceList.forEach(function(iface) {
+         networkRXP50[iface] = extractSeries(function(r) {
+            return (r.network_rates && r.network_rates[iface] &&
+                    r.network_rates[iface].rx_bytes_per_sec &&
+                    r.network_rates[iface].rx_bytes_per_sec.p50 != null)
+               ? r.network_rates[iface].rx_bytes_per_sec.p50 : null;
          });
-      },
-   });
+         networkTXP50[iface] = extractSeries(function(r) {
+            return (r.network_rates && r.network_rates[iface] &&
+                    r.network_rates[iface].tx_bytes_per_sec &&
+                    r.network_rates[iface].tx_bytes_per_sec.p50 != null)
+               ? r.network_rates[iface].tx_bytes_per_sec.p50 : null;
+         });
+         networkRXP95[iface] = extractSeries(function(r) {
+            return (r.network_rates && r.network_rates[iface] &&
+                    r.network_rates[iface].rx_bytes_per_sec &&
+                    r.network_rates[iface].rx_bytes_per_sec.p95 != null)
+               ? r.network_rates[iface].rx_bytes_per_sec.p95 : null;
+         });
+         networkTXP95[iface] = extractSeries(function(r) {
+            return (r.network_rates && r.network_rates[iface] &&
+                    r.network_rates[iface].tx_bytes_per_sec &&
+                    r.network_rates[iface].tx_bytes_per_sec.p95 != null)
+               ? r.network_rates[iface].tx_bytes_per_sec.p95 : null;
+         });
+         networkRXMax[iface] = extractSeries(function(r) {
+            return (r.network_rates && r.network_rates[iface] &&
+                    r.network_rates[iface].rx_bytes_per_sec &&
+                    r.network_rates[iface].rx_bytes_per_sec.max != null)
+               ? r.network_rates[iface].rx_bytes_per_sec.max : null;
+         });
+         networkTXMax[iface] = extractSeries(function(r) {
+            return (r.network_rates && r.network_rates[iface] &&
+                    r.network_rates[iface].tx_bytes_per_sec &&
+                    r.network_rates[iface].tx_bytes_per_sec.max != null)
+               ? r.network_rates[iface].tx_bytes_per_sec.max : null;
+         });
+      });
+
+      // Lustre: collect all operations across all rows
+      const lustreOpSet = {};
+      sortedRows.forEach(function(r) {
+         if (r.lustre_md_summary) {
+            Object.keys(r.lustre_md_summary).forEach(function(op) {
+               lustreOpSet[op] = true;
+            });
+         }
+      });
+      const lustreOps = Object.keys(lustreOpSet).sort();
+
+      // Build per-operation time series for p50_sum, p95_sum, max_sum, target_count
+      const lustreP50Sum = {};
+      const lustreP95Sum = {};
+      const lustreMaxSum = {};
+      const lustreTargetCount = {};
+      lustreOps.forEach(function(op) {
+         lustreP50Sum[op] = extractSeries(function(r) {
+            return (r.lustre_md_summary && r.lustre_md_summary[op] &&
+                    r.lustre_md_summary[op].p50_sum != null)
+               ? r.lustre_md_summary[op].p50_sum : null;
+         });
+         lustreP95Sum[op] = extractSeries(function(r) {
+            return (r.lustre_md_summary && r.lustre_md_summary[op] &&
+                    r.lustre_md_summary[op].p95_sum != null)
+               ? r.lustre_md_summary[op].p95_sum : null;
+         });
+         lustreMaxSum[op] = extractSeries(function(r) {
+            return (r.lustre_md_summary && r.lustre_md_summary[op] &&
+                    r.lustre_md_summary[op].max_sum != null)
+               ? r.lustre_md_summary[op].max_sum : null;
+         });
+         lustreTargetCount[op] = extractSeries(function(r) {
+            return (r.lustre_md_summary && r.lustre_md_summary[op] &&
+                    r.lustre_md_summary[op].target_count != null)
+               ? r.lustre_md_summary[op].target_count : null;
+         });
+      });
+
+      // memoryUsedKb from counters.latest (snapshot-level, not per-row - for scalar displays)
+      const memoryUsedKbLatest = (counters.latest && counters.latest.mem_used_physical_kb != null)
+         ? counters.latest.mem_used_physical_kb : null;
+
+      return {
+         cpu: {
+            labels: expandedLabels,
+            cpuP50: cpuP50,
+            cpuP95: cpuP95,
+            cpuMax: cpuMax,
+            load1: load1,
+            load5: load5,
+            load15: load15,
+            units: 'percent_and_load',
+            yAxisCPU: 'y',
+            yAxisLoad: 'yLoad',
+            spanGaps: false,
+         },
+         memoryLabels: expandedLabels,
+         memoryAvailableSeries: memAvailableSeries,
+         memoryUsedSeries: memUsedSeries,
+         memoryTotalKb: memTotalKb,
+         memoryUsedKbLatest: memoryUsedKbLatest,
+         dStatePoints: dStatePoints,
+         dStateGrains: grains,
+         processGrains: grains,
+         processLabels: processLabels,
+         processCPU: processCPU,
+         processCountP50: processCountP50,
+         processCountMax: processCountMax,
+         processCountP95: processCountP95,
+         processRSSP50: processRSSP50,
+         processRSSP95: processRSSP95,
+         processRSSMax: processRSSMax,
+         processCountMaxUsername: processCountMaxUsername,
+         processRSSMaxUsername: processRSSMaxUsername,
+         networkLabels: expandedLabels,
+         ifaceList: ifaceList,
+         networkRXP50: networkRXP50,
+         networkTXP50: networkTXP50,
+         networkRXP95: networkRXP95,
+         networkTXP95: networkTXP95,
+         networkRXMax: networkRXMax,
+         networkTXMax: networkTXMax,
+         lustreOps: lustreOps,
+         lustreP50Sum: lustreP50Sum,
+         lustreP95Sum: lustreP95Sum,
+         lustreMaxSum: lustreMaxSum,
+         lustreTargetCount: lustreTargetCount,
+         counterGaps: counters.gaps || {},
+         usageGaps: usage.gaps || {},
+         // Lifecycle snapshot at build time (read-only copy)
+         _lifecycle: {
+            createCount: chartLifecycle.createCount,
+            destroyCount: chartLifecycle.destroyCount,
+            renders: Object.assign({}, chartLifecycle.renders),
+         },
+      };
+   }
+
+   // ---- Chart rendering ----
+
+   function renderCharts(snapshot) {
+      const input = buildChartData(snapshot);
+      const totalKb = input.memoryTotalKb;
+
+      // 1. CPU / Load chart
+      replaceChart('cpu', 'chart-cpu', {
+         type: 'line',
+         data: {
+            labels: input.cpu.labels,
+            datasets: [
+               {
+                  label: 'CPU p50 %',
+                  data: input.cpu.cpuP50,
+                  borderColor: '#005fcc',
+                  backgroundColor: 'rgba(0,95,204,0.08)',
+                  spanGaps: false,
+                  pointStyle: 'circle',
+                  tension: 0.2,
+                  yAxisID: 'y',
+               },
+               {
+                  label: 'CPU p95 %',
+                  data: input.cpu.cpuP95,
+                  borderColor: '#cc6600',
+                  backgroundColor: 'rgba(204,102,0,0.08)',
+                  borderDash: [6, 4],
+                  spanGaps: false,
+                  pointStyle: 'rectRot',
+                  tension: 0.2,
+                  yAxisID: 'y',
+               },
+               {
+                  label: 'CPU max %',
+                  data: input.cpu.cpuMax,
+                  borderColor: '#880000',
+                  backgroundColor: 'rgba(136,0,0,0.08)',
+                  borderDash: [2, 2],
+                  spanGaps: false,
+                  pointStyle: 'triangle',
+                  tension: 0.2,
+                  yAxisID: 'y',
+               },
+               {
+                  label: 'Load1',
+                  data: input.cpu.load1,
+                  borderColor: '#660099',
+                  backgroundColor: 'rgba(102,0,153,0.08)',
+                  spanGaps: false,
+                  pointStyle: 'crossRot',
+                  tension: 0.2,
+                  yAxisID: 'yLoad',
+               },
+               {
+                  label: 'Load5',
+                  data: input.cpu.load5,
+                  borderColor: '#228833',
+                  backgroundColor: 'rgba(34,136,51,0.08)',
+                  spanGaps: false,
+                  pointStyle: 'star',
+                  tension: 0.2,
+                  yAxisID: 'yLoad',
+               },
+               {
+                  label: 'Load15',
+                  data: input.cpu.load15,
+                  borderColor: '#aa8800',
+                  backgroundColor: 'rgba(170,136,0,0.08)',
+                  spanGaps: false,
+                  pointStyle: 'diamond',
+                  tension: 0.2,
+                  yAxisID: 'yLoad',
+               },
+            ],
+         },
+         options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+               y: {
+                  beginAtZero: true,
+                  type: 'linear',
+                  display: true,
+                  position: 'left',
+                  title: { display: true, text: 'CPU %' },
+               },
+               yLoad: {
+                  beginAtZero: true,
+                  type: 'linear',
+                  display: true,
+                  position: 'right',
+                  grid: { drawOnChartArea: false },
+                  title: { display: true, text: 'Load avg' },
+               },
+            },
+            plugins: {
+               tooltip: {
+                  callbacks: {
+                     label: function(c) {
+                        if (c.raw === null) return c.dataset.label + ': (gap/null)';
+                        const unit = c.dataset.yAxisID === 'yLoad' ? '' : '%';
+                        return c.dataset.label + ': ' + c.raw + unit;
+                     },
+                  },
+               },
+            },
+         },
+      });
+
+      // 2. Memory chart (GiB, with optional Percent toggle)
+      (function() {
+         // Ensure controls exist
+         let memControls = document.getElementById('mem-controls');
+         if (!memControls) {
+            memControls = document.createElement('div');
+            memControls.id = 'mem-controls';
+            memControls.setAttribute('data-testid', 'mem-controls');
+            memControls.innerHTML =
+               '<button type="button" data-testid="mem-mode-gib" aria-pressed="true">GiB</button>'
+               + '<button type="button" data-testid="mem-mode-percent" aria-pressed="false">Percent</button>';
+            const canvas = document.getElementById('chart-memory');
+            if (canvas && canvas.parentElement) {
+               canvas.parentElement.insertBefore(memControls, canvas);
+            }
+         }
+         // Determine current mode
+         const activeBtn = memControls.querySelector('button[aria-pressed="true"]');
+         const mode = activeBtn ? activeBtn.getAttribute('data-testid') : 'mem-mode-gib';
+         const isPercent = mode === 'mem-mode-percent' && totalKb != null && totalKb > 0;
+
+         function toDisplayVal(kb) {
+            if (kb == null) return null;
+            if (isPercent) {
+               return totalKb != null && totalKb > 0 ? (kb / totalKb) * 100 : null;
+            }
+            return kb / (1024 * 1024); // GiB
+         }
+
+         const memUsedDisplay = input.memoryUsedSeries.map(toDisplayVal);
+         const memAvailDisplay = input.memoryAvailableSeries.map(toDisplayVal);
+         const yLabel = isPercent ? 'Percent (%)' : 'GiB';
+
+         replaceChart('memory', 'chart-memory', {
+            type: 'line',
+            data: {
+               labels: input.memoryLabels,
+               datasets: [
+                  {
+                     label: 'Used (' + yLabel + ')',
+                     data: memUsedDisplay,
+                     borderColor: '#880000',
+                     backgroundColor: 'rgba(136,0,0,0.1)',
+                     spanGaps: false,
+                     pointStyle: 'rect',
+                     fill: false,
+                  },
+                  {
+                     label: 'Available (' + yLabel + ')',
+                     data: memAvailDisplay,
+                     borderColor: '#005fcc',
+                     backgroundColor: 'rgba(0,95,204,0.1)',
+                     spanGaps: false,
+                     pointStyle: 'circle',
+                     fill: false,
+                  },
+               ],
+            },
+            options: {
+               responsive: true,
+               maintainAspectRatio: false,
+               scales: {
+                  y: {
+                     beginAtZero: true,
+                     title: { display: true, text: yLabel },
+                  },
+               },
+               plugins: {
+                  tooltip: {
+                     callbacks: {
+                        label: function(c) {
+                           if (c.raw === null) return c.dataset.label + ': (null/missing)';
+                           return c.dataset.label + ': '
+                              + (isPercent ? c.raw.toFixed(1) + '%' : c.raw.toFixed(3) + ' GiB');
+                        },
+                     },
+                  },
+               },
+            },
+         });
+
+         // Re-bind toggle handlers each time (buttons may be recreated)
+         memControls.querySelectorAll('button').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+               memControls.querySelectorAll('button').forEach(function(b) {
+                  b.setAttribute('aria-pressed', 'false');
+               });
+               btn.setAttribute('aria-pressed', 'true');
+               // Re-render with new mode using stored snapshot
+               if (state.snapshot) renderCharts(state.snapshot);
+            });
+         });
+      })();
+
+      // 3. Process chart (mode toggle: CPU sum / process max / grain total RSS)
+      (function() {
+         let procControls = document.getElementById('proc-controls');
+         if (!procControls) {
+            procControls = document.createElement('div');
+            procControls.id = 'proc-controls';
+            procControls.setAttribute('data-testid', 'proc-controls');
+            procControls.innerHTML =
+               '<button type="button" data-testid="proc-mode-cpusum" aria-pressed="true">CPU sum</button>'
+               + '<button type="button" data-testid="proc-mode-max" aria-pressed="false">Process max</button>'
+               + '<button type="button" data-testid="proc-mode-rss" aria-pressed="false">Grain total RSS</button>';
+            const canvas = document.getElementById('chart-process');
+            if (canvas && canvas.parentElement) {
+               canvas.parentElement.insertBefore(procControls, canvas);
+            }
+         }
+
+         const activeBtn = procControls.querySelector('button[aria-pressed="true"]');
+         const mode = activeBtn ? activeBtn.getAttribute('data-testid') : 'proc-mode-cpusum';
+
+         let dataArr, yText, usernameArr;
+         if (mode === 'proc-mode-rss') {
+            dataArr = input.processRSSMax;
+            yText = 'grain total RSS (rss_max_kb)';
+            usernameArr = input.processRSSMaxUsername;
+         } else if (mode === 'proc-mode-max') {
+            dataArr = input.processCountMax;
+            yText = 'process count max per grain';
+            usernameArr = input.processCountMaxUsername;
+         } else {
+            // CPU sum (default)
+            dataArr = input.processCPU;
+            yText = 'cpu_seconds (additive, 15-min interval)';
+            usernameArr = null;
+         }
+
+         replaceChart('process', 'chart-process', {
+            type: 'bar',
+            data: {
+               labels: input.processLabels,
+               datasets: [
+                  {
+                     label: yText,
+                     data: dataArr,
+                     backgroundColor: '#005fcc',
+                     spanGaps: false,
+                  },
+               ],
+            },
+            options: {
+               responsive: true,
+               maintainAspectRatio: false,
+               scales: {
+                  y: {
+                     beginAtZero: true,
+                     title: { display: true, text: yText },
+                  },
+               },
+               plugins: {
+                  tooltip: {
+                     callbacks: {
+                        label: function(c) {
+                           const val = c.raw === null ? 'null' : c.raw;
+                           if (!usernameArr) return yText + ': ' + val;
+                           const user = usernameArr[c.dataIndex] || '-';
+                           return yText + ': ' + val + ' (contributor: ' + user + ')';
+                        },
+                     },
+                  },
+               },
+            },
+         });
+
+         procControls.querySelectorAll('button').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+               procControls.querySelectorAll('button').forEach(function(b) {
+                  b.setAttribute('aria-pressed', 'false');
+               });
+               btn.setAttribute('aria-pressed', 'true');
+               if (state.snapshot) renderCharts(state.snapshot);
+            });
+         });
+      })();
+
+      // 4. Network / Lustre chart (mode toggle)
+      (function() {
+         let nlControls = document.getElementById('nl-controls');
+         if (!nlControls) {
+            nlControls = document.createElement('div');
+            nlControls.id = 'nl-controls';
+            nlControls.setAttribute('data-testid', 'nl-controls');
+            nlControls.innerHTML =
+               '<button type="button" data-testid="nl-mode-network" aria-pressed="true">Network (p50)</button>'
+               + '<button type="button" data-testid="nl-mode-lustre-p50" aria-pressed="false">Lustre p50-sum</button>'
+               + '<button type="button" data-testid="nl-mode-lustre-p95" aria-pressed="false">Lustre p95-sum</button>'
+               + '<button type="button" data-testid="nl-mode-lustre-peak" aria-pressed="false">Lustre peak-sum</button>'
+               + '<button type="button" data-testid="nl-mode-lustre-targets" aria-pressed="false">Lustre target count</button>';
+            const canvas = document.getElementById('chart-network-lustre');
+            if (canvas && canvas.parentElement) {
+               canvas.parentElement.insertBefore(nlControls, canvas);
+            }
+         }
+
+         const activeBtn = nlControls.querySelector('button[aria-pressed="true"]');
+         const mode = activeBtn ? activeBtn.getAttribute('data-testid') : 'nl-mode-network';
+
+         const nlLabels = input.networkLabels.length ? input.networkLabels : ['—'];
+         const datasets = [];
+
+         // Color-blind-safe palette with distinct line styles
+         const colors = ['#005fcc', '#cc6600', '#228833', '#880000', '#660099', '#aa8800'];
+         const dashes = [[], [6, 4], [2, 2], [8, 2, 2, 2], [4, 4], [10, 2]];
+
+         if (mode === 'nl-mode-network') {
+            // Per-interface RX/TX p50 time series (default)
+            input.ifaceList.forEach(function(iface, idx) {
+               const rxColor = colors[idx * 2 % colors.length];
+               const txColor = colors[(idx * 2 + 1) % colors.length];
+               datasets.push({
+                  label: iface + ' RX p50 (B/s)',
+                  data: input.networkRXP50[iface],
+                  borderColor: rxColor,
+                  backgroundColor: rxColor,
+                  borderDash: dashes[idx % dashes.length],
+                  spanGaps: false,
+                  pointStyle: 'circle',
+               });
+               datasets.push({
+                  label: iface + ' TX p50 (B/s)',
+                  data: input.networkTXP50[iface],
+                  borderColor: txColor,
+                  backgroundColor: txColor,
+                  borderDash: dashes[(idx + 1) % dashes.length],
+                  spanGaps: false,
+                  pointStyle: 'rectRot',
+               });
+            });
+         } else if (mode === 'nl-mode-lustre-p50') {
+            input.lustreOps.forEach(function(op, idx) {
+               datasets.push({
+                  label: op + ' p50-sum (caveat: sum of per-target maxima)',
+                  data: input.lustreP50Sum[op],
+                  borderColor: colors[idx % colors.length],
+                  backgroundColor: colors[idx % colors.length],
+                  borderDash: dashes[idx % dashes.length],
+                  spanGaps: false,
+                  pointStyle: 'circle',
+               });
+            });
+         } else if (mode === 'nl-mode-lustre-p95') {
+            input.lustreOps.forEach(function(op, idx) {
+               datasets.push({
+                  label: op + ' p95-sum (caveat: sum of per-target maxima)',
+                  data: input.lustreP95Sum[op],
+                  borderColor: colors[idx % colors.length],
+                  backgroundColor: colors[idx % colors.length],
+                  borderDash: dashes[idx % dashes.length],
+                  spanGaps: false,
+                  pointStyle: 'rectRot',
+               });
+            });
+         } else if (mode === 'nl-mode-lustre-peak') {
+            input.lustreOps.forEach(function(op, idx) {
+               datasets.push({
+                  label: op + ' peak-sum/max_sum (caveat: sum of per-target maxima)',
+                  data: input.lustreMaxSum[op],
+                  borderColor: colors[idx % colors.length],
+                  backgroundColor: colors[idx % colors.length],
+                  borderDash: dashes[idx % dashes.length],
+                  spanGaps: false,
+                  pointStyle: 'triangle',
+               });
+            });
+         } else if (mode === 'nl-mode-lustre-targets') {
+            input.lustreOps.forEach(function(op, idx) {
+               datasets.push({
+                  label: op + ' target_count',
+                  data: input.lustreTargetCount[op],
+                  borderColor: colors[idx % colors.length],
+                  backgroundColor: colors[idx % colors.length],
+                  borderDash: dashes[idx % dashes.length],
+                  spanGaps: false,
+                  pointStyle: 'diamond',
+               });
+            });
+         }
+
+         replaceChart('networkLustre', 'chart-network-lustre', {
+            type: 'line',
+            data: {
+               labels: nlLabels,
+               datasets: datasets,
+            },
+            options: {
+               responsive: true,
+               maintainAspectRatio: false,
+               scales: {
+                  y: {
+                     beginAtZero: true,
+                     title: {
+                        display: true,
+                        text: mode === 'nl-mode-network' ? 'Bytes/sec (p50)' : 'Sum / count',
+                     },
+                  },
+               },
+               plugins: {
+                  tooltip: {
+                     callbacks: {
+                        label: function(c) {
+                           if (c.raw === null) return c.dataset.label + ': (null/gap)';
+                           return c.dataset.label + ': ' + c.raw;
+                        },
+                     },
+                  },
+               },
+            },
+         });
+
+         nlControls.querySelectorAll('button').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+               nlControls.querySelectorAll('button').forEach(function(b) {
+                  b.setAttribute('aria-pressed', 'false');
+               });
+               btn.setAttribute('aria-pressed', 'true');
+               if (state.snapshot) renderCharts(state.snapshot);
+            });
+         });
+      })();
+   }
+
+   // ---- Read-only test projection ----
+   (function() {
+      function deepFreeze(obj) {
+         if (obj === null || typeof obj !== 'object') return obj;
+         Object.freeze(obj);
+         Object.keys(obj).forEach(function(k) {
+            const v = obj[k];
+            if (v !== null && typeof v === 'object' && !Object.isFrozen(v)) {
+               deepFreeze(v);
+            }
+         });
+         return obj;
+      }
+
+      function deepClone(obj) {
+         if (obj === null || typeof obj !== 'object') return obj;
+         if (Array.isArray(obj)) return obj.map(deepClone);
+         const clone = {};
+         Object.keys(obj).forEach(function(k) { clone[k] = deepClone(obj[k]); });
+         return clone;
+      }
+
+      const testAPI = {
+         getTimerState: function() {
+            return Object.freeze({
+               refreshIntervals: state.refreshTimer === null ? 0 : 1,
+               ageIntervals: state.ageTimer === null ? 0 : 1,
+            });
+         },
+         getState: function() {
+            return Object.freeze({
+               node: state.currentNode,
+               range: state.currentRange,
+               username: state.currentUsername,
+               connected: state.connected,
+               receivedMonotonicMs: state.receivedMonotonicMs,
+               counterAgeAtReceiptSec: state.counterAgeAtReceiptSec,
+               usageAgeAtReceiptSec: state.usageAgeAtReceiptSec,
+            });
+         },
+         get chartData() {
+            const data = buildChartData(state.snapshot);
+            return deepFreeze(deepClone(data));
+         },
+         getChartLifecycle: function() {
+            return Object.freeze({
+               createCount: chartLifecycle.createCount,
+               destroyCount: chartLifecycle.destroyCount,
+               renders: Object.freeze(Object.assign({}, chartLifecycle.renders)),
+            });
+         },
+      };
+
+      window.__nodeMonitorTest = Object.freeze(testAPI);
+   })();
 
    startTimers();
    refreshDashboard();

@@ -77,6 +77,46 @@
     <div>running <span data-testid="procs-running">—</span></div>
     <div>total <span data-testid="procs-total">—</span></div>
   </article>
+  <section aria-label="Charts" class="charts-section">
+    <h2>Metric charts</h2>
+    <div class="chart-group">
+      <article aria-label="CPU and load chart">
+        <h3>CPU / Load</h3>
+        <canvas id="chart-cpu" data-testid="chart-cpu" aria-label="CPU p50 p95 max and load1 load5 load15 time series, one minute cadence; separate axes for unlike units"></canvas>
+        <table aria-label="CPU/load summary" class="chart-alt">
+          <thead><tr><th>Metric</th><th>Aggregation</th><th>Cadence</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>CPU busy %</td><td>p50 / p95 / max</td><td>1 min counter</td><td>Counter rows; gap = null not zero; observation-weighted, per-grain, closed interval</td></tr>
+            <tr><td>Load</td><td>load1 / load5 / load15</td><td>1 min counter</td><td>Separate scale (yLoad axis) from CPU %</td></tr>
+            <tr><td>D-state</td><td>per-grain max, contributor + own interval</td><td>15 min usage</td><td>Observation-weighted fraction; not node-wide/time-weighted</td></tr>
+          </tbody>
+        </table>
+      </article>
+      <article aria-label="Memory chart">
+        <h3>Memory (physical)</h3>
+        <canvas id="chart-memory" data-testid="chart-memory" aria-label="MemAvailable and MemTotal minus MemAvailable, percent or GiB toggle"></canvas>
+        <div class="chart-note"><p>Used = MemTotal − MemAvailable. Percentage disabled if mem_total_kb is null or zero; GiB remains available. Missing values shown as null, not zero.</p></div>
+      </article>
+      <article aria-label="Process chart">
+        <h3>Process</h3>
+        <canvas id="chart-process" data-testid="chart-process" aria-label="CPU sum (additive) or per-username-grain max process count / RSS with contributor"></canvas>
+        <table aria-label="Process summary" class="chart-alt">
+          <thead><tr><th>Mode</th><th>Metric</th><th>Contributor</th></tr></thead>
+          <tbody>
+            <tr><td>CPU sum</td><td>additive cpu_seconds, 15-min closed interval</td><td>sum across grains</td></tr>
+            <tr><td>Process max</td><td>process_count max per grain</td><td>independent username (process_count_max_username)</td></tr>
+            <tr><td>grain total RSS</td><td>rss_max_kb per grain</td><td>independent username (rss_max_username)</td></tr>
+          </tbody>
+        </table>
+        <div class="chart-note"><p>15-minute closed interval; process-sample observation denominator shown in tooltip.</p></div>
+      </article>
+      <article aria-label="Network and Lustre chart">
+        <h3>Network / Lustre</h3>
+        <canvas id="chart-network-lustre" data-testid="chart-network-lustre" aria-label="Network RX/TX per interface (no loopback lo); Lustre p50-sum p95-sum peak-sum"></canvas>
+        <div class="chart-note"><p>Loopback (lo) excluded. Lustre peak-sum: sum of per-target maxima — not instantaneous/global peak. Target count shown per operation. Statistic: p50-sum / p95-sum / peak-sum (max_sum).</p></div>
+      </article>
+    </div>
+  </section>
   <article data-testid="usage-hotspot-card" aria-label="Usage hotspot">
     <h3>D-state hotspot (15m)</h3>
     <div data-testid="d-state">—</div>
@@ -94,6 +134,7 @@
   <button type="button" data-testid="retry-btn" id="retry-btn">Retry connection</button>
 </section>
 
+<script src="/static/chart.umd.min.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

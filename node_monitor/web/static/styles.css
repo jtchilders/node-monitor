@@ -5,8 +5,14 @@ header { display: flex; justify-content: space-between; align-items: center; fle
 button { padding: .25rem .5rem; }
 button:focus-visible { outline: 2px solid #005fcc; outline-offset: 2px; }
 article { border: 1px solid #ccc; border-radius: .25rem; padding: .75rem; margin: .5rem; min-width: 12rem; }
+.charts-section { margin: 1rem 0; }
+.chart-group { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); gap: 1rem; }
+.chart-alt { border-collapse: collapse; font-size: .8rem; width: 100%; }
+.chart-alt th, .chart-alt td { border: 1px solid #999; padding: .25rem .35rem; text-align: left; }
+.chart-note { font-size: .8rem; color: #333; margin-top: .25rem; }
 @media (max-width: 720px) {
   article { min-width: 10rem; }
   .controls { flex-direction: column; align-items: flex-start; }
   .range-buttons { flex-wrap: wrap; }
+  .chart-group { grid-template-columns: 1fr; }
 }
