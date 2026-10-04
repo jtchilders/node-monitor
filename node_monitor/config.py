@@ -980,7 +980,7 @@ def load_config_file_any(path, home=None, database_url_env=None):
 # ==========================================================================
 
 _WEB_TOP_ALLOWED_KEYS = frozenset({"system", "web"})
-_WEB_SECTION_ALLOWED_KEYS = frozenset({"database", "socket_path"})
+_WEB_SECTION_ALLOWED_KEYS = frozenset({"database"})
 
 # The web YAML shape intentionally omits echo_sql, pool_timeout_sec,
 # pool_recycle_sec, and pool_pre_ping -- those are populated from
@@ -1082,7 +1082,6 @@ class WebConfig:
 
    system: str
    database: DatabaseConfig
-   socket_path: str
 
 
 def load_web_config(path, *, home=None, database_url_env=None):
@@ -1129,12 +1128,7 @@ def load_web_config(path, *, home=None, database_url_env=None):
          "web.database.url is required: set web.database.url in the "
          "config or set NODE_MONITOR_WEB_DB_URL")
    database = _validate_web_database_section(database_raw, resolved_url)
-   socket_raw = web.get("socket_path")
-   if socket_raw is None:
-      raise ConfigError("web.socket_path is required")
-   socket_path = _validate_web_socket_path(socket_raw, resolved_home)
    return WebConfig(
       system=_validate_nonempty_string(raw["system"], "system"),
       database=database,
-      socket_path=socket_path,
    )
