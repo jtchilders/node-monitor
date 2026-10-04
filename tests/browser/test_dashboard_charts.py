@@ -448,8 +448,10 @@ def test_canvas_has_nontransparent_pixels_after_render(browser_page, live_web, s
     wait_connected(page)
     wait_lifecycle(page)
 
-    # Verify canvas has actual pixel data (not blank white or all-transparent)
-    has_pixels = page.evaluate("""() => {
+    # Chart.js creates its object before the browser necessarily paints the
+    # first animation frame. Wait for observable pixels rather than racing
+    # createCount and sampling the canvas immediately.
+    has_pixels_js = """() => {
         const canvas = document.getElementById('chart-cpu');
         if (!canvas) return false;
         const ctx = canvas.getContext('2d');
@@ -457,15 +459,15 @@ def test_canvas_has_nontransparent_pixels_after_render(browser_page, live_web, s
         const w = canvas.width;
         const h = canvas.height;
         if (w <= 0 || h <= 0) return false;
-        const imageData = ctx.getImageData(0, 0, w, h);
-        const data = imageData.data;
-        // Check if any pixel is non-transparent (alpha > 0)
+        const data = ctx.getImageData(0, 0, w, h).data;
         for (let i = 3; i < data.length; i += 4) {
             if (data[i] > 0) return true;
         }
         return false;
-    }""")
-    assert has_pixels, "CPU chart canvas has no drawn pixels (all transparent/blank)"
+    }"""
+    page.wait_for_function(has_pixels_js, timeout=CONNECTED_TIMEOUT)
+    assert page.evaluate(has_pixels_js), (
+        "CPU chart canvas has no drawn pixels (all transparent/blank)")
 
     assert errors == []
 
