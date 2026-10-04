@@ -5,7 +5,7 @@ Design: node-monitor web process loads a web-only configuration that:
 - rejects every collector key (``nodes``, ``probe_python``, etc.)
 - uses ``NODE_MONITOR_WEB_DB_URL`` env var only when no explicit URL is in YAML
 - never reads ``NODE_MONITOR_DB_URL``
-- confines socket_path to ~/.node-monitor/run/ after expansion
+- rejects the removed legacy ``socket_path`` key
 - reuses ``DatabaseConfig`` validation and defaults
 """
 
@@ -36,7 +36,6 @@ def _valid(url="postgresql+psycopg2://reader@localhost/node_monitor_dev"):
                "options": "-c statement_timeout=3000 -c lock_timeout=2000",
             },
          },
-         "socket_path": "~/.node-monitor/run/web.sock",
       },
    }
 
@@ -45,7 +44,6 @@ def test_web_config_accepts_only_system_and_web(tmp_path):
    path = _write(tmp_path / "web.yaml", _valid())
    config = load_web_config(path, home="/home/operator")
    assert config.system == "polaris"
-   assert config.socket_path == "/home/operator/.node-monitor/run/web.sock"
    assert config.database.pool_size == 1
    assert config.database.max_overflow == 0
 
@@ -145,41 +143,11 @@ def test_web_config_rejects_overflow_other_than_0(tmp_path):
       load_web_config(path, home="/home/operator")
 
 
-def test_web_config_expands_tilde_to_injected_home(tmp_path):
-   path = _write(tmp_path / "web.yaml", _valid())
-   config = load_web_config(path, home="/custom/home")
-   assert config.socket_path == "/custom/home/.node-monitor/run/web.sock"
-
-
-def test_web_config_rejects_socket_path_outside_run_dir(tmp_path):
+def test_web_config_rejects_legacy_socket_path(tmp_path):
    raw = _valid()
-   raw["web"]["socket_path"] = "~/.node-monitor/web.sock"
+   raw["web"]["socket_path"] = "~/.node-monitor/run/web.sock"
    path = _write(tmp_path / "web.yaml", raw)
-   with pytest.raises(ConfigError, match="socket_path"):
-      load_web_config(path, home="/home/operator")
-
-
-def test_web_config_rejects_absolute_socket_path_outside_run_dir(tmp_path):
-   raw = _valid()
-   raw["web"]["socket_path"] = "/tmp/web.sock"
-   path = _write(tmp_path / "web.yaml", raw)
-   with pytest.raises(ConfigError, match="socket_path"):
-      load_web_config(path, home="/home/operator")
-
-
-def test_web_config_rejects_relative_socket_path_after_expansion(tmp_path):
-   raw = _valid()
-   raw["web"]["socket_path"] = "relative/web.sock"
-   path = _write(tmp_path / "web.yaml", raw)
-   with pytest.raises(ConfigError, match="socket_path"):
-      load_web_config(path, home="/home/operator")
-
-
-def test_web_config_rejects_nul_byte_in_socket_path(tmp_path):
-   raw = _valid()
-   raw["web"]["socket_path"] = "~/.node-monitor/run/web\x00.sock"
-   path = _write(tmp_path / "web.yaml", raw)
-   with pytest.raises(ConfigError, match="socket_path"):
+   with pytest.raises(ConfigError, match="unknown key"):
       load_web_config(path, home="/home/operator")
 
 

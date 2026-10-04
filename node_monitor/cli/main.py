@@ -1353,98 +1353,82 @@ def _run_daemon_postgres(nested, config_path, run_id, probe_version, home,
 
 @cli.command("web")
 @click.option("--config", "config_path", required=True,
-              type=click.Path(dir_okay=False, exists=True),
-              help="Path to the web-only YAML config file.")
-def web_command(config_path):
-   import os
+             type=click.Path(dir_okay=False, exists=True),
+             help="Path to the web-only YAML config file.")
+@click.option("--host", default="127.0.0.1", show_default=True,
+             help="Bind address for the TCP listener.")
+@click.option("--port", default=8080, type=int, show_default=True,
+             help="TCP port (1-65535).")
+@click.option("--no-browser", is_flag=True, default=False,
+             help="Suppress browser launch.")
+def web_command(config_path, host, port, no_browser):
+   import os, webbrowser
    from node_monitor.config import load_web_config, ConfigError
    from node_monitor.database.web import WebDatabase, WebDatabaseError
    from node_monitor.web.service import DashboardService
    from node_monitor.web.app import create_app
    from node_monitor.web.runtime import run_uvicorn
-   from node_monitor.web.socket import bind_private_socket, SocketError
 
-   config = None
-   db = None
-   service = None
-   app = None
-   sock = None
-   # Config preflight — YAML parse errors are caught separately to avoid
-   # interpolating parser exception objects into output.
+   if not host or "\x00" in host:
+      click.echo("invalid host: must be non-empty without NUL bytes", err=True)
+      sys.exit(1)
+   if isinstance(port, bool) or not isinstance(port, int) or port < 1 or port > 65535:
+      click.echo("invalid port: must be integer 1..65535, got %r" % (port,), err=True)
+      sys.exit(1)
+
+   config = None; db = None; service = None; app = None
    try:
       config = load_web_config(config_path)
-   except yaml.YAMLError:
-      click.echo("preflight failed", err=True)
-      sys.exit(1)
-   except ConfigError:
+   except (yaml.YAMLError, ConfigError):
       click.echo("preflight failed", err=True)
       sys.exit(1)
    except Exception:
       click.echo("preflight failed", err=True)
       sys.exit(1)
-   # DB constructor: construct inside try; dispose on every failure path.
    db = None
    try:
       db = WebDatabase(config.database)
    except Exception:
       click.echo("database initialization failed", err=True)
       try:
-         if db is not None:
-            db.dispose()
-      except Exception:
-         pass
+         if db is not None: db.dispose()
+      except Exception: pass
       sys.exit(1)
    try:
       db.preflight()
    except Exception:
       click.echo("database preflight failed", err=True)
       try:
-         if db is not None:
-            db.dispose()
-      except Exception:
-         pass
+         if db is not None: db.dispose()
+      except Exception: pass
       sys.exit(1)
-   # Service/app/socket construction — OSError and all Exception subclasses
-   # caught here; KeyboardInterrupt/SystemExit propagate through.
    try:
       service = DashboardService(db, system=config.system)
       app = create_app(service)
-      sock = bind_private_socket(config.socket_path)
    except Exception:
       click.echo("service initialization failed", err=True)
       try:
-         if sock is not None:
-            sock.close()
-      except Exception:
-         pass
-      try:
-         if db is not None:
-            db.dispose()
-      except Exception:
-         pass
+         if db is not None: db.dispose()
+      except Exception: pass
       sys.exit(1)
-   # One bounded startup line: PID + expanded socket path
-   click.echo("PID %d socket %s" % (os.getpid(), os.path.abspath(config.socket_path)))
+   display_host = host
+   browser_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+   url = "http://%s:%d" % (browser_host, port)
+   click.echo("PID %d http://%s:%d" % (os.getpid(), display_host, port))
+   if not no_browser:
+      try:
+         webbrowser.open(url, new=2)
+      except Exception:
+         pass
    try:
-      run_uvicorn(app, sock)
+      run_uvicorn(app, host=host, port=port)
    except Exception:
-      # Catch ordinary Exception (not BaseException) so KeyboardInterrupt
-      # and SystemExit propagate.  A fixed message prevents interpolating
-      # exception objects into output.
       click.echo("service failed", err=True)
       raise SystemExit(1)
    finally:
-      # Cleanup: close socket first, then dispose DB — deterministic order.
-      if sock is not None:
-         try:
-            sock.close()
-         except Exception:
-            pass
-      if db is not None:
-         try:
-            db.dispose()
-         except Exception:
-            pass
+      try:
+         if db is not None: db.dispose()
+      except Exception: pass
 
 
 def main():

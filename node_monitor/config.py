@@ -964,10 +964,7 @@ def load_config_file_any(path, home=None, database_url_env=None):
 # (``pool_timeout_sec``, ``pool_recycle_sec``, ``pool_pre_ping``,
 # ``echo_sql``) are populated from ``_DATABASE_DEFAULTS``.
 #
-# ``web.socket_path`` must expand to an absolute path inside the
-# operator's ``~/.node-monitor/run/`` directory.  ``~`` is expanded to
-# the ``home`` argument (never read from ``os.environ`` -- tests must not
-# depend on the invoking user's real $HOME).
+# ``web.socket_path`` removed (TCP-only listener).
 #
 # URL resolution order (explicit YAML always wins):
 #   1. ``web.database.url`` when present in YAML
@@ -980,7 +977,7 @@ def load_config_file_any(path, home=None, database_url_env=None):
 # ==========================================================================
 
 _WEB_TOP_ALLOWED_KEYS = frozenset({"system", "web"})
-_WEB_SECTION_ALLOWED_KEYS = frozenset({"database", "socket_path"})
+_WEB_SECTION_ALLOWED_KEYS = frozenset({"database"})
 
 # The web YAML shape intentionally omits echo_sql, pool_timeout_sec,
 # pool_recycle_sec, and pool_pre_ping -- those are populated from
@@ -1005,34 +1002,6 @@ def _validate_web_pool_size(value):
          "database.pool_size must be exactly 1 for the web process "
          "(single read-only connection), got %r" % (value,))
    return value
-
-
-def _validate_web_socket_path(value, home):
-   """Validate and expand socket_path; confine it to ~/.node-monitor/run/."""
-   if not isinstance(value, str) or not value:
-      raise ConfigError(
-         "web.socket_path must be a non-empty string, got %r" % (value,))
-   if "\x00" in value:
-      raise ConfigError(
-         "web.socket_path must not contain NUL bytes, got %r" % (value,))
-   # Expand leading ~/ against the injected home (never os.environ["HOME"])
-   if value == "~" or value.startswith("~/"):
-      expanded = home.rstrip("/") + value[1:]
-   else:
-      expanded = value
-   expanded = os.path.normpath(expanded)
-   if not os.path.isabs(expanded):
-      raise ConfigError(
-         "web.socket_path must be an absolute path after expansion "
-         "(relative paths are not safe for socket locations), "
-         "got %r (expanded to %r)" % (value, expanded))
-   # Confine to ~/.node-monitor/run/ under the injected home
-   run_dir = os.path.normpath(os.path.join(home, ".node-monitor", "run"))
-   if not expanded.startswith(run_dir + "/") and expanded != run_dir:
-      raise ConfigError(
-         "web.socket_path must be inside ~/.node-monitor/run/ "
-         "(expanded: %r, run_dir: %r)" % (expanded, run_dir))
-   return expanded
 
 
 def _validate_web_database_section(raw, resolved_url):
@@ -1082,7 +1051,6 @@ class WebConfig:
 
    system: str
    database: DatabaseConfig
-   socket_path: str
 
 
 def load_web_config(path, *, home=None, database_url_env=None):
@@ -1129,12 +1097,7 @@ def load_web_config(path, *, home=None, database_url_env=None):
          "web.database.url is required: set web.database.url in the "
          "config or set NODE_MONITOR_WEB_DB_URL")
    database = _validate_web_database_section(database_raw, resolved_url)
-   socket_raw = web.get("socket_path")
-   if socket_raw is None:
-      raise ConfigError("web.socket_path is required")
-   socket_path = _validate_web_socket_path(socket_raw, resolved_home)
    return WebConfig(
       system=_validate_nonempty_string(raw["system"], "system"),
       database=database,
-      socket_path=socket_path,
    )

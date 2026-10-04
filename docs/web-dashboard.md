@@ -42,7 +42,6 @@ rejected on sight.
 system: polaris
 
 web:
-  socket_path: ~/.node-monitor/run/web.sock
   database:
     schema: node_monitor
     pool_size: 1
@@ -51,14 +50,15 @@ web:
 
 Notes on this shape:
 
-- `web.socket_path` must resolve (after `~` expansion against the
-  operator's own home directory) to a path inside
-  `~/.node-monitor/run/`. Any other location is rejected before the
-  process attempts to bind.
+- Listener address and port are CLI settings, not YAML fields. The defaults
+  are `--host 127.0.0.1 --port 8080`; use those options to override either
+  value. There is no Unix-socket mode; `socket_path` has been removed and any
+  reference to it is rejected.
+- `--host 0.0.0.0` exposes the unauthenticated read-only dashboard to every
+  network source able to reach the selected port. Use it only when that
+  exposure is intentional; otherwise retain loopback and use SSH forwarding.
 - `web.database.schema` must be exactly `node_monitor`.
-- `web.database.pool_size` must be exactly `1`; `max_overflow` must be
-  exactly `0`. The web process is a single bounded reader, never a pool of
-  connections.
+- `pool_size` must be exactly `1`; `max_overflow` must be exactly `0`.
 - No password, connection string, internal hostname, or other credential
   belongs in a committed copy of this file.
 
@@ -82,221 +82,168 @@ leak into the read-only web process by accident.
 ## Foreground run command
 
 ```console
-node-monitor web --config /path/to/web-config.yaml
+node-monitor web --config /path/to/web-config.yaml [--host HOST] [--port PORT] [--no-browser]
 ```
 
-This is the only supported invocation shape: the web process always runs
-in the foreground, bound to the terminal or process supervisor that
-started it. There is no `--daemonize` or background-fork mode for the web
-process (unlike the collector's `daemon start --foreground` flag, which
-controls a separate detached-daemon lifecycle entirely).
+Defaults: `--host 127.0.0.1` `--port 8080`. `--no-browser` suppresses the
+best-effort browser open. The process always runs in the foreground,
+bound to TCP; there is no `--daemonize` mode (the collector's separate
+`daemon start --foreground` controls a different lifecycle).
 
 On successful startup the process prints exactly one bounded line to
 stdout before serving:
 
 ```
-PID <pid> socket <absolute socket path>
+PID <pid> http://<host>:<port>
 ```
 
 No other startup banner, and no credential, URL, or SQL text, is ever
-printed. On any failure (bad config, database preflight failure, socket
+printed. On any failure (bad config, database preflight failure, TCP
 bind failure, runtime crash) the process prints one bounded,
 credential-free line to stderr and exits nonzero -- it never prints a raw
 traceback or interpolates an underlying exception's message.
 
-## Run and socket modes
+## TCP-only mode (no Unix sockets)
 
-The web process serves HTTP exclusively over a Unix domain socket --
-it never binds a TCP port. Exactly one mode is supported:
+The web process serves HTTP exclusively over TCP -- there is no `AF_UNIX`
+mode. The legacy `socket_path` parameter has been removed; configuring it
+is rejected at startup. A duplicate-start against the same `host:port`
+while the first is still running fails closed: the TCP bind detects the
+occupied port and the second process exits nonzero with a bounded message.
 
-- **Unix socket, foreground, single process.** `web.socket_path` names an
-  `AF_UNIX` `SOCK_STREAM` socket under `~/.node-monitor/run/`. The parent
-  run directory is created (or verified) mode `0700`, owned by the
-  invoking user; the socket itself is created mode `0600` and verified
-  before `listen()` is ever called. A pre-existing socket at the same path
-  is probed: if it is still live (a real connect succeeds) the new process
-  refuses to start ("socket is already in use"); if it is conclusively
-  stale (the probe connect fails with `ECONNREFUSED` or `ENOENT`) the old
-  inode is removed and the new process binds cleanly. Any other probe
-  outcome (including `EACCES`) is treated conservatively as "still live"
-  and the new process refuses to start rather than risk clobbering a
-  working socket.
+Because the listener is TCP, remote access can go either directly
+(`curl http://127.0.0.1:8080/health`) when the bind is loopback, or
+through an optional SSH port-forward (`ssh -L 8080:localhost:8080 <host>`)
+when the service is bound to loopback only. A `0.0.0.0` bind exposes the
+dashboard directly; the operator must confirm that is intentional.
 
-There is no TCP listening mode and no option to expose the dashboard
-directly to a network interface -- every remote access path goes through
-an SSH tunnel (see below).
+For intentional shared access, the PBS Monitor-style invocation is:
+
+```console
+node-monitor web --config /path/to/web-config.yaml --host 0.0.0.0 --port 9998 --no-browser
+```
+
+This service has no HTTP authentication. Its database role is constrained to
+read-only access, but all clients that can reach the listener can view the
+dashboard data.
 
 ## Running detached with `screen`
 
 The web process has no built-in daemonization, so an operator who wants it
-to survive a disconnected terminal session runs it inside `screen` (or an
-equivalent terminal multiplexer such as `tmux`):
+to survive a disconnected terminal session runs it inside `screen` (or
+`tmux`):
 
 ```console
 screen -S node-monitor-web
 node-monitor web --config /path/to/web-config.yaml
-# Detach with Ctrl-A, D -- the process keeps running inside the screen session.
+# Detach with Ctrl-A, D -- process keeps running inside screen.
 ```
 
-To reattach later and check on it:
-
-```console
-screen -r node-monitor-web
-```
-
-To stop it, reattach and press Ctrl-C (or send SIGTERM/SIGINT to the
-process directly with `kill`) -- the process has no separate `stop`
-subcommand of its own.
+Reattach: `screen -r node-monitor-web`. Stop: reattach and press Ctrl-C,
+or send SIGTERM directly (`kill <pid>`); there is no separate `stop`
+subcommand.
 
 ## No automatic restart
 
 The web process does not restart itself after a crash, and node-monitor
 does not ship a supervisor, systemd unit, or watchdog for it. If the
-process exits (crash, OOM, a transport-level panic inside Uvicorn, or an
+process exits (crash, OOM, transport-level panic inside Uvicorn, or an
 operator-initiated stop), it stays down until an operator explicitly
 starts it again -- inside the same `screen` session, a fresh one, or
-under a process supervisor the operator chooses to configure separately.
-This is a known operational limitation, not an oversight: automatic
-restart is explicitly out of scope for this increment.
+under a process supervisor the operator chooses separately.
 
 ## Health check
 
-The process exposes `GET /health`, which returns `{"status": "ok"}` with
-HTTP 200 whenever the process is accepting connections -- it does **not**
-re-run the database preflight or touch PostgreSQL at all. A 200 from
-`/health` means the web process itself is alive; it does not by itself
-prove the database is reachable or that dashboard data is fresh (see the
-note at the end of this section).
+The process exposes `GET /health`, returning `{"status": "ok"}` with
+HTTP 200 whenever it is accepting TCP connections -- it does **not**
+re-run the database preflight or touch PostgreSQL. A 200 from `/health`
+means the web process is alive; it does not by itself prove the database
+is reachable or that dashboard data is fresh (see the note at the end).
 
-Because the API is served only over the Unix socket, `/health` must be
-checked either directly on the host (over the socket) or through an SSH
-tunnel (see the next section) -- never over a bare TCP connection, because
-none exists.
-
-### Checking `/health` over the socket directly on the host
+Because the API is TCP-only, `/health` is checked directly over TCP:
 
 ```console
-curl --unix-socket ~/.node-monitor/run/web.sock http://localhost/health
-```
-
-### Checking `/health` over an SSH tunnel
-
-```console
-ssh -L 8080:/home/<operator>/.node-monitor/run/web.sock <host>
 curl http://localhost:8080/health
 ```
 
-(Modern OpenSSH supports tunneling a local TCP port straight to a remote
-Unix socket with `-L local_port:/path/to/socket`; older OpenSSH may
-require `socat` or `nc -U` as a small relay on the remote side instead.)
+(When bound to loopback only, reach it through SSH port-forwarding:
+`ssh -L 8080:localhost:8080 <host>` then `curl http://localhost:8080/health`.)
 
-Note that `/health` returning 200 only proves the web process is up and
-accepting connections -- it does not query PostgreSQL. A dashboard that is
-"connected but stale" (the web process is healthy and reachable, but the
-most recent stored counter/usage data is older than the freshness
-threshold) is a distinct, honestly-reported condition surfaced by
-`/api/dashboard`'s own `is_fresh`/`status` fields, never by `/health`.
+A dashboard that is "connected but stale" (healthy and reachable, but
+most recent data older than the freshness threshold) is a separate,
+honestly-reported condition surfaced by `/api/dashboard`'s
+`is_fresh`/`status` fields, never by `/health`.
 
-## SSH tunnel to the dashboard
+## SSH tunnel (optional, loopback-bound services)
 
-The dashboard UI and `/api/dashboard` JSON endpoint are reached the same
-way as `/health`: tunnel a local TCP port to the exact path named by
-`web.socket_path` in the running process's configuration, then browse to
-the tunneled local port.
+When the service is bound to `127.0.0.1` (the safe default) and must be
+reached from another host, use SSH port forwarding rather than exposing
+`0.0.0.0`:
 
 ```console
-ssh -L 8080:/home/<operator>/.node-monitor/run/web.sock <host>
-# then open http://localhost:8080/ in a browser on the local machine
+ssh -L 8080:localhost:8080 <host>
+# then open http://localhost:8080/ in a browser locally
 ```
 
-The tunnel target is always the live process's own `web.socket_path` --
-never a hard-coded path -- so an operator who changes `socket_path` in
-their config must update the tunnel command to match.
+This is optional: a `0.0.0.0` bind requires no tunnel, but exposes the
+listener to all interfaces reachable from the host.
 
 ## Log location
 
-The web process does not write its own log file. All of its bounded
+The web process does not write its own log file. All bounded
 startup/shutdown/failure output goes to stdout/stderr, exactly as
-inherited from whatever launched it (a `screen` session's scrollback, a
-process supervisor's captured output, or a redirected file the operator
-sets up themselves, e.g. `node-monitor web --config ... >>
-~/web.log 2>&1`). There is no separate structured log file the process
-manages on its own, unlike the collector/daemon, which does maintain
-`~/.node_monitor_daemon.log`.
+inherited from whatever launched it (`screen` scrollback, supervisor
+capture, or an operator redirect such as
+`node-monitor web --config ... >> ~/web.log 2>&1`). There is no separate
+structured log file the process manages on its own.
 
 ## Duplicate-start behavior
 
-Starting a second `node-monitor web` process against the same
-`web.socket_path` while the first is still running fails closed: the
-socket-bind probe detects the first process is still live (a real connect
-to the existing socket succeeds) and the second process exits nonzero
-with a bounded "socket is already in use" message before it ever calls
-`listen()`. The first process's socket inode is never disturbed by the
+Starting a second `node-monitor web` against the same `host:port` while
+the first is still running fails closed: the TCP bind detects the
+occupied port (`EADDRINUSE`) and the second process exits nonzero before
+it serves. The first process's listener is never disturbed by the
 failed second attempt.
-
-If the first process has genuinely exited without cleaning up its own
-socket file (e.g. it was killed with `SIGKILL`), the stale socket is
-detected the same way: the connect probe fails conclusively
-(`ECONNREFUSED`/`ENOENT`), the old inode is unlinked, and the new process
-binds cleanly in its place.
-
-## Manual cross-UID socket-denial check
-
-The socket is created mode `0600` and owned by the user that started the
-process; the kernel itself enforces that no other UID can connect to it.
-To manually verify this on a multi-user host:
-
-```console
-# As the operator who started the web process:
-node-monitor web --config /path/to/web-config.yaml &
-
-# As a DIFFERENT user on the same host:
-curl --unix-socket /home/<operator>/.node-monitor/run/web.sock http://localhost/health
-# Expected: a permission-denied connection failure (curl reports
-# "Couldn't connect to server" / a kernel-level EACCES), never a 200.
-```
-
-If the second command ever succeeds for a foreign UID, that is a serious
-regression in the socket security contract and must be treated as a
-blocking defect, not a configuration quirk.
 
 ## PostgreSQL reader role: operator responsibility
 
 node-monitor never creates, modifies, or grants privileges to any
 PostgreSQL role, and never creates or drops any database. Before running
-`node-monitor web`, an operator with appropriate PostgreSQL administrative
-access must, using their own tooling, create a dedicated read-only role
-and grant it exactly the following, against the already-migrated
-`node_monitor` schema:
+`node-monitor web`, an operator with appropriate PostgreSQL
+administrative access must, using their own tooling, create a dedicated
+read-only role and grant exactly:
 
 - `CONNECT` on the target database.
 - `USAGE` on the `node_monitor` schema.
 - `SELECT` on every table in the `node_monitor` schema.
 
 And must ensure the role does **not** hold any of: `INSERT`, `UPDATE`,
-`DELETE`, `TRUNCATE`, `REFERENCES`, or `TRIGGER` on any table in the
-schema; database-level `TEMP` or `CREATE`; or schema-level `CREATE`. The
-web process's own startup preflight independently verifies every one of
-these grants and forbidden-privilege absences before it ever serves a
-request, and refuses to start if any check fails -- but the role itself
-must already exist with the correct grants before that preflight can
-succeed. Creating that role, and deciding which PostgreSQL server and
-database it lives on, remains entirely the operator's decision and
-action; node-monitor never performs it automatically.
+`DELETE`, `TRUNCATE`, `REFERENCES`, or `TRIGGER` on any table; database-level
+`TEMP` or `CREATE`; or schema-level `CREATE`. The web process's own
+preflight verifies every grant and forbidden-privilege absence before
+serving a request, and refuses to start if any check fails -- but the role
+must already exist with the correct grants before the preflight can
+succeed.
 
 ## node-monitor never manages the shared PostgreSQL server
 
-To restate plainly, because it is the single most important operational
-boundary in this document: node-monitor -- neither the collector/daemon
-nor the web process -- ever starts, stops, restarts, reconfigures, backs
-up, or otherwise manages the lifecycle of the PostgreSQL server itself.
-The server may be shared with other applications (for example, a
-`pbs-monitor` installation on the same host); node-monitor reads and
-writes only its own `node_monitor` schema and never touches any other
-schema, database, or role on that server. Database backups, server
-upgrades, `pg_ctl`/service-manager actions, and PostgreSQL server
-configuration changes are all operator responsibilities performed outside
-of node-monitor entirely.
+To restate plainly: node-monitor -- neither the collector/daemon nor the
+web process -- ever starts, stops, restarts, reconfigures, backs up, or
+manages the PostgreSQL server lifecycle. The server may be shared (e.g.
+with a `pbs-monitor` installation); node-monitor reads and writes only
+its `node_monitor` schema and never touches any other schema, database,
+or role. Backups, server upgrades, `pg_ctl` actions, and PostgreSQL
+configuration changes are all operator responsibilities.
+
+## Migration note: `socket_path` removed/rejected
+
+Earlier releases used `web.socket_path` (Unix domain socket). That
+parameter has been removed; any config that still references it is
+rejected at startup with a bounded error message. Operators migrating
+from a Unix-socket deployment should switch to `--host 127.0.0.1` (or an
+explicit bind) and `--port 8080`, update health checks to direct TCP
+(`curl http://localhost:8080/health`), and replace Unix-socket SSH
+tunnels with TCP port-forwarding or direct TCP reach when `0.0.0.0` is used.
 
 # Chart.js asset documentation
 
