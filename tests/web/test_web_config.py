@@ -5,7 +5,7 @@ Design: node-monitor web process loads a web-only configuration that:
 - rejects every collector key (``nodes``, ``probe_python``, etc.)
 - uses ``NODE_MONITOR_WEB_DB_URL`` env var only when no explicit URL is in YAML
 - never reads ``NODE_MONITOR_DB_URL``
-- confines socket_path to ~/.node-monitor/run/ after expansion
+- rejects the removed legacy ``socket_path`` key
 - reuses ``DatabaseConfig`` validation and defaults
 """
 

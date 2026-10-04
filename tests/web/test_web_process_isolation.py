@@ -1,31 +1,4 @@
-"""Real-PostgreSQL + real-subprocess collector/web process isolation
-acceptance (operational-web-dashboard plan Task 9, Step 3 second half).
-
-All tests in this file are unconditionally SKIPPED when
-NODE_MONITOR_TEST_DATABASE_URL is not set -- they never fabricate evidence.
-
-Builds a resident-like collector fixture (a background thread writing real
-``node_hardware``/``node_counter_minute`` rows through its own dedicated
-SQLAlchemy engine -- never the web process's engine) and a REAL
-``node-monitor web`` subprocess bound to a disposable UUID-named database
-through a UUID-named SELECT-only reader role. Proves:
-
-  * While the web process is induced into repeated query failures, the
-    resident-like collector's heartbeat and maximum counter timestamp keep
-    advancing (the two are genuinely independent processes/connections).
-  * Killing the web subprocess (SIGKILL) does not signal, interrupt, or
-    stale the collector thread.
-  * Stopping the collector leaves ``/health`` available on the still-running
-    web subprocess, and ``/api/dashboard`` reports connected-but-stale data
-    (the web process is up; the data it serves is honestly marked stale).
-
-Every subprocess/thread this file starts is bounded and guaranteed to be
-torn down in ``finally`` blocks, even on assertion failure. This file never
-starts, stops, restarts, or reconfigures PostgreSQL itself, and never
-touches ``pbs-monitor``, ``node_monitor_dev``, or the resident collector
-that may be running against the development database.
-"""
-
+"""Collector/web process isolation through the TCP-only web listener."""
 import json
 import os
 import signal
@@ -34,6 +7,7 @@ import sys
 import tempfile
 import threading
 import time
+import socket
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -54,7 +28,6 @@ from tests.web.conftest import (
 
 
 _PG_AVAILABLE = bool(os.environ.get("NODE_MONITOR_TEST_DATABASE_URL"))
-
 _SYSTEM = "polaris"
 _NODE = "login-04"
 
@@ -67,29 +40,23 @@ def _repo_python():
    return _VENV_PYTHON if os.path.exists(_VENV_PYTHON) else sys.executable
 
 
-# ---------------------------------------------------------------------------
-# Disposable DB + reader role + collector (writer) engine
-# ---------------------------------------------------------------------------
-
 class _ProcessIsolationEnv:
    def __init__(self):
       self.db_name = None
       self.role_name = None
       self.admin_url = None
       self.reader_url = None
-      self.collector_engine = None  # dedicated engine, never the web's own
+      self.collector_engine = None
 
 
 @pytest.fixture
 def process_isolation_env():
    if not _PG_AVAILABLE:
       pytest.skip("NODE_MONITOR_TEST_DATABASE_URL is required")
-
    admin_url = make_url(os.environ["NODE_MONITOR_TEST_DATABASE_URL"])
    db_name = disposable_identifier("nm_procisotest")
    role_name = disposable_identifier("nm_procisoreader")
    password = disposable_password()
-
    admin_engine = create_engine(
       admin_url, poolclass=NullPool, isolation_level="AUTOCOMMIT")
    with admin_engine.connect() as conn:
@@ -98,25 +65,16 @@ def process_isolation_env():
       conn.exec_driver_sql(
          "CREATE ROLE %s LOGIN PASSWORD %%s" % quote_identifier(role_name),
          (password,))
-
    db_admin_engine = create_engine(
       admin_url.set(database=db_name), poolclass=NullPool)
-
    env = _ProcessIsolationEnv()
    try:
       runner = MigrationRunner(db_admin_engine, "task9-procisolation-test")
       runner.migrate()
-
-      # Revoke default PUBLIC TEMP so this disposable database matches the
-      # expected production setup -- WebDatabase.preflight() fails closed
-      # on any database-level TEMP privilege (see
-      # test_web_database_preflight.py's migrated_reader_engine fixture,
-      # which performs this exact same revoke for the same reason).
       with admin_engine.connect() as conn:
          conn.exec_driver_sql(
             'REVOKE TEMP ON DATABASE "%s" FROM PUBLIC'
             % quote_identifier(db_name))
-
       with db_admin_engine.connect() as conn:
          conn.exec_driver_sql(
             "GRANT CONNECT ON DATABASE \"%s\" TO %s"
@@ -128,17 +86,13 @@ def process_isolation_env():
             "GRANT SELECT ON ALL TABLES IN SCHEMA node_monitor TO %s"
             % quote_identifier(role_name))
          conn.commit()
-
       env.db_name = db_name
       env.role_name = role_name
       env.admin_url = admin_url.set(database=db_name)
       env.reader_url = admin_url.set(
          database=db_name, username=role_name, password=password)
-      # The collector's OWN dedicated engine -- deliberately a brand-new
-      # engine object, never reused by (or shared with) the web process.
       env.collector_engine = create_engine(
          str(env.admin_url), poolclass=NullPool)
-
       yield env
    finally:
       if env.collector_engine is not None:
@@ -155,19 +109,7 @@ def process_isolation_env():
       admin_engine.dispose()
 
 
-# ---------------------------------------------------------------------------
-# Resident-like collector fixture: a bounded background thread that writes
-# real rows through its OWN dedicated engine, independent of the web process.
-# ---------------------------------------------------------------------------
-
 class ResidentCollector:
-   """A bounded background thread simulating a resident node-monitor
-   collector: it periodically writes a fresh ``node_counter_minute`` row
-   (advancing the maximum stored window_end) and records its own heartbeat
-   timestamp, using a dedicated SQLAlchemy engine that the web process never
-   touches.
-   """
-
    def __init__(self, engine, system, node, *, interval_sec=0.2):
       self._engine = engine
       self._system = system
@@ -232,19 +174,11 @@ class ResidentCollector:
                self._tick_count += 1
             self._stop_event.wait(self._interval_sec)
       except Exception as exc:
-         # Deliberately broad: this is a background thread with no caller
-         # on the stack to propagate to. Any failure here (DB error,
-         # connection loss, etc.) is stored and re-raised synchronously
-         # from stop() so the test body still sees it and fails loudly --
-         # narrowing this to a DB-specific exception type would silently
-         # swallow any other failure mode in this thread instead of
-         # surfacing it. The exception is never silently discarded.
          self._error = exc
 
    def start(self):
       self._thread = threading.Thread(target=self._run, daemon=True)
       self._thread.start()
-      # Wait for at least one real tick before returning control.
       deadline = time.monotonic() + 5.0
       while time.monotonic() < deadline:
          with self._lock:
@@ -275,38 +209,27 @@ class ResidentCollector:
          ), {"system": self._system, "node": self._node}).scalar_one()
 
 
-# ---------------------------------------------------------------------------
-# Real `node-monitor web` subprocess harness
-# ---------------------------------------------------------------------------
-
-class WebSubprocess:
-   """Launches the real ``node-monitor web --config ...`` CLI as a bounded
-   subprocess bound to a temporary ``HOME`` so it never touches the
-   operator's real ``~/.node-monitor`` run directory.
-   """
-
-   def __init__(self, reader_url):
+class TCPWebSubprocess:
+   def __init__(self, reader_url, host="127.0.0.1", port=0):
       self._reader_url = reader_url
-      # Use a short /tmp path for HOME rather than tempfile's default
-      # (which resolves under macOS's long /private/var/folders/... prefix
-      # and overflows the 103-byte AF_UNIX path limit once ~/.node-monitor/
-      # run/web.sock is appended -- see tests/web/test_web_socket.py's
-      # short_tmp fixture for the same constraint).
-      self._tmp_home = tempfile.mkdtemp(prefix="nmw_", dir="/tmp")
-      self._config_path = os.path.join(self._tmp_home, "web_config.yaml")
-      self._socket_path = os.path.join(
-         self._tmp_home, ".node-monitor", "run", "web.sock")
+      self.host = host
+      if port:
+         self.port = port
+      else:
+         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+         probe.bind((host, 0))
+         self.port = probe.getsockname()[1]
+         probe.close()
       self.process = None
+      # Safe short /tmp-based HOME (tests explicitly permit HOME temp)
+      self._tmp_home = tempfile.mkdtemp(prefix="nmtcp_", dir="/tmp")
+      self._config_path = os.path.join(self._tmp_home, "tcp_config.yaml")
 
    def _write_config(self):
-      os.makedirs(
-         os.path.join(self._tmp_home, ".node-monitor", "run"),
-         mode=0o700, exist_ok=True)
-      with open(self._config_path, "w") as handle:
-         handle.write(
+      with open(self._config_path, "w") as h:
+         h.write(
             "system: %s\n"
             "web:\n"
-            "  socket_path: ~/.node-monitor/run/web.sock\n"
             "  database:\n"
             "    url: %s\n" % (_SYSTEM, str(self._reader_url)))
 
@@ -317,38 +240,34 @@ class WebSubprocess:
       env["PYTHONPATH"] = _REPO_ROOT
       self.process = subprocess.Popen(
          [_repo_python(), "-m", "node_monitor.cli.main", "web",
-          "--config", self._config_path],
+          "--config", self._config_path,
+          "--host", self.host, "--port", str(self.port), "--no-browser"],
          cwd=_REPO_ROOT, env=env,
-         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-      )
-      self._wait_for_socket(timeout=10.0)
-
-   def _wait_for_socket(self, timeout):
-      deadline = time.monotonic() + timeout
+         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+      # TCP readiness: poll health endpoint on TCP loopback
+      deadline = time.monotonic() + 10.0
       while time.monotonic() < deadline:
          if self.process.poll() is not None:
             out, err = self.process.communicate(timeout=2)
             raise AssertionError(
                "web subprocess exited early (rc=%s): stdout=%r stderr=%r"
                % (self.process.returncode, out, err))
-         if os.path.exists(self._socket_path):
-            try:
-               client = self.client()
-               resp = client.get("/health", timeout=1.0)
-               client.close()
+         try:
+            with httpx.Client(
+               base_url="http://%s:%d" % (self.host, self.port),
+               timeout=1.0) as client:
+               resp = client.get("/health")
                if resp.status_code == 200:
                   return
-            except httpx.TransportError:
-               # Expected during the narrow window between socket-file
-               # creation and the server actually accepting connections
-               # (ECONNREFUSED/transport-level failure) -- retry.
-               pass
+         except Exception:
+            pass
          time.sleep(0.1)
-      raise AssertionError("web subprocess never became ready")
+      raise AssertionError("web subprocess never became ready on TCP %s:%d"
+         % (self.host, self.port))
 
    def client(self):
-      transport = httpx.HTTPTransport(uds=self._socket_path)
-      return httpx.Client(transport=transport, base_url="http://nodemonitor")
+      return httpx.Client(
+         base_url="http://%s:%d" % (self.host, self.port))
 
    def is_alive(self):
       return self.process is not None and self.process.poll() is None
@@ -359,7 +278,7 @@ class WebSubprocess:
       self.process.kill()
       try:
          self.process.wait(timeout=timeout)
-      except subprocess.TimeoutExpired:  # pragma: no cover -- defensive
+      except subprocess.TimeoutExpired:
          pass
 
    def cleanup(self):
@@ -367,16 +286,11 @@ class WebSubprocess:
          self.process.kill()
          try:
             self.process.wait(timeout=5.0)
-         except subprocess.TimeoutExpired:  # pragma: no cover
+         except subprocess.TimeoutExpired:
             pass
       import shutil
       shutil.rmtree(self._tmp_home, ignore_errors=True)
 
-
-# ---------------------------------------------------------------------------
-# Step 3: collector heartbeat/counter timestamp advance under web failure;
-# killing the web subprocess does not signal/stale the collector.
-# ---------------------------------------------------------------------------
 
 @pg_skip
 def test_collector_advances_while_web_query_fails_and_survives_web_kill(
@@ -384,21 +298,15 @@ def test_collector_advances_while_web_query_fails_and_survives_web_kill(
    collector = ResidentCollector(
       process_isolation_env.collector_engine, _SYSTEM, _NODE,
       interval_sec=0.2)
-   web = WebSubprocess(process_isolation_env.reader_url)
+   web = TCPWebSubprocess(process_isolation_env.reader_url)
    try:
       collector.start()
       web.start()
-
       client = web.client()
       try:
-         # Induce repeated web query failures: an unknown node is rejected
-         # by the real DashboardService's in-transaction inventory lookup
-         # (422) on every call -- a genuine, repeated web-side failure mode
-         # that touches the database on every request.
          failures = 0
          heartbeat_before, ticks_before = collector.heartbeat_and_ticks()
          max_window_before = collector.max_counter_window_end()
-
          for _ in range(10):
             resp = client.get(
                "/api/dashboard",
@@ -407,10 +315,8 @@ def test_collector_advances_while_web_query_fails_and_survives_web_kill(
             assert resp.status_code == 422
             failures += 1
             time.sleep(0.1)
-
          heartbeat_after, ticks_after = collector.heartbeat_and_ticks()
          max_window_after = collector.max_counter_window_end()
-
          assert failures == 10
          assert ticks_after > ticks_before, (
             "collector must keep ticking while the web process fails "
@@ -421,15 +327,11 @@ def test_collector_advances_while_web_query_fails_and_survives_web_kill(
             "collector's maximum counter timestamp must keep advancing")
       finally:
          client.close()
-
-      # Kill the web subprocess -- the collector must not be signaled,
-      # interrupted, or staled by this at all.
       heartbeat_before_kill, ticks_before_kill = collector.heartbeat_and_ticks()
       assert web.is_alive()
       web.kill()
       assert not web.is_alive()
-
-      time.sleep(0.6)  # bounded: let a couple more collector ticks happen
+      time.sleep(0.6)
       assert collector.is_alive(), (
          "collector thread must survive the web subprocess being killed")
       heartbeat_after_kill, ticks_after_kill = collector.heartbeat_and_ticks()
@@ -441,45 +343,27 @@ def test_collector_advances_while_web_query_fails_and_survives_web_kill(
       web.cleanup()
 
 
-# ---------------------------------------------------------------------------
-# Step 3: stopping the collector leaves /health available and dashboard
-# data connected-but-stale.
-# ---------------------------------------------------------------------------
-
 @pg_skip
 def test_stopping_collector_leaves_health_available_and_data_stale(
       process_isolation_env):
-   """The collector writes ONLY already-old (pre-stale) counter windows --
-   anchored far enough in the past that COUNTER_STALENESS_SECONDS is
-   already exceeded at write time -- then is explicitly stopped. The web
-   subprocess, queried only AFTER the collector stops, must still answer
-   /health, while /api/dashboard reports connected-but-stale counter data.
-   This proves the staleness contract without requiring the test to sleep
-   past the real 120-second freshness window.
-   """
    collector = ResidentCollector(
       process_isolation_env.collector_engine, _SYSTEM, _NODE,
       interval_sec=0.2)
-   web = WebSubprocess(process_isolation_env.reader_url)
+   web = TCPWebSubprocess(process_isolation_env.reader_url)
    try:
       collector.write_hardware_row()
-      # Write a handful of counter rows anchored well beyond the staleness
-      # threshold -- the collector has, in effect, "already stopped"
-      # producing fresh data from the dashboard's point of view.
       stale_anchor = (
          datetime.now(timezone.utc)
          - timedelta(seconds=COUNTER_STALENESS_SECONDS * 5))
       for minute_offset in range(5):
          collector.write_one_counter_row(
             stale_anchor + timedelta(minutes=minute_offset))
-
       web.start()
       client = web.client()
       try:
          health = client.get("/health", timeout=5.0)
          assert health.status_code == 200
          assert health.json() == {"status": "ok"}
-
          resp = client.get(
             "/api/dashboard", params={"node": _NODE, "range": "24h"},
             timeout=10.0)
@@ -487,8 +371,6 @@ def test_stopping_collector_leaves_health_available_and_data_stale(
          data = resp.json()
          assert data["counters"]["is_fresh"] is False
          assert data["counters"]["status"] == "stale"
-         # Connected-but-stale: the web process answered successfully (not
-         # a 503/timeout) with real, non-empty historical rows.
          assert len(data["counters"]["rows"]) > 0
       finally:
          client.close()
@@ -497,18 +379,12 @@ def test_stopping_collector_leaves_health_available_and_data_stale(
       web.cleanup()
 
 
-# ---------------------------------------------------------------------------
-# Bounded-process guarantee: both fixtures above tear down deterministically
-# even when the body raises -- proven by a deliberately-failing body whose
-# `finally` cleanup still runs and leaves no process/thread behind.
-# ---------------------------------------------------------------------------
-
 @pg_skip
 def test_cleanup_runs_even_when_test_body_raises(process_isolation_env):
    collector = ResidentCollector(
       process_isolation_env.collector_engine, _SYSTEM, _NODE,
       interval_sec=0.2)
-   web = WebSubprocess(process_isolation_env.reader_url)
+   web = TCPWebSubprocess(process_isolation_env.reader_url)
    cleanup_ran = {"collector": False, "web": False}
    try:
       collector.start()
