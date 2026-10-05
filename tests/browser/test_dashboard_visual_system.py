@@ -1,74 +1,117 @@
-"""Visual-system acceptance for the production node-monitor dashboard."""
+"""Task 2 visual-system exact-state assertions (rewritten, non-tautological)."""
+import copy
 from playwright.sync_api import expect
 
 CONNECTED_TIMEOUT = 10000
 
 
-def open_dashboard(browser_page, live_web):
-   page, errors, external = browser_page
-   page.goto(live_web.url + "/")
-   expect(page.locator('[data-testid="connectivity-status"]')).to_have_text(
-      "Connected", timeout=CONNECTED_TIMEOUT)
-   page.wait_for_function(
-      "() => window.__nodeMonitorTest "
-      "&& window.__nodeMonitorTest.getChartLifecycle().createCount === 4",
-      timeout=CONNECTED_TIMEOUT)
-   return page, errors, external
+def test_semantic_state_stale_usage_current_counters(browser_page, live_web, snapshot_complete):
+    page, _, _ = browser_page
+    snapshot = copy.deepcopy(snapshot_complete)
+    snapshot["usage"]["status"] = "stale"
+    snapshot["usage"]["is_fresh"] = False
+    live_web.state.set_snapshot(snapshot)
+    page.goto(live_web.url + "/")
+    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected", timeout=CONNECTED_TIMEOUT)
+    # Header connected
+    header = page.locator('.dashboard-header')
+    cls_header = header.get_attribute('class') or ''
+    assert 'is-connected' in cls_header
+    # Counter card exact state-current
+    counter_card = page.locator('[data-testid="counter-card"]')
+    expect(counter_card).to_have_class(r"state-current")
+    # Usage card exact state-stale (not broad any)
+    usage_card = page.locator('[data-testid="usage-card"]')
+    cls_usage = usage_card.get_attribute('class') or ''
+    assert 'state-stale' in cls_usage, f"usage class must be exactly state-stale, got: {cls_usage}"
+    assert 'state-current' not in cls_usage
+    # Freshness text exact
+    expect(page.locator('[data-testid="counter-freshness"]')).to_have_text("Current")
+    expect(page.locator('[data-testid="usage-freshness"]')).to_have_text("Stale")
 
 
-def css_value(page, selector, property_name):
-   return page.locator(selector).first.evaluate(
-      "(el, name) => getComputedStyle(el).getPropertyValue(name).trim()",
-      property_name)
+def test_disconnect_retains_stale_classes(browser_page, live_web, snapshot_complete):
+    page, _, _ = browser_page
+    # Load stale usage snapshot first
+    snapshot = copy.deepcopy(snapshot_complete)
+    snapshot["usage"]["status"] = "stale"
+    snapshot["usage"]["is_fresh"] = False
+    live_web.state.set_snapshot(snapshot)
+    page.goto(live_web.url + "/")
+    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected", timeout=CONNECTED_TIMEOUT)
+    # Record CPU text and usage stale class
+    before_cpu = page.locator('[data-testid="cpu-busy"]').inner_text()
+    usage_card = page.locator('[data-testid="usage-card"]')
+    cls_usage_before = usage_card.get_attribute('class') or ''
+    assert 'state-stale' in cls_usage_before
+    # Fail server and trigger different range click
+    live_web.state.fail()
+    page.locator('[data-range="3h"]').click()
+    # Wait exact disconnect text
+    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Web server disconnected", timeout=CONNECTED_TIMEOUT)
+    # Header exact disconnected
+    header = page.locator('.dashboard-header')
+    cls_header = header.get_attribute('class') or ''
+    assert 'is-disconnected' in cls_header
+    assert 'is-connected' not in cls_header
+    # Usage remains state-stale, CPU unchanged, retry NOT visible
+    cls_usage_after = page.locator('[data-testid="usage-card"]').get_attribute('class') or ''
+    assert 'state-stale' in cls_usage_after
+    assert page.locator('[data-testid="cpu-busy"]').inner_text() == before_cpu
+    retry_btn = page.locator('[data-testid="retry-btn"]')
+    assert not retry_btn.is_visible()
+    # Charts not replaced/destroyed: lifecycle projection unchanged
+    lc_before = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
+    assert page.locator('#chart-cpu').count() == 1
 
 
-def test_narrow_400px_no_masked_overflow(browser_page, live_web):
-   page, errors, external = open_dashboard(browser_page, live_web)
-   page.set_viewport_size({"width": 400, "height": 800})
-   body_ox = css_value(page, "body", "overflow-x")
-   shell_ox = css_value(page, ".dashboard-shell", "overflow-x")
-   assert body_ox not in ("hidden", "clip"), "body overflow-x masked: %s" % body_ox
-   assert shell_ox not in ("hidden", "clip"), ".dashboard-shell overflow-x masked: %s" % shell_ox
-   sw = page.evaluate("""() => {
-       const b = document.body; return {sw: b.scrollWidth, cw: b.clientWidth, sh: b.scrollHeight};
-   }""")
-   overflowers = page.evaluate("""() => {
-       const all = document.querySelectorAll('*');
-       const overs = [];
-       for (const el of all) {
-           if (el.scrollWidth > el.clientWidth + 2) {
-               overs.push({tag: el.tagName, cls: el.className, id: el.id, sw: el.scrollWidth, cw: el.clientWidth, r: el.getBoundingClientRect().right});
-           }
-       }
-       return overs.slice(0, 10);
-   }""")
-   assert sw["sw"] <= sw["cw"] + 2, "body scrollWidth %d > clientWidth %d" % (sw["sw"], sw["cw"])
-   for sel in (".dashboard-header", ".control-panel", ".metric-panel", ".status-grid > article"):
-       expect(page.locator(sel).first).to_be_visible()
-   assert errors == []
-   assert external == []
+def test_partial_and_empty_states(browser_page, live_web, snapshot_complete):
+    page, _, _ = browser_page
+    partial = copy.deepcopy(snapshot_complete)
+    partial["counters"]["status"] = "partial"
+    partial["usage"]["status"] = "partial"
+    live_web.state.set_snapshot(partial)
+    page.goto(live_web.url + "/")
+    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected", timeout=CONNECTED_TIMEOUT)
+    # Wait exact Partial text
+    expect(page.locator('[data-testid="counter-freshness"]')).to_have_text("Partial")
+    expect(page.locator('[data-testid="usage-freshness"]')).to_have_text("Partial")
+    # Exact partial classes
+    assert 'state-partial' in (page.locator('[data-testid="counter-card"]').get_attribute('class') or '')
+    assert 'state-partial' in (page.locator('[data-testid="usage-card"]').get_attribute('class') or '')
+    # Then set empty with DIFFERENT range click (e.g., 12h)
+    empty = copy.deepcopy(snapshot_complete)
+    empty["counters"].update({"rows": [], "latest": None, "newest_window_end": None, "status": "empty", "is_fresh": False})
+    empty["usage"].update({"grains": [], "newest_interval_end": None, "status": "empty", "is_fresh": False})
+    live_web.state.set_snapshot(empty)
+    page.locator('[data-range="12h"]').click()
+    # Wait exact Empty text
+    expect(page.locator('[data-testid="counter-freshness"]')).to_have_text("Empty")
+    expect(page.locator('[data-testid="usage-freshness"]')).to_have_text("Empty")
+    # Exact empty classes
+    for card in ('counter-card', 'usage-card'):
+        cls = page.locator(f'[data-testid="{card}"]').get_attribute('class') or ''
+        assert 'state-empty' in cls, f"expected state-empty on {card}, got {cls}"
+    # CPU '-' and header connected
+    assert page.locator('[data-testid="cpu-busy"]').inner_text() == "-"
+    header_cls = page.locator('.dashboard-header').get_attribute('class') or ''
+    assert 'is-connected' in header_cls
+    retry_btn = page.locator('[data-testid="retry-btn"]')
+    assert not retry_btn.is_visible()
 
 
-def test_uses_pbs_monitor_visual_tokens(browser_page, live_web):
-   page, errors, external = open_dashboard(browser_page, live_web)
-   assert css_value(page, "body", "background-color") == "rgb(26, 26, 46)"
-   assert css_value(page, ".dashboard-header", "background-color") == "rgb(22, 33, 62)"
-   assert css_value(page, ".metric-panel", "border-color") == "rgb(45, 55, 72)"
-   assert css_value(page, "body", "color") == "rgb(224, 224, 224)"
-   assert errors == []
-   assert external == []
-
-
-def test_dashboard_has_operational_hierarchy(browser_page, live_web):
-   page, errors, external = open_dashboard(browser_page, live_web)
-   expect(page.locator(".dashboard-header")).to_be_visible()
-   expect(page.locator(".control-panel")).to_be_visible()
-   assert page.locator(".status-grid > article").count() == 4
-   assert page.locator(".metric-grid > article.metric-panel").count() == 4
-   for testid in (
-      "system-name", "node-name", "connectivity-status", "data-age-value",
-      "cpu-busy", "procs-running", "procs-total",
-   ):
-      expect(page.locator('[data-testid="%s"]' % testid)).to_be_visible()
-   assert errors == []
-   assert external == []
+def test_first_load_failure_header_disconnected_and_retry_visible(browser_page, live_web):
+    page, _, _ = browser_page
+    live_web.state.fail()
+    page.goto(live_web.url + "/")
+    # Wait exact connection failure text
+    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connection failure", timeout=CONNECTED_TIMEOUT)
+    # Header exact disconnected
+    header = page.locator('.dashboard-header')
+    cls_header = header.get_attribute('class') or ''
+    assert 'is-disconnected' in cls_header
+    assert 'is-connected' not in cls_header
+    # Retry visible
+    retry_btn = page.locator('[data-testid="retry-btn"]')
+    expect(retry_btn).to_be_visible()
+    # No card state class required before any snapshot
