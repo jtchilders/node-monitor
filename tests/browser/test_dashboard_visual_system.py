@@ -238,7 +238,7 @@ def test_narrow_400px_no_overflow_and_content_visible_and_focus_and_chart_height
    expect(page.locator('.header-stats').first).to_be_visible()
    expect(page.locator('.control-panel').first).to_be_visible()
    expect(page.locator('.range-buttons button').first).to_be_visible()
-   expect(page.locator('#node-form').first).to_be_visible()
+   expect(page.locator('#node-group').first).to_be_visible()
    expect(page.locator('#user-form').first).to_be_visible()
    expect(page.locator('.metric-panel').first).to_be_visible()
    page.locator('[data-range="1h"]').focus()

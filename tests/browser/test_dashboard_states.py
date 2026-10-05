@@ -115,14 +115,19 @@ def test_all_ranges_issue_requests_and_mark_active(browser_page, live_web):
 
 def test_node_and_username_controls_preserve_range(
       browser_page, live_web, snapshot_complete):
+   live_web.state.set_inventory([
+      {"id": "login-04", "label": "login-04", "configured": True,
+       "role": "local"},
+      {"id": "login-05", "label": "login-05", "configured": True,
+       "role": "remote"},
+   ])
    page, errors, _external = open_dashboard(browser_page, live_web)
    page.locator('[data-range="6h"]').click()
    switched = copy.deepcopy(snapshot_complete)
    switched["node"] = "login-05"
    switched["hardware"]["source_hostname"] = "login-05"
    live_web.state.set_snapshot(switched)
-   page.locator('#node-input').fill("login-05")
-   page.locator('[data-testid="node-submit"]').click()
+   page.locator('[data-node-id="login-05"]').click()
    expect(page.locator('[data-testid="node-name"]')).to_have_text("login-05")
    assert live_web.state.requests[-1]["node"] == ["login-05"]
    assert live_web.state.requests[-1]["range"] == ["6h"]
@@ -234,51 +239,89 @@ def test_narrow_layout_keeps_quality_and_controls_accessible(
    assert errors == []
    assert external == []
 
-def test_inventory_first_selection_no_guessed_input(browser_page, live_web, snapshot_complete):
-    # Verify node-group exists and no text input remains
-    page, errors, _ = open_dashboard(browser_page, live_web)
-    assert page.locator('[data-testid="node-btn"]').count() >= 1
-    assert page.locator('#node-input').count() == 0
-    # Selection should use first node automatically
-    assert page.locator('[data-testid="node-btn"][aria-pressed="true"]').count() == 1
-    assert errors == []
+def test_inventory_first_selection_no_guessed_input(
+      browser_page, live_web, snapshot_complete):
+   page, errors, _ = open_dashboard(browser_page, live_web)
+   assert page.locator('[data-testid="node-btn"]').count() >= 1
+   assert page.locator('#node-input').count() == 0
+   assert page.locator(
+      '[data-testid="node-btn"][aria-pressed="true"]').count() == 1
+   assert errors == []
 
 
 def test_empty_inventory_shows_distinct_text(browser_page, live_web):
-    live_web.state.snapshot["nodes_inventory"] = []
-    page, errors, _ = browser_page
-    page.goto(live_web.url + "/", wait_until="domcontentloaded")
-    expect(page.locator('#node-status')).to_have_text(re.compile("No monitored nodes available"))
-    expect(page.locator('[data-testid="connectivity-status"]')).not_to_have_text("Connection failure")
-    assert errors == []
+   live_web.state.set_inventory([])
+   page, errors, _ = browser_page
+   page.goto(live_web.url + "/", wait_until="domcontentloaded")
+   expect(page.locator('#node-status')).to_have_text(
+      re.compile("No monitored nodes available"))
+   expect(page.locator('[data-testid="connectivity-status"]')).not_to_have_text(
+      "Connection failure")
+   assert live_web.state.requests == []
+   assert errors == []
 
 
 def test_inventory_failure_distinguished_from_empty(browser_page, live_web):
-    # If /api/nodes fails, the status should indicate failure, not empty
-    # The fixture returns 503 if status set; we rely on node-status text
-    live_web.state.fail()
-    page, errors, _ = browser_page
-    page.goto(live_web.url + "/", wait_until="domcontentloaded")
-    expect(page.locator('#node-status')).to_contain_text("Connection failure")
-    # No dashboard request should occur before inventory succeeds
-    assert errors == []
+   live_web.state.fail_inventory()
+   page, errors, _ = browser_page
+   page.goto(live_web.url + "/", wait_until="domcontentloaded")
+   expect(page.locator('#node-status')).to_contain_text("Connection failure")
+   assert live_web.state.requests == []
+   assert all("503" in error for error in errors)
 
 
-def test_node_buttons_use_exact_id_and_exclusive_pressed(browser_page, live_web, snapshot_complete):
-    snapshot_complete["nodes_inventory"] = [
-        {"id": "polaris-login-01.hsn.cm.polaris.alcf.anl.gov", "label": "login-01", "configured": True, "role": "local"},
-        {"id": "polaris-login-04.hsn.cm.polaris.alcf.anl.gov", "label": "login-04", "configured": False, "role": "remote"},
-    ]
-    live_web.state.set_snapshot(snapshot_complete)
-    page, errors, _ = open_dashboard(browser_page, live_web)
-    # First local configured preferred over remote; but if current null, first configured local is preferred
-    btns = page.locator('[data-testid="node-btn"]')
-    assert btns.count() == 2
-    # Click second node; exact id should go to request
-    btns.nth(1).click()
-    # Request should contain exact FQDN
-    assert any("polaris-login-04" in str(req.get("node")) for req in live_web.state.requests[-5:] if req.get("node"))
-    # Only one pressed
-    pressed = page.locator('[data-testid="node-btn"][aria-pressed="true"]')
-    assert pressed.count() == 1
-    assert errors == []
+def test_node_buttons_use_exact_id_and_exclusive_pressed(
+      browser_page, live_web, snapshot_complete):
+   exact_local = "polaris-login-01.hsn.cm.polaris.alcf.anl.gov"
+   exact_remote = "polaris-login-04.hsn.cm.polaris.alcf.anl.gov"
+   snapshot_complete["node"] = exact_local
+   snapshot_complete["hardware"]["source_hostname"] = exact_local
+   live_web.state.set_snapshot(snapshot_complete)
+   live_web.state.set_inventory([
+      {"id": exact_local, "label": "login-01", "configured": True,
+       "role": "local"},
+      {"id": exact_remote, "label": "login-04", "configured": False,
+       "role": None},
+   ])
+   page, errors, _ = open_dashboard(browser_page, live_web)
+   buttons = page.locator('[data-testid="node-btn"]')
+   assert buttons.count() == 2
+   assert live_web.state.requests[0]["node"] == [exact_local]
+   switched = copy.deepcopy(snapshot_complete)
+   switched["node"] = exact_remote
+   switched["hardware"]["source_hostname"] = exact_remote
+   live_web.state.set_snapshot(switched)
+   buttons.nth(1).click()
+   expect(page.locator('[data-testid="node-name"]')).to_have_text(exact_remote)
+   assert live_web.state.requests[-1]["node"] == [exact_remote]
+   pressed = page.locator('[data-testid="node-btn"][aria-pressed="true"]')
+   assert pressed.count() == 1
+   assert pressed.get_attribute("data-node-id") == exact_remote
+   assert errors == []
+
+
+def test_unavailable_node_refreshes_inventory_and_selects_valid_exact_id(
+      browser_page, live_web, snapshot_complete):
+   stale = "stale.example"
+   valid = "valid.example"
+   live_web.state.set_inventory([
+      {"id": stale, "label": "stale", "configured": True, "role": "local"},
+   ])
+   live_web.state.set_dashboard_status_once(422)
+   page, errors, _ = browser_page
+
+   def replace_inventory(request):
+      if request.url.endswith("/api/nodes") and live_web.state.inventory_requests:
+         live_web.state.set_inventory([
+            {"id": valid, "label": "valid", "configured": True,
+             "role": "local"},
+         ])
+
+   page.on("request", replace_inventory)
+   page.goto(live_web.url + "/", wait_until="domcontentloaded")
+
+   expect(page.locator('[data-testid="connectivity-status"]')).to_have_text(
+      "Connected")
+   assert len(live_web.state.inventory_requests) >= 2
+   assert live_web.state.requests[-1]["node"] == [valid]
+   assert all("422" in error for error in errors)

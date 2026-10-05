@@ -25,8 +25,12 @@ STATIC_TYPES = {
 class WebState:
    snapshot: dict
    status: int = 200
+   inventory_status: int = 200
+   inventory_body: object = None
+   dashboard_status_once: object = None
    delay_event: object = None
    requests: list = field(default_factory=list)
+   inventory_requests: list = field(default_factory=list)
 
    def set_snapshot(self, snapshot):
       self.snapshot = copy.deepcopy(snapshot)
@@ -36,6 +40,16 @@ class WebState:
    def fail(self, status=503):
       self.status = status
       self.delay_event = None
+
+   def fail_inventory(self, status=503):
+      self.inventory_status = status
+
+   def set_inventory(self, nodes):
+      self.inventory_status = 200
+      self.inventory_body = {"system": "polaris", "nodes": copy.deepcopy(nodes)}
+
+   def set_dashboard_status_once(self, status):
+      self.dashboard_status_once = status
 
    def delay(self):
       self.delay_event = threading.Event()
@@ -66,15 +80,33 @@ class LiveWeb:
          def do_GET(self):
             parsed = urlparse(self.path)
             if parsed.path == "/api/nodes":
-               nodes = state.snapshot.get("nodes_inventory", [])
-               body = json.dumps({
-                  "system": state.snapshot.get("hardware", {}).get("system", "polaris"),
-                  "nodes": nodes
-               }).encode("utf-8")
+               state.inventory_requests.append(parsed.path)
+               if state.inventory_status != 200:
+                  self.send_bytes(
+                     state.inventory_status, "application/json", b"{}")
+                  return
+               payload = state.inventory_body
+               if payload is None:
+                  hostname = state.snapshot.get("hardware", {}).get(
+                     "source_hostname", state.snapshot.get("node"))
+                  payload = {
+                     "system": state.snapshot.get("hardware", {}).get(
+                        "system", "polaris"),
+                     "nodes": [{
+                        "id": hostname, "label": hostname,
+                        "configured": True, "role": "local",
+                     }] if hostname else [],
+                  }
+               body = json.dumps(payload).encode("utf-8")
                self.send_bytes(200, "application/json; charset=utf-8", body)
                return
             if parsed.path == "/api/dashboard":
                state.requests.append(parse_qs(parsed.query))
+               if state.dashboard_status_once is not None:
+                  status = state.dashboard_status_once
+                  state.dashboard_status_once = None
+                  self.send_bytes(status, "application/json", b"{}")
+                  return
                if state.delay_event is not None:
                   state.delay_event.wait(timeout=5)
                if state.status != 200:

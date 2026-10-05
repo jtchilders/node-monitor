@@ -99,7 +99,11 @@
          cache: 'no-store',
          signal: AbortSignal.timeout(15000),
       });
-      if (!response.ok) throw new Error('refresh failed');
+      if (!response.ok) {
+         const error = new Error('refresh failed');
+         error.status = response.status;
+         throw error;
+      }
       return response.json();
    }
 
@@ -272,7 +276,12 @@
       try {
          render(await fetchDashboard());
          return true;
-      } catch (_error) {
+      } catch (error) {
+         if (error.status === 422) {
+            state.currentNode = null;
+            await initInventorySelection();
+            return state.connected;
+         }
          renderFailure(state.snapshot === null);
          return false;
       }
@@ -302,19 +311,19 @@
       });
    });
 
-   qs('#node-form').addEventListener('submit', async function(event) {
-      event.preventDefault();
-      updateSelection(qs('#node-input').value, null, qs('#user-input').value);
-      await refreshDashboard();
-   });
-
    qs('#user-form').addEventListener('submit', async function(event) {
       event.preventDefault();
-      updateSelection(qs('#node-input').value, null, qs('#user-input').value);
+      updateSelection(null, null, qs('#user-input').value);
       await refreshDashboard();
    });
 
-   qs('#retry-btn').addEventListener('click', refreshDashboard);
+   qs('#retry-btn').addEventListener('click', async function() {
+      if (state.currentNode) {
+         await refreshDashboard();
+      } else {
+         await initInventorySelection();
+      }
+   });
 
    // ---- Chart registry with lifecycle tracking ----
    // Maps chart name -> Chart instance

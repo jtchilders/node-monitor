@@ -170,6 +170,12 @@ def test_all_five_ranges_issue_requests_and_activate(browser_page, live_web):
 
 def test_two_nodes_node_switch_preserves_range(
       browser_page, live_web, snapshot_complete):
+   live_web.state.set_inventory([
+      {"id": "login-04", "label": "login-04", "configured": True,
+       "role": "local"},
+      {"id": "login-05", "label": "login-05", "configured": True,
+       "role": "remote"},
+   ])
    page, errors, external = open_dashboard(browser_page, live_web)
    page.locator('[data-range="6h"]').click()
 
@@ -177,9 +183,7 @@ def test_two_nodes_node_switch_preserves_range(
    switched["node"] = "login-05"
    switched["hardware"]["source_hostname"] = "login-05"
    live_web.state.set_snapshot(switched)
-
-   page.locator("#node-input").fill("login-05")
-   page.locator('[data-testid="node-submit"]').click()
+   page.locator('[data-node-id="login-05"]').click()
    expect(page.locator('[data-testid="node-name"]')).to_have_text("login-05")
    assert live_web.state.requests[-1]["node"] == ["login-05"]
    assert live_web.state.requests[-1]["range"] == ["6h"]
@@ -389,6 +393,12 @@ def test_no_external_requests_on_full_interaction_sequence(
    """Across the full interaction sequence (ranges, node switch, username
    filter, toggle controls, narrow layout), zero non-local requests occur.
    """
+   live_web.state.set_inventory([
+      {"id": "login-04", "label": "login-04", "configured": True,
+       "role": "local"},
+      {"id": "login-05", "label": "login-05", "configured": True,
+       "role": "remote"},
+   ])
    page, errors, external = open_dashboard(browser_page, live_web)
 
    for value in ("1h", "3h", "6h", "12h", "24h"):
@@ -397,8 +407,7 @@ def test_no_external_requests_on_full_interaction_sequence(
    switched = copy.deepcopy(snapshot_complete)
    switched["node"] = "login-05"
    live_web.state.set_snapshot(switched)
-   page.locator("#node-input").fill("login-05")
-   page.locator('[data-testid="node-submit"]').click()
+   page.locator('[data-node-id="login-05"]').click()
 
    page.locator("#user-input").fill("alice")
    page.locator('[data-testid="user-submit"]').click()
