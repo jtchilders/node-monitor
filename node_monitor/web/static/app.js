@@ -44,6 +44,41 @@
       return 'Current';
    }
 
+
+   // Narrow presentation-state helpers for operational-state styling.
+   // Derive exclusively from response semantics; never parse text.
+   const ALLOWED_CARD_STATES = ['current', 'partial', 'stale', 'empty'];
+
+   function normalizedSectionState(section) {
+      const status = section && section.status ? section.status : 'empty';
+      if (status === 'empty') return 'empty';
+      if (status === 'partial') return 'partial';
+      if (status === 'stale') return 'stale';
+      if (section && section.is_fresh === false) return 'stale';
+      return 'current';
+   }
+
+   function setExclusiveStateClass(el, stateName) {
+      if (!el) return;
+      ALLOWED_CARD_STATES.forEach(function(s) {
+         el.classList.remove('state-' + s);
+      });
+      if (ALLOWED_CARD_STATES.indexOf(stateName) >= 0) {
+         el.classList.add('state-' + stateName);
+      }
+   }
+
+   function renderPresentationState(counters, usage, connected) {
+      // Header connection state from connected flag (not text)
+      const header = qs('.dashboard-header');
+      if (header) {
+         header.classList.remove('is-connected', 'is-disconnected');
+         header.classList.add(connected ? 'is-connected' : 'is-disconnected');
+      }
+      setExclusiveStateClass(qs('[data-testid="counter-card"]'), normalizedSectionState(counters || {}));
+      setExclusiveStateClass(qs('[data-testid="usage-card"]'), normalizedSectionState(usage || {}));
+   }
+
    function setActiveRange() {
       qsa('[data-testid="range-btn"]').forEach(function(button) {
          const active = button.getAttribute('data-range') === state.currentRange;
@@ -213,13 +248,23 @@
       setActiveRange();
       renderAges();
       qs('#retry-section').hidden = true;
+      renderPresentationState(data.counters || {}, data.usage || {}, true);
    }
 
    function renderFailure(firstLoad) {
       state.connected = false;
+      const header = qs('.dashboard-header');
+      if (header) {
+         header.classList.remove('is-connected');
+         header.classList.add('is-disconnected');
+      }
+      // NEVER recompute or erase retained card presentation classes
       qs('[data-testid="connectivity-status"]').textContent = firstLoad
          ? 'Connection failure' : 'Web server disconnected';
       qs('#retry-section').hidden = !firstLoad;
+      const preservedCounters = (state.snapshot && state.snapshot.counters) ? state.snapshot.counters : {};
+      const preservedUsage = (state.snapshot && state.snapshot.usage) ? state.snapshot.usage : {};
+      renderPresentationState(preservedCounters, preservedUsage, false);
    }
 
    async function refreshDashboard() {

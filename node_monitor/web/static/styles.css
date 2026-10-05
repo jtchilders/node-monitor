@@ -1,21 +1,176 @@
-body { font-family: sans-serif; margin: 1rem; }
-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: .5rem; }
-.controls { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; margin: 1rem 0; }
-.range-buttons { display: flex; gap: .25rem; }
-button { padding: .25rem .5rem; }
-button:focus-visible { outline: 2px solid #005fcc; outline-offset: 2px; }
-article { border: 1px solid #ccc; border-radius: .25rem; padding: .75rem; margin: .5rem; min-width: 12rem; }
-.charts-section { margin: 1rem 0; }
-.chart-group { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); gap: 1rem; align-items: start; }
-.chart-group article { min-width: 0; overflow: hidden; }
-.chart-canvas-wrap { position: relative; width: 100%; height: 18rem; max-height: 18rem; }
-.chart-group canvas { display: block; width: 100% !important; height: 100% !important; }
-.chart-alt { border-collapse: collapse; font-size: .8rem; width: 100%; }
-.chart-alt th, .chart-alt td { border: 1px solid #999; padding: .25rem .35rem; text-align: left; }
-.chart-note { font-size: .8rem; color: #333; margin-top: .25rem; }
-@media (max-width: 720px) {
-  article { min-width: 10rem; }
-  .controls { flex-direction: column; align-items: flex-start; }
-  .range-buttons { flex-wrap: wrap; }
-  .chart-group { grid-template-columns: 1fr; }
+:root {
+  --bg-color: #1a1a2e;
+  --panel-bg: #16213e;
+  --inset-bg: #0f172a;
+  --text-color: #e0e0e0;
+  --text-dim: #94a3b8;
+  --accent-blue: #3b82f6;
+  --accent-current: #4ade80;
+  --accent-warning: #f59e0b;
+  --accent-danger: #ef4444;
+  --accent-border: #2d3748;
+  --header-height: 72px;
+}
+* { box-sizing: border-box; }
+html { color-scheme: dark; }
+body {
+  margin: 0;
+  background: var(--bg-color);
+  color: var(--text-color);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+               Helvetica, Arial, sans-serif;
+}
+.dashboard-shell { min-height: 100vh; }
+.dashboard-header,
+.control-panel,
+.status-grid,
+.metric-grid,
+.detail-panel { min-width: 0; }
+.dashboard-header {
+
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  min-height: var(--header-height);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 1rem;
+  padding: .75rem 1.5rem;
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--accent-border);
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, .3);
+}
+.control-panel,
+.status-grid,
+.metric-grid,
+.detail-panel { margin: 1rem; }
+.control-panel,
+.status-grid > article,
+.metric-panel,
+.detail-panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 8px;
+  padding: .75rem;
+}
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1rem;
+}
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  align-items: start;
+}
+.panel-header,
+.metric-label {
+  color: var(--text-dim);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+.chart-canvas-wrap {
+  position: relative;
+  width: 100%;
+  height: 18rem;
+  max-height: 18rem;
+  background: var(--inset-bg);
+}
+.chart-canvas-wrap canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+button:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 2px;
+}
+.range-buttons,
+#mem-controls,
+#proc-controls,
+#nl-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--inset-bg);
+}
+button[aria-pressed="true"] {
+  color: #fff;
+  background: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+@media (max-width: 1024px) {
+  .dashboard-header,
+.control-panel,
+.status-grid,
+.metric-grid,
+.detail-panel { min-width: 0; }
+.dashboard-header {
+
+    position: static;
+    grid-template-columns: 1fr 1fr;
+  }
+  .header-stats { justify-content: flex-end; }
+  .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 640px) {
+  .dashboard-header,
+  .status-grid,
+  .metric-grid,
+  .detail-panel { grid-template-columns: minmax(0, 1fr); }
+  .dashboard-header,
+  .control-panel,
+  .status-grid,
+  .metric-grid,
+  .detail-panel { margin-left: .5rem; margin-right: .5rem; }
+  .dashboard-header,
+.control-panel,
+.status-grid,
+.metric-grid,
+.detail-panel { min-width: 0; }
+.dashboard-header {
+ margin: 0 .25rem; padding: .5rem .75rem; }
+  .header-hero { text-align: left; }
+  .header-stats { justify-content: flex-start; }
+  .control-panel { align-items: stretch; }
+  .control-panel form { display: grid; grid-template-columns: 1fr; }
+  .range-buttons { width: 100%; }
+  .range-buttons button { flex: 1 1 auto; min-width: 0; }
+  .status-grid > article,
+  .metric-panel,
+  .detail-panel { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+  .chart-canvas-wrap { height: 18rem; max-height: 18rem; }
+}
+
+/* Operational-state presentation classes (semantic, independent) */
+.state-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: .35rem; vertical-align: middle; flex-shrink: 0; }
+
+/* Connection / header states */
+.dashboard-header.is-connected .state-dot { background: #4ade80; box-shadow: 0 0 0 2px rgba(74, 222, 128, 0.35); }
+.dashboard-header.is-disconnected .state-dot { background: #ef4444; animation: pulse-disconnected 1.2s infinite; box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.35); }
+
+/* Card presentation states */
+[data-testid="counter-card"].state-current,
+[data-testid="usage-card"].state-current { border-left-color: #4ade80; }
+[data-testid="counter-card"].state-partial,
+[data-testid="usage-card"].state-partial { border-left-color: #f59e0b; }
+[data-testid="counter-card"].state-stale,
+[data-testid="usage-card"].state-stale { border-left-color: #f59e0b; }
+[data-testid="counter-card"].state-empty,
+[data-testid="usage-card"].state-empty { border-left-color: #94a3b8; opacity: 0.85; }
+
+@keyframes pulse-disconnected {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dashboard-header.is-disconnected .state-dot { animation: none; }
 }
