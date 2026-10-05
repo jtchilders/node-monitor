@@ -1,6 +1,8 @@
 """Visual-system/state/responsive acceptance assertions (Task 2 + 3): responsive layout, focus outline, reduced motion, lifecycle stability, disconnect state retention."""
 import copy
+import json
 import os
+import stat
 from pathlib import Path
 
 from playwright.sync_api import expect
@@ -10,12 +12,28 @@ from tests.browser.test_dashboard_states import open_dashboard
 
 CONNECTED_TIMEOUT = 10000
 CANVAS_IDS = ["chart-cpu", "chart-memory", "chart-process", "chart-network-lustre"]
+CANVAS_IDS_JSON = json.dumps(CANVAS_IDS)
 
-CANVAS_PIXEL_WAIT_JS = """() => {
-    const ids = ['chart-cpu', 'chart-memory', 'chart-process', 'chart-network-lustre'];
-    for (const id of ids) {
+CANVAS_PIXEL_WAIT_JS = f"""() => {{
+    const ids = {CANVAS_IDS_JSON};
+    for (const id of ids) {{
         const canvas = document.getElementById(id);
         if (!canvas) return false;
+        const chart = (typeof Chart !== 'undefined' && Chart.getChart) ? Chart.getChart(canvas) : null;
+        let hasDataset = false;
+        if (chart && chart.data && chart.data.datasets) {{
+            for (const ds of chart.data.datasets) {{
+                if (ds && Array.isArray(ds.data)) {{
+                    for (const v of ds.data) {{
+                        if (v != null && typeof v === 'number' && isFinite(v)) {{
+                            hasDataset = true; break;
+                        }}
+                    }}
+                }}
+                if (hasDataset) break;
+            }}
+        }}
+        if (!hasDataset) return false;
         const ctx = canvas.getContext('2d');
         if (!ctx) return false;
         const w = canvas.width;
@@ -23,17 +41,17 @@ CANVAS_PIXEL_WAIT_JS = """() => {
         if (w <= 0 || h <= 0) return false;
         const data = ctx.getImageData(0, 0, w, h).data;
         let has = false;
-        for (let i = 3; i < data.length; i += 4) {
-            if (data[i] > 0) { has = true; break; }
-        }
+        for (let i = 3; i < data.length; i += 4) {{
+            if (data[i] > 0) {{ has = true; break; }}
+        }}
         if (!has) return false;
-    }
+    }}
     return true;
-}"""
+}}"""
 
 
 def wait_canvas_pixels(page):
-    page.wait_for_function(CANVAS_PIXEL_WAIT_JS, timeout=CONNECTED_TIMEOUT)
+   page.wait_for_function(CANVAS_PIXEL_WAIT_JS, timeout=CONNECTED_TIMEOUT)
 
 
 def wait_connected_and_charts(page):
@@ -88,9 +106,6 @@ def test_disconnect_retains_stale_classes(browser_page, live_web, snapshot_compl
    lc_before = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
    assert lc_before["createCount"] == 4
    assert lc_before.get("destroyCount", 0) == 0, f"unexpected destroy before disconnect: {lc_before}"
-   # Capture lifecycle projection and representative telemetry before fail
-   before_lc_project = lc_before
-   before_cpu_text = before_cpu
    # Fail server and trigger different range click
    live_web.state.fail()
    page.locator('[data-range="3h"]').click()
@@ -98,9 +113,9 @@ def test_disconnect_retains_stale_classes(browser_page, live_web, snapshot_compl
    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Web server disconnected", timeout=CONNECTED_TIMEOUT)
    # Assert retained lifecycle projection and telemetry after disconnect wait
    lc_after = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
-   assert lc_after["createCount"] == before_lc_project["createCount"], f"createCount changed: {lc_after}"
-   assert lc_after.get("destroyCount", 0) == before_lc_project.get("destroyCount", 0), f"destroyCount changed: {lc_after}"
-   assert page.locator('[data-testid="cpu-busy"]').inner_text() == before_cpu_text
+   assert lc_after["createCount"] == lc_before["createCount"], f"createCount changed: {lc_after}"
+   assert lc_after.get("destroyCount", 0) == lc_before.get("destroyCount", 0), f"destroyCount changed: {lc_after}"
+   assert page.locator('[data-testid="cpu-busy"]').inner_text() == before_cpu
    # Header exact disconnected; usage remains state-stale; retry NOT visible
    header = page.locator('.dashboard-header')
    cls_header = header.get_attribute('class') or ''
@@ -112,8 +127,8 @@ def test_disconnect_retains_stale_classes(browser_page, live_web, snapshot_compl
    assert not retry_btn.is_visible()
    # Confirm chart wrappers / canvases visible and pixel-painted before capture
    for wid in CANVAS_IDS:
-      wrap = page.locator(f'[data-testid="{wid}"]')
-      assert wrap.is_visible(), f"chart wrapper {wid} not visible after disconnect"
+     wrap = page.locator(f'[data-testid="{wid}"]')
+     assert wrap.is_visible(), f"chart wrapper {wid} not visible after disconnect"
    wait_canvas_pixels(page)
    # Stale/current state remains independently identifiable
    assert 'state-stale' in (page.locator('[data-testid="usage-card"]').get_attribute('class') or '')
@@ -137,11 +152,11 @@ def test_partial_and_empty_states(browser_page, live_web, snapshot_complete):
    # Then set empty
    empty = copy.deepcopy(snapshot_complete)
    empty["counters"].update({
-      "rows": [], "latest": None, "newest_window_end": None,
-      "status": "empty", "is_fresh": False})
+     "rows": [], "latest": None, "newest_window_end": None,
+     "status": "empty", "is_fresh": False})
    empty["usage"].update({
-      "grains": [], "newest_interval_end": None,
-      "status": "empty", "is_fresh": False})
+     "grains": [], "newest_interval_end": None,
+     "status": "empty", "is_fresh": False})
    live_web.state.set_snapshot(empty)
    page.goto(live_web.url + "/")
    wait_connected_and_charts(page)
@@ -150,8 +165,8 @@ def test_partial_and_empty_states(browser_page, live_web, snapshot_complete):
    expect(page.locator('[data-testid="usage-freshness"]')).to_have_text("Empty")
    # Exact empty classes
    for card in ('counter-card', 'usage-card'):
-      cls = page.locator(f'[data-testid="{card}"]').get_attribute('class') or ''
-      assert 'state-empty' in cls, f"expected state-empty on {card}, got {cls}"
+     cls = page.locator(f'[data-testid="{card}"]').get_attribute('class') or ''
+     assert 'state-empty' in cls, f"expected state-empty on {card}, got {cls}"
    # CPU '-' and header connected
    assert page.locator('[data-testid="cpu-busy"]').inner_text() == "-"
    header_cls = page.locator('.dashboard-header').get_attribute('class') or ''
@@ -182,33 +197,33 @@ def test_desktop_geometry_4_cards_and_2_metric_columns_and_chart_height(browser_
    wait_connected_and_charts(page)
    page.set_viewport_size({"width": 1440, "height": 1000})
    cards = [page.locator('[data-testid="counter-card"]'),
-            page.locator('[data-testid="usage-card"]'),
-            page.locator('[data-testid="poll-card"]'),
-            page.locator('[data-testid="mem-card"]')]
+           page.locator('[data-testid="usage-card"]'),
+           page.locator('[data-testid="poll-card"]'),
+           page.locator('[data-testid="mem-card"]')]
    for c in cards:
-      expect(c).to_be_visible()
+     expect(c).to_be_visible()
    tops = []
    for c in cards:
-      bb = c.bounding_box()
-      assert bb is not None, f"bounding_box missing for {c}"
-      tops.append(bb["y"])
+     bb = c.bounding_box()
+     assert bb is not None, f"bounding_box missing for {c}"
+     tops.append(bb["y"])
    assert len(tops) == 4
    assert max(tops) - min(tops) < 4, f"status cards not aligned: {tops}"
    panels = page.locator('.metric-panel').all()
    xs = []
    for p in panels:
-      expect(p).to_be_visible()
-      bb = p.bounding_box()
-      assert bb is not None, "metric-panel bounding_box None"
-      xs.append(bb["x"])
+     expect(p).to_be_visible()
+     bb = p.bounding_box()
+     assert bb is not None, "metric-panel bounding_box None"
+     xs.append(bb["x"])
    distinct_x = len({round(x / 10) * 10 for x in xs})
    assert distinct_x == 2, f"expected 2 metric x columns, got {distinct_x} at {xs}"
    for w in page.locator('.chart-canvas-wrap').all():
-      expect(w).to_be_visible()
-      bb = w.bounding_box()
-      assert bb is not None, "chart wrapper bounding_box None (geometry missing)"
-      h = bb["height"]
-      assert 280 <= h <= 300, f"chart wrapper height {h} out of [280,300]"
+     expect(w).to_be_visible()
+     bb = w.bounding_box()
+     assert bb is not None, "chart wrapper bounding_box None (geometry missing)"
+     h = bb["height"]
+     assert 280 <= h <= 300, f"chart wrapper height {h} out of [280,300]"
 
 
 def test_narrow_400px_no_overflow_and_content_visible_and_focus_and_chart_height(browser_page, live_web):
@@ -235,29 +250,34 @@ def test_narrow_400px_no_overflow_and_content_visible_and_focus_and_chart_height
    overflow_hidden = page.evaluate("() => { const s=getComputedStyle(document.documentElement); return s.overflow==='hidden'||s.overflow==='clip'; }")
    assert not overflow_hidden, "overflow hidden/clip must not be set on root"
    for w in page.locator('.chart-canvas-wrap').all():
-      expect(w).to_be_visible()
-      bb = w.bounding_box()
-      assert bb is not None, "chart wrapper bounding_box None in narrow layout"
-      assert 280 <= bb["height"] <= 300
+     expect(w).to_be_visible()
+     bb = w.bounding_box()
+     assert bb is not None, "chart wrapper bounding_box None in narrow layout"
+     assert 280 <= bb["height"] <= 300
 
 
 def screenshot_dir(tmp_path):
-   import os
    d = os.environ.get("NODE_MONITOR_SCREENSHOT_DIR")
    if d:
       out = Path(d)
+      out.mkdir(parents=True, exist_ok=True)
+      out.chmod(0o700)
+      if stat.S_ISLNK(out.stat().st_mode):
+         # Skip mode assertion for symlinks; still durable
+         pass
+      else:
+         assert stat.S_IMODE(out.stat().st_mode) == 0o700, f"evidence dir mode {oct(stat.S_IMODE(out.stat().st_mode))} != 0o700"
    else:
       out = Path(tmp_path)
-   out.mkdir(parents=True, exist_ok=True)
-   try:
-      out.chmod(0o700)
-   except OSError:
-      pass
+      out.mkdir(parents=True, exist_ok=True)
+      try:
+         out.chmod(0o700)
+      except OSError:
+         pass
    return out
 
 
 def test_capture_visual_acceptance_matrix(browser_page, live_web, snapshot_complete, tmp_path):
-   import copy, os
    out_dir = screenshot_dir(tmp_path)
    page, errors, external = open_dashboard(browser_page, live_web)
    wait_connected_and_charts(page)
@@ -265,8 +285,8 @@ def test_capture_visual_acceptance_matrix(browser_page, live_web, snapshot_compl
    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected")
    expect(page.locator('.dashboard-header')).to_contain_class("is-connected")
    for wid in CANVAS_IDS:
-      wrap = page.locator(f'[data-testid="{wid}"]')
-      assert wrap.is_visible(), f"chart wrapper {wid} not visible before desktop screenshot"
+     wrap = page.locator(f'[data-testid="{wid}"]')
+     assert wrap.is_visible(), f"chart wrapper {wid} not visible before desktop screenshot"
    expect(page.locator('[data-testid="counter-freshness"]')).to_have_text("Current")
    page.set_viewport_size({"width": 1440, "height": 1000})
    wait_canvas_pixels(page)
@@ -296,7 +316,7 @@ def test_capture_visual_acceptance_matrix(browser_page, live_web, snapshot_compl
    assert page.locator('[data-testid="cpu-busy"]').inner_text() == before_cpu
    # All chart wrappers/canvases visible and pixel-painted after disconnect wait
    for wid in CANVAS_IDS:
-      assert page.locator(f'[data-testid="{wid}"]').is_visible(), f"chart wrapper {wid} not visible after disconnect"
+     assert page.locator(f'[data-testid="{wid}"]').is_visible(), f"chart wrapper {wid} not visible after disconnect"
    wait_canvas_pixels(page)
    # Stale/current state remains independently identifiable
    assert 'state-stale' in (page.locator('[data-testid="usage-card"]').get_attribute('class') or '')
@@ -329,19 +349,19 @@ def test_capture_visual_acceptance_matrix(browser_page, live_web, snapshot_compl
    expect(page.locator('[data-testid="counter-freshness"]')).to_have_text("Partial")
    expect(page.locator('[data-testid="usage-freshness"]')).to_have_text("Stale")
    for wid in CANVAS_IDS:
-      assert page.locator(f'[data-testid="{wid}"]').is_visible()
+     assert page.locator(f'[data-testid="{wid}"]').is_visible()
    wait_canvas_pixels(page)
    narrow_path = out_dir / "narrow-partial-stale.png"
    page.screenshot(path=str(narrow_path), full_page=True)
 
    # Assert PNG evidence
    for p in (desktop_path, disconnect_path, narrow_path):
-      assert p.is_file(), f"missing screenshot: {p}"
-      assert p.stat().st_size > 10240, f"screenshot too small ({p.stat().st_size} bytes): {p}"
+     assert p.is_file(), f"missing screenshot: {p}"
+     assert p.stat().st_size > 10240, f"screenshot too small ({p.stat().st_size} bytes): {p}"
 
    # Network / console assertions
    assert external == [], f"unexpected external requests: {external}"
-   # Simplified error assertion: all([]) is true; keep external == []
+   # No errors is valid; every observed error must be the intentional 503.
    assert all("503" in str(error) for error in errors), f"expected only 503 errors, got: {errors}"
 
 
