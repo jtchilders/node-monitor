@@ -1,11 +1,40 @@
 """Visual-system/state/responsive acceptance assertions (Task 2 + 3): responsive layout, focus outline, reduced motion, lifecycle stability, disconnect state retention."""
 import copy
+import os
+from pathlib import Path
+
 from playwright.sync_api import expect
 
 # Import open_dashboard from sibling module
 from tests.browser.test_dashboard_states import open_dashboard
 
 CONNECTED_TIMEOUT = 10000
+CANVAS_IDS = ["chart-cpu", "chart-memory", "chart-process", "chart-network-lustre"]
+
+CANVAS_PIXEL_WAIT_JS = """() => {
+    const ids = ['chart-cpu', 'chart-memory', 'chart-process', 'chart-network-lustre'];
+    for (const id of ids) {
+        const canvas = document.getElementById(id);
+        if (!canvas) return false;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return false;
+        const w = canvas.width;
+        const h = canvas.height;
+        if (w <= 0 || h <= 0) return false;
+        const data = ctx.getImageData(0, 0, w, h).data;
+        let has = false;
+        for (let i = 3; i < data.length; i += 4) {
+            if (data[i] > 0) { has = true; break; }
+        }
+        if (!has) return false;
+    }
+    return true;
+}"""
+
+
+def wait_canvas_pixels(page):
+    page.wait_for_function(CANVAS_PIXEL_WAIT_JS, timeout=CONNECTED_TIMEOUT)
+
 
 def wait_connected_and_charts(page):
    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected", timeout=CONNECTED_TIMEOUT)
@@ -59,26 +88,35 @@ def test_disconnect_retains_stale_classes(browser_page, live_web, snapshot_compl
    lc_before = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
    assert lc_before["createCount"] == 4
    assert lc_before.get("destroyCount", 0) == 0, f"unexpected destroy before disconnect: {lc_before}"
+   # Capture lifecycle projection and representative telemetry before fail
+   before_lc_project = lc_before
+   before_cpu_text = before_cpu
    # Fail server and trigger different range click
    live_web.state.fail()
    page.locator('[data-range="3h"]').click()
    # Wait exact disconnect text
    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Web server disconnected", timeout=CONNECTED_TIMEOUT)
-   # Header exact disconnected
+   # Assert retained lifecycle projection and telemetry after disconnect wait
+   lc_after = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
+   assert lc_after["createCount"] == before_lc_project["createCount"], f"createCount changed: {lc_after}"
+   assert lc_after.get("destroyCount", 0) == before_lc_project.get("destroyCount", 0), f"destroyCount changed: {lc_after}"
+   assert page.locator('[data-testid="cpu-busy"]').inner_text() == before_cpu_text
+   # Header exact disconnected; usage remains state-stale; retry NOT visible
    header = page.locator('.dashboard-header')
    cls_header = header.get_attribute('class') or ''
    assert 'is-disconnected' in cls_header
    assert 'is-connected' not in cls_header
-   # Usage remains state-stale, CPU unchanged, retry NOT visible
    cls_usage_after = page.locator('[data-testid="usage-card"]').get_attribute('class') or ''
    assert 'state-stale' in cls_usage_after
-   assert page.locator('[data-testid="cpu-busy"]').inner_text() == before_cpu
    retry_btn = page.locator('[data-testid="retry-btn"]')
    assert not retry_btn.is_visible()
-   # After disconnect, lifecycle unchanged (compare full projection)
-   lc_after = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
-   assert lc_after["createCount"] == lc_before["createCount"], f"createCount changed after disconnect: {lc_after}"
-   assert lc_after.get("destroyCount", 0) == lc_before.get("destroyCount", 0), f"destroyCount changed after disconnect: {lc_after}"
+   # Confirm chart wrappers / canvases visible and pixel-painted before capture
+   for wid in CANVAS_IDS:
+      wrap = page.locator(f'[data-testid="{wid}"]')
+      assert wrap.is_visible(), f"chart wrapper {wid} not visible after disconnect"
+   wait_canvas_pixels(page)
+   # Stale/current state remains independently identifiable
+   assert 'state-stale' in (page.locator('[data-testid="usage-card"]').get_attribute('class') or '')
 
 
 def test_partial_and_empty_states(browser_page, live_web, snapshot_complete):
@@ -207,12 +245,12 @@ def screenshot_dir(tmp_path):
    import os
    d = os.environ.get("NODE_MONITOR_SCREENSHOT_DIR")
    if d:
-      out = d
+      out = Path(d)
    else:
-      out = str(tmp_path)
-   os.makedirs(out, exist_ok=True)
+      out = Path(tmp_path)
+   out.mkdir(parents=True, exist_ok=True)
    try:
-      os.chmod(out, 0o700)
+      out.chmod(0o700)
    except OSError:
       pass
    return out
@@ -223,22 +261,49 @@ def test_capture_visual_acceptance_matrix(browser_page, live_web, snapshot_compl
    out_dir = screenshot_dir(tmp_path)
    page, errors, external = open_dashboard(browser_page, live_web)
    wait_connected_and_charts(page)
+   # Assert expected current state text/classes and visible chart wrappers before all-canvas wait and capture (desktop-current)
+   expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected")
+   expect(page.locator('.dashboard-header')).to_contain_class("is-connected")
+   for wid in CANVAS_IDS:
+      wrap = page.locator(f'[data-testid="{wid}"]')
+      assert wrap.is_visible(), f"chart wrapper {wid} not visible before desktop screenshot"
+   expect(page.locator('[data-testid="counter-freshness"]')).to_have_text("Current")
    page.set_viewport_size({"width": 1440, "height": 1000})
-   desktop_path = os.path.join(out_dir, "desktop-current.png")
-   page.screenshot(path=desktop_path, full_page=True)
+   wait_canvas_pixels(page)
+   desktop_path = out_dir / "desktop-current.png"
+   page.screenshot(path=str(desktop_path), full_page=True)
 
-   # Disconnect: fail server + range click; retain telemetry/charts
+   # Disconnect: fail server + range click; set stale snapshot first, then reload so usage retains stale
    snapshot = copy.deepcopy(snapshot_complete)
    snapshot["usage"]["status"] = "stale"
    snapshot["usage"]["is_fresh"] = False
    live_web.state.set_snapshot(snapshot)
+   page.goto(live_web.url + "/")
+   wait_connected_and_charts(page)
+   # Confirm usage card is state-stale before disconnect
+   usage_cls_before = page.locator('[data-testid="usage-card"]').get_attribute('class') or ''
+   assert 'state-stale' in usage_cls_before
+   # Capture lifecycle projection and representative telemetry before fail
+   lc_before = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
+   before_cpu = page.locator('[data-testid="cpu-busy"]').inner_text()
+   # Fail server and trigger different range click
    live_web.state.fail()
    page.locator('[data-range="3h"]').click()
    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Web server disconnected", timeout=CONNECTED_TIMEOUT)
-   disconnect_path = os.path.join(out_dir, "desktop-disconnected.png")
-   page.screenshot(path=disconnect_path, full_page=True)
+   lc_after = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
+   assert lc_after["createCount"] == lc_before["createCount"], f"createCount changed after disconnect: {lc_after}"
+   assert lc_after.get("destroyCount", 0) == lc_before.get("destroyCount", 0)
+   assert page.locator('[data-testid="cpu-busy"]').inner_text() == before_cpu
+   # All chart wrappers/canvases visible and pixel-painted after disconnect wait
+   for wid in CANVAS_IDS:
+      assert page.locator(f'[data-testid="{wid}"]').is_visible(), f"chart wrapper {wid} not visible after disconnect"
+   wait_canvas_pixels(page)
+   # Stale/current state remains independently identifiable
+   assert 'state-stale' in (page.locator('[data-testid="usage-card"]').get_attribute('class') or '')
+   disconnect_path = out_dir / "desktop-disconnected.png"
+   page.screenshot(path=str(disconnect_path), full_page=True)
 
-   # Narrow partial stale after restore + reload/action + connected/state waits
+   # Narrow partial stale: after setting fixture status=200 and snapshot, navigation, viewport, and 1h click; wait again after click (fix race)
    partial = copy.deepcopy(snapshot_complete)
    partial["counters"]["status"] = "partial"
    partial["usage"]["status"] = "stale"
@@ -248,19 +313,36 @@ def test_capture_visual_acceptance_matrix(browser_page, live_web, snapshot_compl
    page.goto(live_web.url + "/")
    wait_connected_and_charts(page)
    page.set_viewport_size({"width": 400, "height": 800})
+   # Wait for exact Connected, counter freshness Partial, usage freshness Stale, matching state classes, no horizontal overflow, visible controls
+   expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected")
+   expect(page.locator('[data-testid="counter-freshness"]')).to_have_text("Partial")
+   expect(page.locator('[data-testid="usage-freshness"]')).to_have_text("Stale")
+   assert 'state-partial' in (page.locator('[data-testid="counter-card"]').get_attribute('class') or '')
+   assert 'state-stale' in (page.locator('[data-testid="usage-card"]').get_attribute('class') or '')
+   scroll = page.evaluate("() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 2")
+   assert scroll, "narrow layout overflows horizontally"
+   expect(page.locator('.control-panel').first).to_be_visible()
+   # Click then wait (fixed race)
    page.locator('[data-range="1h"]').click()
-   narrow_path = os.path.join(out_dir, "narrow-partial-stale.png")
-   page.screenshot(path=narrow_path, full_page=True)
+   # After click, wait again for exact state and all four canvases pixel-painted before capture
+   expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected")
+   expect(page.locator('[data-testid="counter-freshness"]')).to_have_text("Partial")
+   expect(page.locator('[data-testid="usage-freshness"]')).to_have_text("Stale")
+   for wid in CANVAS_IDS:
+      assert page.locator(f'[data-testid="{wid}"]').is_visible()
+   wait_canvas_pixels(page)
+   narrow_path = out_dir / "narrow-partial-stale.png"
+   page.screenshot(path=str(narrow_path), full_page=True)
 
    # Assert PNG evidence
    for p in (desktop_path, disconnect_path, narrow_path):
-      assert os.path.isfile(p), f"missing screenshot: {p}"
-      assert os.path.getsize(p) > 10240, f"screenshot too small ({os.path.getsize(p)} bytes): {p}"
+      assert p.is_file(), f"missing screenshot: {p}"
+      assert p.stat().st_size > 10240, f"screenshot too small ({p.stat().st_size} bytes): {p}"
 
    # Network / console assertions
    assert external == [], f"unexpected external requests: {external}"
-   # Only expected 503 console/network errors (from disconnect failure)
-   assert all("503" in str(e) for e in errors) if errors else True
+   # Simplified error assertion: all([]) is true; keep external == []
+   assert all("503" in str(error) for error in errors), f"expected only 503 errors, got: {errors}"
 
 
 def test_reduced_motion_disables_pulse(browser_page, live_web):
