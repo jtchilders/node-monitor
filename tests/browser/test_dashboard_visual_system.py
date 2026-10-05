@@ -2,17 +2,31 @@
 import copy
 from playwright.sync_api import expect
 
+# Import open_dashboard from sibling module
+from tests.browser.test_dashboard_states import open_dashboard
+
 CONNECTED_TIMEOUT = 10000
+LIFECYCLE_WAIT = "() => window.__nodeMonitorTest && window.__nodeMonitorTest.getChartLifecycle && window.__nodeMonitorTest.getChartLifecycle().createCount >= 4"
+
+def wait_connected_and_charts(page, require_exact_4=True):
+    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected", timeout=CONNECTED_TIMEOUT)
+    if require_exact_4:
+        page.wait_for_function("() => window.__nodeMonitorTest && window.__nodeMonitorTest.getChartLifecycle && window.__nodeMonitorTest.getChartLifecycle().createCount === 4", timeout=10000)
+    else:
+        page.wait_for_function(LIFECYCLE_WAIT, timeout=10000)
+    lc = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
+    assert lc["createCount"] >= 4, f"expected createCount>=4, got {lc}"
 
 
 def test_semantic_state_stale_usage_current_counters(browser_page, live_web, snapshot_complete):
-    page, _, _ = browser_page
+    page, _, _ = open_dashboard(browser_page, live_web)
+    wait_connected_and_charts(page)
     snapshot = copy.deepcopy(snapshot_complete)
     snapshot["usage"]["status"] = "stale"
     snapshot["usage"]["is_fresh"] = False
     live_web.state.set_snapshot(snapshot)
     page.goto(live_web.url + "/")
-    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected", timeout=CONNECTED_TIMEOUT)
+    wait_connected_and_charts(page)
     # Header connected
     header = page.locator('.dashboard-header')
     cls_header = header.get_attribute('class') or ''
@@ -31,14 +45,15 @@ def test_semantic_state_stale_usage_current_counters(browser_page, live_web, sna
 
 
 def test_disconnect_retains_stale_classes(browser_page, live_web, snapshot_complete):
-    page, _, _ = browser_page
+    page, _, _ = open_dashboard(browser_page, live_web)
+    wait_connected_and_charts(page)
     # Load stale usage snapshot first
     snapshot = copy.deepcopy(snapshot_complete)
     snapshot["usage"]["status"] = "stale"
     snapshot["usage"]["is_fresh"] = False
     live_web.state.set_snapshot(snapshot)
     page.goto(live_web.url + "/")
-    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected", timeout=CONNECTED_TIMEOUT)
+    wait_connected_and_charts(page)
     # Record CPU text and usage stale class
     before_cpu = page.locator('[data-testid="cpu-busy"]').inner_text()
     usage_card = page.locator('[data-testid="usage-card"]')
@@ -62,29 +77,32 @@ def test_disconnect_retains_stale_classes(browser_page, live_web, snapshot_compl
     assert not retry_btn.is_visible()
     # Charts not replaced/destroyed: lifecycle projection unchanged
     lc_before = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
+    assert lc_before["createCount"] == 4
     assert page.locator('#chart-cpu').count() == 1
 
 
 def test_partial_and_empty_states(browser_page, live_web, snapshot_complete):
-    page, _, _ = browser_page
+    page, _, _ = open_dashboard(browser_page, live_web)
+    wait_connected_and_charts(page)
     partial = copy.deepcopy(snapshot_complete)
     partial["counters"]["status"] = "partial"
     partial["usage"]["status"] = "partial"
     live_web.state.set_snapshot(partial)
     page.goto(live_web.url + "/")
-    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected", timeout=CONNECTED_TIMEOUT)
+    wait_connected_and_charts(page)
     # Wait exact Partial text
     expect(page.locator('[data-testid="counter-freshness"]')).to_have_text("Partial")
     expect(page.locator('[data-testid="usage-freshness"]')).to_have_text("Partial")
     # Exact partial classes
     assert 'state-partial' in (page.locator('[data-testid="counter-card"]').get_attribute('class') or '')
     assert 'state-partial' in (page.locator('[data-testid="usage-card"]').get_attribute('class') or '')
-    # Then set empty with DIFFERENT range click (e.g., 12h)
+    # Then set empty
     empty = copy.deepcopy(snapshot_complete)
     empty["counters"].update({"rows": [], "latest": None, "newest_window_end": None, "status": "empty", "is_fresh": False})
     empty["usage"].update({"grains": [], "newest_interval_end": None, "status": "empty", "is_fresh": False})
     live_web.state.set_snapshot(empty)
-    page.locator('[data-range="12h"]').click()
+    page.goto(live_web.url + "/")
+    wait_connected_and_charts(page)
     # Wait exact Empty text
     expect(page.locator('[data-testid="counter-freshness"]')).to_have_text("Empty")
     expect(page.locator('[data-testid="usage-freshness"]')).to_have_text("Empty")
@@ -118,9 +136,8 @@ def test_first_load_failure_header_disconnected_and_retry_visible(browser_page, 
 
 
 def test_desktop_geometry_4_cards_and_2_metric_columns_and_chart_height(browser_page, live_web):
-    page, _, _ = browser_page
-    page.goto(live_web.url + "/")
-    page.wait_for_selector('[data-testid="connectivity-status"]', timeout=10000)
+    page, _, _ = open_dashboard(browser_page, live_web)
+    wait_connected_and_charts(page)
     page.set_viewport_size({"width": 1440, "height": 1000})
     cards = [page.locator('[data-testid="counter-card"]'),
              page.locator('[data-testid="usage-card"]'),
@@ -141,16 +158,20 @@ def test_desktop_geometry_4_cards_and_2_metric_columns_and_chart_height(browser_
 
 
 def test_narrow_400px_no_overflow_and_content_visible_and_focus_and_chart_height(browser_page, live_web):
-    page, _, _ = browser_page
-    page.goto(live_web.url + "/")
-    page.wait_for_selector('[data-testid="connectivity-status"]', timeout=10000)
+    page, _, _ = open_dashboard(browser_page, live_web)
+    wait_connected_and_charts(page)
     page.set_viewport_size({"width": 400, "height": 800})
     scroll = page.evaluate("() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 2")
     assert scroll, "narrow layout overflows horizontally"
-    for sel in (".dashboard-header", ".header-hero", ".status-grid",
-                ".control-panel", ".range-buttons", "#node-form",
-                "#user-form", ".metric-panel"):
-        assert page.locator(sel).count() > 0, f"missing {sel}"
+    # Required content assertions using expect visibility (not count>0)
+    expect(page.locator('.header-identity').first).to_be_visible()
+    expect(page.locator('.header-hero').first).to_be_visible()
+    expect(page.locator('.header-stats').first).to_be_visible()
+    expect(page.locator('.control-panel').first).to_be_visible()
+    expect(page.locator('.range-buttons button').first).to_be_visible()
+    expect(page.locator('#node-form').first).to_be_visible()
+    expect(page.locator('#user-form').first).to_be_visible()
+    expect(page.locator('.metric-panel').first).to_be_visible()
     page.locator('[data-range="1h"]').focus()
     outline = page.locator('[data-range="1h"]').evaluate("el => getComputedStyle(el).outline")
     assert outline not in ("none", "0px none"), f"focus outline missing: {outline}"
@@ -165,10 +186,12 @@ def test_reduced_motion_disables_pulse(browser_page, live_web):
     page, _, _ = browser_page
     page.emulate_media(reduced_motion="reduce")
     page.goto(live_web.url + "/")
-    page.wait_for_selector('[data-testid="connectivity-status"]', timeout=10000)
+    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected", timeout=CONNECTED_TIMEOUT)
+    # Wait charts
+    page.wait_for_function(LIFECYCLE_WAIT, timeout=10000)
     live_web.state.fail()
     page.locator('[data-range="3h"]').click()
-    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Web server disconnected", timeout=10000)
+    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Web server disconnected", timeout=CONNECTED_TIMEOUT)
     dot = page.locator('.dashboard-header.is-disconnected .state-dot')
     anim = dot.evaluate("el => getComputedStyle(el).animationName")
     assert anim == "none", f"expected animation none under reduced motion, got {anim}"
