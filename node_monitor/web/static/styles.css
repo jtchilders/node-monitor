@@ -90,6 +90,11 @@ summary:focus-visible {
   outline: 2px solid #60a5fa;
   outline-offset: 2px;
 }
+.node-group { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .25rem; }
+.node-group button { min-width: 0; flex: 1 1 auto; }
+.node-group button[aria-pressed="true"] {
+  color: #fff; background: var(--accent-blue); border-color: var(--accent-blue);
+}
 .range-buttons,
 #mem-controls,
 #proc-controls,

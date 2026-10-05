@@ -7,7 +7,7 @@
       receivedMonotonicMs: 0,
       counterAgeAtReceiptSec: null,
       usageAgeAtReceiptSec: null,
-      currentNode: 'login-04',
+      currentNode: null,
       currentRange: '1h',
       currentUsername: null,
       refreshTimer: null,
@@ -268,6 +268,7 @@
    }
 
    async function refreshDashboard() {
+      if (!state.currentNode) return false;
       try {
          render(await fetchDashboard());
          return true;
@@ -1420,6 +1421,73 @@
       window.__nodeMonitorTest = Object.freeze(testAPI);
    })();
 
-   startTimers();
-   refreshDashboard();
+   // Inventory-first node selection (design spec 194+)
+   async function fetchNodes() {
+      try {
+         const resp = await fetch('/api/nodes', { cache: 'no-store' });
+         if (!resp.ok) throw new Error('inventory failed');
+         const data = await resp.json();
+         return data.nodes || [];
+      } catch (e) { return null; }
+   }
+
+   function renderNodeButtons(nodes) {
+      const group = qs('#node-group');
+      if (!group) return;
+      group.innerHTML = '';
+      if (!nodes || nodes.length === 0) {
+         group.innerHTML = '<span>No monitored nodes available</span>';
+         return;
+      }
+      nodes.forEach(function(node) {
+         const btn = document.createElement('button');
+         btn.type = 'button';
+         btn.textContent = node.label || node.id;
+         btn.setAttribute('data-testid', 'node-btn');
+         btn.setAttribute('data-node-id', node.id);
+         btn.setAttribute('aria-pressed', node.id === state.currentNode ? 'true' : 'false');
+         btn.addEventListener('click', async function() {
+            state.currentNode = node.id;
+            qsa('#node-group button').forEach(function(b) {
+               b.setAttribute('aria-pressed', 'false');
+            });
+            btn.setAttribute('aria-pressed', 'true');
+            await refreshDashboard();
+         });
+         group.appendChild(btn);
+      });
+   }
+
+   async function initInventorySelection() {
+      const nodes = await fetchNodes();
+      if (nodes === null) {
+         qs('#node-status').textContent = 'Connection failure';
+         return;
+      }
+      if (nodes.length === 0) {
+         qs('#node-status').textContent = 'No monitored nodes available';
+         renderNodeButtons([]);
+         return;
+      }
+      renderNodeButtons(nodes);
+      // Precedence: current if still available, configured local, first returned
+      let selection = null;
+      if (state.currentNode) {
+         for (let i = 0; i < nodes.length; i++) {
+            if (nodes[i].id === state.currentNode) { selection = state.currentNode; break; }
+         }
+      }
+      if (!selection) {
+         for (let i = 0; i < nodes.length; i++) {
+            if (nodes[i].configured && nodes[i].role === 'local') { selection = nodes[i].id; break; }
+         }
+      }
+      if (!selection) { selection = nodes[0].id; }
+      state.currentNode = selection;
+      renderNodeButtons(nodes); // refresh aria-pressed
+      startTimers();
+      await refreshDashboard();
+   }
+
+   initInventorySelection();
 })();

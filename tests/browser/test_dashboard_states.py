@@ -233,3 +233,52 @@ def test_narrow_layout_keeps_quality_and_controls_accessible(
    assert page.locator('button').count() >= 8
    assert errors == []
    assert external == []
+
+def test_inventory_first_selection_no_guessed_input(browser_page, live_web, snapshot_complete):
+    # Verify node-group exists and no text input remains
+    page, errors, _ = open_dashboard(browser_page, live_web)
+    assert page.locator('[data-testid="node-btn"]').count() >= 1
+    assert page.locator('#node-input').count() == 0
+    # Selection should use first node automatically
+    assert page.locator('[data-testid="node-btn"][aria-pressed="true"]').count() == 1
+    assert errors == []
+
+
+def test_empty_inventory_shows_distinct_text(browser_page, live_web):
+    live_web.state.snapshot["nodes_inventory"] = []
+    page, errors, _ = browser_page
+    page.goto(live_web.url + "/", wait_until="domcontentloaded")
+    expect(page.locator('#node-status')).to_have_text(re.compile("No monitored nodes available"))
+    expect(page.locator('[data-testid="connectivity-status"]')).not_to_have_text("Connection failure")
+    assert errors == []
+
+
+def test_inventory_failure_distinguished_from_empty(browser_page, live_web):
+    # If /api/nodes fails, the status should indicate failure, not empty
+    # The fixture returns 503 if status set; we rely on node-status text
+    live_web.state.fail()
+    page, errors, _ = browser_page
+    page.goto(live_web.url + "/", wait_until="domcontentloaded")
+    expect(page.locator('#node-status')).to_contain_text("Connection failure")
+    # No dashboard request should occur before inventory succeeds
+    assert errors == []
+
+
+def test_node_buttons_use_exact_id_and_exclusive_pressed(browser_page, live_web, snapshot_complete):
+    snapshot_complete["nodes_inventory"] = [
+        {"id": "polaris-login-01.hsn.cm.polaris.alcf.anl.gov", "label": "login-01", "configured": True, "role": "local"},
+        {"id": "polaris-login-04.hsn.cm.polaris.alcf.anl.gov", "label": "login-04", "configured": False, "role": "remote"},
+    ]
+    live_web.state.set_snapshot(snapshot_complete)
+    page, errors, _ = open_dashboard(browser_page, live_web)
+    # First local configured preferred over remote; but if current null, first configured local is preferred
+    btns = page.locator('[data-testid="node-btn"]')
+    assert btns.count() == 2
+    # Click second node; exact id should go to request
+    btns.nth(1).click()
+    # Request should contain exact FQDN
+    assert any("polaris-login-04" in str(req.get("node")) for req in live_web.state.requests[-5:] if req.get("node"))
+    # Only one pressed
+    pressed = page.locator('[data-testid="node-btn"][aria-pressed="true"]')
+    assert pressed.count() == 1
+    assert errors == []

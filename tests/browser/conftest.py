@@ -65,6 +65,14 @@ class LiveWeb:
 
          def do_GET(self):
             parsed = urlparse(self.path)
+            if parsed.path == "/api/nodes":
+               nodes = state.snapshot.get("nodes_inventory", [])
+               body = json.dumps({
+                  "system": state.snapshot.get("hardware", {}).get("system", "polaris"),
+                  "nodes": nodes
+               }).encode("utf-8")
+               self.send_bytes(200, "application/json; charset=utf-8", body)
+               return
             if parsed.path == "/api/dashboard":
                state.requests.append(parse_qs(parsed.query))
                if state.delay_event is not None:
@@ -233,7 +241,10 @@ def snapshot_complete():
          "status": "complete",
          "gaps": {"missing_count": 0},
       },
-      "poll_failures": [{
+      "nodes_inventory": [
+        {"id": "polaris-login-04.hsn.cm.polaris.alcf.anl.gov", "label": "login-04", "configured": False, "role": "local"},
+     ],
+     "poll_failures": [{
          "recorded_at": "2026-10-03T11:30:00+00:00",
          "failure_type": "timeout",
          "detail": "connect refused",

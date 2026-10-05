@@ -47,11 +47,8 @@
     <button type="button" data-testid="range-btn" data-range="12h">12h</button>
     <button type="button" data-testid="range-btn" data-range="24h">24h</button>
   </div>
-  <form id="node-form" aria-label="Switch node">
-    <label for="node-input">Node</label>
-    <input id="node-input" type="text" data-testid="node-input" placeholder="login-04" />
-    <button type="submit" data-testid="node-submit">Switch</button>
-  </form>
+  <div id="node-group" class="node-group" role="group" aria-label="Select node"></div>
+  <div id="node-status" aria-live="polite"></div>
   <form id="user-form" aria-label="Username filter">
     <label for="user-input">Username</label>
     <input id="user-input" type="text" data-testid="user-input" placeholder="alice" />
