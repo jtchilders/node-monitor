@@ -19,12 +19,19 @@ from node_monitor.config import ConfigError, load_web_config
 
 def _write(path, value):
    path.write_text(yaml.safe_dump(value))
+   path.chmod(0o600)
    return str(path)
 
 
 def _valid(url="postgresql+psycopg2://reader@localhost/node_monitor_dev"):
    return {
       "system": "polaris",
+      "nodes": [
+         {"hostname": "polaris-login-04.example.org", "role": "local",
+          "display_name": "login-04"},
+      ],
+      "probe_python": "/usr/bin/python3.11",
+      "database": {"url": "not-a-writer-url"},
       "web": {
          "database": {
             "url": url,
@@ -40,20 +47,24 @@ def _valid(url="postgresql+psycopg2://reader@localhost/node_monitor_dev"):
    }
 
 
-def test_web_config_accepts_only_system_and_web(tmp_path):
+def test_web_config_projects_reader_and_typed_nodes(tmp_path):
    path = _write(tmp_path / "web.yaml", _valid())
    config = load_web_config(path, home="/home/operator")
    assert config.system == "polaris"
+   assert tuple(config.__dataclass_fields__) == ("system", "nodes", "database")
+   assert config.nodes[0].hostname == "polaris-login-04.example.org"
+   assert config.nodes[0].display_name == "login-04"
    assert config.database.pool_size == 1
    assert config.database.max_overflow == 0
 
 
-def test_web_config_rejects_collector_fields(tmp_path):
+def test_web_config_accepts_daemon_fields_without_exposing_them(tmp_path):
    raw = _valid()
-   raw["nodes"] = []
+   raw["output"] = {"root": "~/runs"}
    path = _write(tmp_path / "web.yaml", raw)
-   with pytest.raises(ConfigError, match="unknown key"):
-      load_web_config(path, home="/home/operator")
+   config = load_web_config(path, home="/home/operator")
+   assert not hasattr(config, "output")
+   assert not hasattr(config, "probe_python")
 
 
 def test_explicit_web_url_wins_and_writer_env_is_never_read(tmp_path, monkeypatch):
@@ -73,20 +84,72 @@ def test_web_env_fills_only_an_omitted_url(tmp_path, monkeypatch):
    assert config.database.url == "postgresql:///reader"
 
 
-def test_web_config_rejects_probe_python(tmp_path):
+def test_web_config_ignores_malformed_writer_database(tmp_path):
    raw = _valid()
-   raw["probe_python"] = "/usr/bin/python3.11"
+   raw["database"] = {"url": "definitely-not-postgresql"}
+   path = _write(tmp_path / "web.yaml", raw)
+   config = load_web_config(path, home="/home/operator")
+   assert config.database.url.endswith("node_monitor_dev")
+
+
+def test_web_config_rejects_unknown_top_level_key(tmp_path):
+   raw = _valid()
+   raw["surprise"] = True
    path = _write(tmp_path / "web.yaml", raw)
    with pytest.raises(ConfigError, match="unknown key"):
       load_web_config(path, home="/home/operator")
 
 
-def test_web_config_rejects_output(tmp_path):
+def test_legacy_web_only_shape_has_fixed_migration_error(tmp_path):
    raw = _valid()
-   raw["output"] = {"root": "/tmp/out"}
-   path = _write(tmp_path / "web.yaml", raw)
-   with pytest.raises(ConfigError, match="unknown key"):
+   raw.pop("nodes")
+   raw.pop("probe_python")
+   raw.pop("database")
+   path = _write(tmp_path / "legacy.yaml", raw)
+   with pytest.raises(ConfigError, match="migrate to the unified configuration"):
       load_web_config(path, home="/home/operator")
+
+
+def test_literal_reader_url_requires_mode_0600(tmp_path):
+   path = tmp_path / "web.yaml"
+   path.write_text(yaml.safe_dump(_valid()))
+   path.chmod(0o644)
+   with pytest.raises(ConfigError, match="mode 0600"):
+      load_web_config(str(path), home="/home/operator")
+
+
+def test_literal_writer_url_also_requires_mode_0600(tmp_path):
+   raw = _valid()
+   raw["database"] = {"url": "postgresql://writer:WRITER_SENTINEL@host/db"}
+   path = tmp_path / "web.yaml"
+   path.write_text(yaml.safe_dump(raw))
+   path.chmod(0o644)
+   with pytest.raises(ConfigError) as caught:
+      load_web_config(str(path), home="/home/operator")
+   assert "mode 0600" in str(caught.value)
+   assert "WRITER_SENTINEL" not in str(caught.value)
+
+
+def test_environment_only_reader_allows_mode_0644(tmp_path, monkeypatch):
+   raw = _valid()
+   del raw["web"]["database"]["url"]
+   raw["database"] = {"url_env": "NODE_MONITOR_DB_URL"}
+   path = tmp_path / "web.yaml"
+   path.write_text(yaml.safe_dump(raw))
+   path.chmod(0o644)
+   monkeypatch.setenv("NODE_MONITOR_WEB_DB_URL", "postgresql:///reader")
+   assert load_web_config(str(path), home="/home/operator").database.url == \
+      "postgresql:///reader"
+
+
+def test_web_config_rejects_symlink_without_path_leak(tmp_path):
+   target = tmp_path / "PATH_SENTINEL-target.yaml"
+   _write(target, _valid())
+   link = tmp_path / "PATH_SENTINEL-link.yaml"
+   link.symlink_to(target)
+   with pytest.raises(ConfigError) as caught:
+      load_web_config(str(link), home="/home/operator")
+   assert "PATH_SENTINEL" not in str(caught.value)
 
 
 def test_web_config_rejects_unknown_web_subkey(tmp_path):

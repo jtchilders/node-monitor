@@ -21,6 +21,7 @@ import dataclasses
 import math
 import os
 import re
+import stat
 import typing
 import warnings
 from urllib.parse import urlsplit
@@ -387,6 +388,69 @@ def load_config(raw, home):
    )
 
 
+def _has_literal_database_url(value, parent_key=None):
+   """Return whether parsed YAML embeds a PostgreSQL database URL."""
+   if isinstance(value, dict):
+      if parent_key == "database":
+         url = value.get("url")
+         if isinstance(url, str) and url.startswith(
+               ("postgresql://", "postgresql+")):
+            return True
+      return any(
+         _has_literal_database_url(child, key)
+         for key, child in value.items())
+   if isinstance(value, list):
+      return any(_has_literal_database_url(child) for child in value)
+   return False
+
+
+def _read_yaml_config(path):
+   """Read YAML from a verified regular file without following symlinks."""
+   flags = os.O_RDONLY
+   nofollow = getattr(os, "O_NOFOLLOW", 0)
+   before = None
+   try:
+      if nofollow:
+         flags |= nofollow
+      else:  # pragma: no cover - only platforms without O_NOFOLLOW
+         before = os.lstat(path)
+         if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise ConfigError("configuration source is not a regular file")
+      fd = os.open(path, flags)
+   except ConfigError:
+      raise
+   except OSError:
+      raise ConfigError("configuration source cannot be opened") from None
+
+   try:
+      opened = os.fstat(fd)
+      if not stat.S_ISREG(opened.st_mode):
+         raise ConfigError("configuration source is not a regular file")
+      if before is not None and (
+            before.st_dev != opened.st_dev or before.st_ino != opened.st_ino):
+         raise ConfigError("configuration source changed while opening")
+      with os.fdopen(fd, "r") as handle:
+         fd = None
+         content = handle.read()
+   except ConfigError:
+      raise
+   except OSError:
+      raise ConfigError("configuration source cannot be read") from None
+   finally:
+      if fd is not None:
+         os.close(fd)
+
+   try:
+      raw = yaml.safe_load(content)
+   except yaml.YAMLError:
+      raise ConfigError("configuration is not valid YAML") from None
+   if (os.name == "posix" and _has_literal_database_url(raw)
+         and stat.S_IMODE(opened.st_mode) != 0o600):
+      raise ConfigError(
+         "configuration containing a database URL must have mode 0600")
+   return raw
+
+
 def load_config_file(path, home=None):
    """Read and validate a Phase 0 YAML config file.
 
@@ -395,10 +459,9 @@ def load_config_file(path, home=None):
    """
    if home is None:
       home = os.path.expanduser("~")
-   with open(path, "r") as handle:
-      raw = yaml.safe_load(handle)
+   raw = _read_yaml_config(path)
    if raw is None:
-      raise ConfigError("config file %r is empty" % (path,))
+      raise ConfigError("config file is empty")
    return load_config(raw, home=home)
 
 
@@ -826,7 +889,7 @@ class NodeMonitorConfig:
 
 _NESTED_TOP_REQUIRED_KEYS = ("system", "nodes", "probe_python")
 _NESTED_TOP_SECTION_KEYS = (
-   "output", "collection", "ssh", "safety", "database", "retention")
+   "output", "collection", "ssh", "safety", "database", "retention", "web")
 _NESTED_TOP_ALLOWED_KEYS = (
    frozenset(_NESTED_TOP_REQUIRED_KEYS) | frozenset(_NESTED_TOP_SECTION_KEYS))
 
@@ -950,10 +1013,9 @@ def load_config_file_any(path, home=None, database_url_env=None):
    """Read a YAML config file and dispatch it through ``load_any_config``."""
    if home is None:
       home = os.path.expanduser("~")
-   with open(path, "r") as handle:
-      raw = yaml.safe_load(handle)
+   raw = _read_yaml_config(path)
    if raw is None:
-      raise ConfigError("config file %r is empty" % (path,))
+      raise ConfigError("config file is empty")
    return load_any_config(raw, home=home, database_url_env=database_url_env)
 
 
@@ -1059,6 +1121,7 @@ class WebConfig:
    """
 
    system: str
+   nodes: tuple
    database: DatabaseConfig
 
 
@@ -1083,14 +1146,16 @@ def load_web_config(path, *, home=None, database_url_env=None):
    # Resolve URL env var once here; NODE_MONITOR_DB_URL is never touched.
    if database_url_env is None:
       database_url_env = os.environ.get("NODE_MONITOR_WEB_DB_URL")
-   with open(path, "r") as handle:
-      raw = yaml.safe_load(handle)
+   raw = _read_yaml_config(path)
    if raw is None:
-      raise ConfigError("web config file %r is empty" % (path,))
+      raise ConfigError("configuration is empty")
    raw = _require_mapping(raw, "config")
-   _reject_unknown_keys(raw, _WEB_TOP_ALLOWED_KEYS, "config")
-   if set(raw) != {"system", "web"}:
-      raise ConfigError("web config requires exactly system and web keys")
+   if set(raw) == {"system", "web"}:
+      raise ConfigError(
+         "legacy web-only config is unsupported; migrate to the unified configuration")
+   _reject_unknown_keys(raw, _NESTED_TOP_ALLOWED_KEYS, "config")
+   _require_keys(raw, ("system", "nodes", "web"), "config")
+   nodes = _validate_nodes(raw["nodes"])
    web = _require_mapping(raw["web"], "web")
    _reject_unknown_keys(web, _WEB_SECTION_ALLOWED_KEYS, "web")
    database_raw = web.get("database")
@@ -1108,5 +1173,6 @@ def load_web_config(path, *, home=None, database_url_env=None):
    database = _validate_web_database_section(database_raw, resolved_url)
    return WebConfig(
       system=_validate_nonempty_string(raw["system"], "system"),
+      nodes=nodes,
       database=database,
    )

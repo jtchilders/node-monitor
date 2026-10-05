@@ -39,7 +39,7 @@ def _make_fake_config():
       pool_recycle_sec=1800.0,
       connect_args=(),
    )
-   return WebConfig(system="test", database=db_cfg)
+   return WebConfig(system="test", nodes=(), database=db_cfg)
 
 
 def _write_valid_config(path):

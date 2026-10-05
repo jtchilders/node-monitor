@@ -727,6 +727,7 @@ class TestLoadConfigFileAny:
    def test_dispatches_nested_layout(self, tmp_path):
       path = tmp_path / "config.yaml"
       path.write_text(yaml.safe_dump(_base_nested()))
+      path.chmod(0o600)
       cfg = load_config_file_any(str(path), home=str(tmp_path))
       assert isinstance(cfg, NodeMonitorConfig)
 
