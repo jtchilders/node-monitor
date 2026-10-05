@@ -7,12 +7,39 @@
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-<header>
-  <h1>Node Monitor — <span data-testid="system-name">system</span> / <span data-testid="node-name">node</span></h1>
-  <div aria-live="polite" id="connectivity-status" data-testid="connectivity-status">Loading…</div>
+<div class="dashboard-shell">
+<header class="dashboard-header">
+  <div class="header-identity">
+    <h1><span data-testid="system-name">system</span> Node Monitor</h1>
+    <div class="header-node" data-testid="node-name">node</div>
+    <div class="connection-line">
+      <span class="state-dot" aria-hidden="true"></span>
+      <span aria-live="polite" id="connectivity-status"
+            data-testid="connectivity-status">Loading…</span>
+      <span aria-hidden="true">·</span>
+      <span data-testid="data-age">
+        <span data-testid="data-age-value">—</span>
+        <span data-testid="data-age-seconds" data-age-seconds="0">—</span>
+      </span>
+    </div>
+  </div>
+  <div class="header-hero">
+    <span class="metric-label">CPU busy p50</span>
+    <strong data-testid="cpu-busy">—</strong>
+  </div>
+  <div class="header-stats">
+    <div class="header-stat">
+      <span class="metric-label">Running</span>
+      <strong data-testid="procs-running">—</strong>
+    </div>
+    <div class="header-stat">
+      <span class="metric-label">Processes</span>
+      <strong data-testid="procs-total">—</strong>
+    </div>
+  </div>
 </header>
 
-<section aria-label="Controls" class="controls">
+<section aria-label="Controls" class="control-panel">
   <div class="range-buttons" role="group" aria-label="Time range">
     <button type="button" data-testid="range-btn" data-range="1h">1h</button>
     <button type="button" data-testid="range-btn" data-range="3h">3h</button>
@@ -32,14 +59,13 @@
   </form>
 </section>
 
-<section aria-label="Status cards">
+<section aria-label="Status cards" class="status-grid">
   <article data-testid="counter-card" aria-label="Counter status">
     <h2>Counter</h2>
     <div data-testid="counter-status">—</div>
     <div data-testid="counter-freshness">—</div>
     <div data-testid="counter-age">Counter age —</div>
     <div data-testid="counter-quality">No counter samples in range</div>
-    <div data-testid="data-age"><span data-testid="data-age-value">—</span> <span data-testid="data-age-seconds" data-age-seconds="0">—</span></div>
   </article>
   <article data-testid="usage-card" aria-label="Usage status">
     <h2>Usage</h2>
@@ -54,88 +80,71 @@
     <div data-testid="poll-breaker">—</div>
     <div data-testid="poll-failures-text">—</div>
   </article>
-</section>
-
-<section aria-label="Telemetry cards">
-  <article data-testid="cpu-card" aria-label="CPU busy">
-    <h3>CPU busy p50</h3>
-    <div data-testid="cpu-busy">—</div>
-  </article>
-  <article data-testid="load-card" aria-label="Load averages">
-    <h3>Load</h3>
-    <div>load1 <span data-testid="load1">—</span></div>
-    <div>load5 <span data-testid="load5">—</span></div>
-    <div>load15 <span data-testid="load15">—</span></div>
-  </article>
   <article data-testid="mem-card" aria-label="Physical memory">
     <h3>Memory (physical used)</h3>
     <div data-testid="mem-used">—</div>
     <div data-testid="mem-note">MemTotal − MemAvailable (incl. kernel/cache)</div>
   </article>
-  <article data-testid="process-card" aria-label="Processes">
-    <h3>Processes (latest)</h3>
-    <div>running <span data-testid="procs-running">—</span></div>
-    <div>total <span data-testid="procs-total">—</span></div>
+</section>
+
+<section aria-label="Metric charts" class="metric-grid">
+  <article class="metric-panel" aria-label="CPU and load chart">
+    <div class="panel-header"><h2>CPU / Load</h2></div>
+    <div class="chart-canvas-wrap"><canvas id="chart-cpu" data-testid="chart-cpu" aria-label="CPU p50 p95 max and load1 load5 load15 time series, one minute cadence; separate axes for unlike units"></canvas></div>
+    <table aria-label="CPU/load summary" class="chart-alt">
+      <thead><tr><th>Metric</th><th>Aggregation</th><th>Cadence</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>CPU busy %</td><td>p50 / p95 / max</td><td>1 min counter</td><td>Counter rows; gap = null not zero; observation-weighted, per-grain, closed interval</td></tr>
+        <tr><td>Load</td><td>load1 / load5 / load15</td><td>1 min counter</td><td>Separate scale (yLoad axis) from CPU %</td></tr>
+        <tr><td>D-state</td><td>per-grain max, contributor + own interval</td><td>15 min usage</td><td>Observation-weighted fraction; not node-wide/time-weighted</td></tr>
+      </tbody>
+    </table>
+    <details class="chart-note" open>
+      <summary>D-state / Interactivity hotspots (15-min intervals)</summary>
+      <table data-testid="dstate-hotspot-table" aria-label="D-state and interactivity hotspot table" class="chart-alt">
+        <caption>observation-weighted per stored grain; not node-wide or clock-time weighted</caption>
+        <thead>
+          <tr>
+            <th>Interval</th>
+            <th>D-state max</th>
+            <th>D-state user</th>
+            <th>Interactivity max</th>
+            <th>Interactivity user</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="5">Loading…</td></tr>
+        </tbody>
+      </table>
+    </details>
   </article>
-  <section aria-label="Charts" class="charts-section">
-    <h2>Metric charts</h2>
-    <div class="chart-group">
-      <article aria-label="CPU and load chart">
-        <h3>CPU / Load</h3>
-        <div class="chart-canvas-wrap"><canvas id="chart-cpu" data-testid="chart-cpu" aria-label="CPU p50 p95 max and load1 load5 load15 time series, one minute cadence; separate axes for unlike units"></canvas></div>
-        <table aria-label="CPU/load summary" class="chart-alt">
-          <thead><tr><th>Metric</th><th>Aggregation</th><th>Cadence</th><th>Notes</th></tr></thead>
-          <tbody>
-            <tr><td>CPU busy %</td><td>p50 / p95 / max</td><td>1 min counter</td><td>Counter rows; gap = null not zero; observation-weighted, per-grain, closed interval</td></tr>
-            <tr><td>Load</td><td>load1 / load5 / load15</td><td>1 min counter</td><td>Separate scale (yLoad axis) from CPU %</td></tr>
-            <tr><td>D-state</td><td>per-grain max, contributor + own interval</td><td>15 min usage</td><td>Observation-weighted fraction; not node-wide/time-weighted</td></tr>
-          </tbody>
-        </table>
-        <details class="chart-note" open>
-          <summary>D-state / Interactivity hotspots (15-min intervals)</summary>
-          <table data-testid="dstate-hotspot-table" aria-label="D-state and interactivity hotspot table" class="chart-alt">
-            <caption>observation-weighted per stored grain; not node-wide or clock-time weighted</caption>
-            <thead>
-              <tr>
-                <th>Interval</th>
-                <th>D-state max</th>
-                <th>D-state user</th>
-                <th>Interactivity max</th>
-                <th>Interactivity user</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr><td colspan="5">Loading…</td></tr>
-            </tbody>
-          </table>
-        </details>
-      </article>
-      <article aria-label="Memory chart">
-        <h3>Memory (physical)</h3>
-        <div class="chart-canvas-wrap"><canvas id="chart-memory" data-testid="chart-memory" aria-label="MemAvailable and MemTotal minus MemAvailable, percent or GiB toggle"></canvas></div>
-        <div class="chart-note"><p>Used = MemTotal − MemAvailable. Percentage disabled if mem_total_kb is null or zero; GiB remains available. Missing values shown as null, not zero.</p></div>
-      </article>
-      <article aria-label="Process chart">
-        <h3>Process</h3>
-        <div class="chart-canvas-wrap"><canvas id="chart-process" data-testid="chart-process" aria-label="CPU sum (additive) or per-username-grain max process count / RSS with contributor"></canvas></div>
-        <table aria-label="Process summary" class="chart-alt">
-          <thead><tr><th>Mode</th><th>Metric</th><th>Contributor</th></tr></thead>
-          <tbody>
-            <tr><td>CPU sum</td><td>additive cpu_seconds, 15-min closed interval</td><td>sum across grains</td></tr>
-            <tr><td>Process max</td><td>process_count max per grain</td><td>independent username (process_count_max_username)</td></tr>
-            <tr><td>grain total RSS</td><td>rss_max_kb per grain</td><td>independent username (rss_max_username)</td></tr>
-          </tbody>
-        </table>
-        <div class="chart-note"><p>15-minute closed interval; process-sample observation denominator shown in tooltip.</p></div>
-      </article>
-      <article aria-label="Network and Lustre chart">
-        <h3>Network / Lustre</h3>
-        <div class="chart-canvas-wrap"><canvas id="chart-network-lustre" data-testid="chart-network-lustre" aria-label="Network RX/TX per interface (no loopback lo); Lustre p50-sum p95-sum peak-sum"></canvas></div>
-        <div class="chart-note"><p>Loopback (lo) excluded. Lustre p50-sum: sum of per-target p50 values. Lustre p95-sum: sum of per-target p95 values. Lustre peak-sum (max_sum): sum of per-target maxima — not instantaneous/global peak. Target count shown per operation. Statistic: p50-sum / p95-sum / peak-sum (max_sum).</p></div>
-      </article>
-    </div>
-  </section>
-  <article data-testid="usage-hotspot-card" aria-label="Usage hotspot">
+  <article class="metric-panel" aria-label="Memory chart">
+    <div class="panel-header"><h2>Memory (physical)</h2></div>
+    <div class="chart-canvas-wrap"><canvas id="chart-memory" data-testid="chart-memory" aria-label="MemAvailable and MemTotal minus MemAvailable, percent or GiB toggle"></canvas></div>
+    <div class="chart-note"><p>Used = MemTotal − MemAvailable. Percentage disabled if mem_total_kb is null or zero; GiB remains available. Missing values shown as null, not zero.</p></div>
+  </article>
+  <article class="metric-panel" aria-label="Process chart">
+    <div class="panel-header"><h2>Process</h2></div>
+    <div class="chart-canvas-wrap"><canvas id="chart-process" data-testid="chart-process" aria-label="CPU sum (additive) or per-username-grain max process count / RSS with contributor"></canvas></div>
+    <table aria-label="Process summary" class="chart-alt">
+      <thead><tr><th>Mode</th><th>Metric</th><th>Contributor</th></tr></thead>
+      <tbody>
+        <tr><td>CPU sum</td><td>additive cpu_seconds, 15-min closed interval</td><td>sum across grains</td></tr>
+        <tr><td>Process max</td><td>process_count max per grain</td><td>independent username (process_count_max_username)</td></tr>
+        <tr><td>grain total RSS</td><td>rss_max_kb per grain</td><td>independent username (rss_max_username)</td></tr>
+      </tbody>
+    </table>
+    <div class="chart-note"><p>15-minute closed interval; process-sample observation denominator shown in tooltip.</p></div>
+  </article>
+  <article class="metric-panel" aria-label="Network and Lustre chart">
+    <div class="panel-header"><h2>Network / Lustre</h2></div>
+    <div class="chart-canvas-wrap"><canvas id="chart-network-lustre" data-testid="chart-network-lustre" aria-label="Network RX/TX per interface (no loopback lo); Lustre p50-sum p95-sum peak-sum"></canvas></div>
+    <div class="chart-note"><p>Loopback (lo) excluded. Lustre p50-sum: sum of per-target p50 values. Lustre p95-sum: sum of per-target p95 values. Lustre peak-sum (max_sum): sum of per-target maxima — not instantaneous/global peak. Target count shown per operation. Statistic: p50-sum / p95-sum / peak-sum (max_sum).</p></div>
+  </article>
+</section>
+
+<section aria-label="Subordinate context" class="detail-panel">
+  <article data-testid="usage-hotspot-card" aria-label="Usage hotspot" class="current-context-panel">
     <h3>D-state hotspot (15m)</h3>
     <div data-testid="d-state">—</div>
     <div data-testid="usage-timestamp">—</div>
@@ -145,6 +154,9 @@
     <div data-testid="current-range">—</div>
     <div data-testid="current-username">—</div>
     <div data-testid="hardware-context">—</div>
+    <div>load1 <span data-testid="load1">—</span></div>
+    <div>load5 <span data-testid="load5">—</span></div>
+    <div>load15 <span data-testid="load15">—</span></div>
   </article>
 </section>
 
@@ -152,6 +164,7 @@
   <button type="button" data-testid="retry-btn" id="retry-btn">Retry connection</button>
 </section>
 
+</div>
 <script src="/static/chart.umd.min.js"></script>
 <script src="/static/app.js"></script>
 </body>
