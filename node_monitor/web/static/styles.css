@@ -19,10 +19,15 @@ body {
   color: var(--text-color);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
                Helvetica, Arial, sans-serif;
-  overflow-x: hidden;
 }
-.dashboard-shell { min-height: 100vh; overflow-x: hidden; }
+.dashboard-shell { min-height: 100vh; }
+.dashboard-header,
+.control-panel,
+.status-grid,
+.metric-grid,
+.detail-panel { min-width: 0; }
 .dashboard-header {
+
   position: sticky;
   top: 0;
   z-index: 100;
@@ -102,7 +107,13 @@ button[aria-pressed="true"] {
   border-color: var(--accent-blue);
 }
 @media (max-width: 1024px) {
-  .dashboard-header {
+  .dashboard-header,
+.control-panel,
+.status-grid,
+.metric-grid,
+.detail-panel { min-width: 0; }
+.dashboard-header {
+
     position: static;
     grid-template-columns: 1fr 1fr;
   }
@@ -119,12 +130,21 @@ button[aria-pressed="true"] {
   .status-grid,
   .metric-grid,
   .detail-panel { margin-left: .5rem; margin-right: .5rem; }
-  .dashboard-header { margin: 0 .25rem; padding: .5rem .75rem; }
+  .dashboard-header,
+.control-panel,
+.status-grid,
+.metric-grid,
+.detail-panel { min-width: 0; }
+.dashboard-header {
+ margin: 0 .25rem; padding: .5rem .75rem; }
   .header-hero { text-align: left; }
   .header-stats { justify-content: flex-start; }
   .control-panel { align-items: stretch; }
   .control-panel form { display: grid; grid-template-columns: 1fr; }
   .range-buttons { width: 100%; }
-  .range-buttons button { flex: 1 1 auto; }
+  .range-buttons button { flex: 1 1 auto; min-width: 0; }
+  .status-grid > article,
+  .metric-panel,
+  .detail-panel { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
   .chart-canvas-wrap { height: 18rem; max-height: 18rem; }
 }
