@@ -115,3 +115,60 @@ def test_first_load_failure_header_disconnected_and_retry_visible(browser_page, 
     retry_btn = page.locator('[data-testid="retry-btn"]')
     expect(retry_btn).to_be_visible()
     # No card state class required before any snapshot
+
+
+def test_desktop_geometry_4_cards_and_2_metric_columns_and_chart_height(browser_page, live_web):
+    page, _, _ = browser_page
+    page.goto(live_web.url + "/")
+    page.wait_for_selector('[data-testid="connectivity-status"]', timeout=10000)
+    page.set_viewport_size({"width": 1440, "height": 1000})
+    cards = [page.locator('[data-testid="counter-card"]'),
+             page.locator('[data-testid="usage-card"]'),
+             page.locator('[data-testid="poll-card"]'),
+             page.locator('[data-testid="mem-card"]')]
+    tops = [c.bounding_box()["y"] for c in cards if c.bounding_box()]
+    assert len(tops) == 4
+    assert max(tops) - min(tops) < 4, f"status cards not aligned: {tops}"
+    panels = page.locator('.metric-panel').all()
+    xs = [p.bounding_box()["x"] for p in panels if p.bounding_box()]
+    distinct_x = len({round(x / 10) * 10 for x in xs})
+    assert distinct_x == 2, f"expected 2 metric x columns, got {distinct_x} at {xs}"
+    for w in page.locator('.chart-canvas-wrap').all():
+        bb = w.bounding_box()
+        assert bb, "chart wrapper missing bounding box"
+        h = bb["height"]
+        assert 280 <= h <= 300, f"chart wrapper height {h} out of [280,300]"
+
+
+def test_narrow_400px_no_overflow_and_content_visible_and_focus_and_chart_height(browser_page, live_web):
+    page, _, _ = browser_page
+    page.goto(live_web.url + "/")
+    page.wait_for_selector('[data-testid="connectivity-status"]', timeout=10000)
+    page.set_viewport_size({"width": 400, "height": 800})
+    scroll = page.evaluate("() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 2")
+    assert scroll, "narrow layout overflows horizontally"
+    for sel in (".dashboard-header", ".header-hero", ".status-grid",
+                ".control-panel", ".range-buttons", "#node-form",
+                "#user-form", ".metric-panel"):
+        assert page.locator(sel).count() > 0, f"missing {sel}"
+    page.locator('[data-range="1h"]').focus()
+    outline = page.locator('[data-range="1h"]').evaluate("el => getComputedStyle(el).outline")
+    assert outline not in ("none", "0px none"), f"focus outline missing: {outline}"
+    overflow_hidden = page.evaluate("() => { const s=getComputedStyle(document.documentElement); return s.overflow==='hidden'||s.overflow==='clip'; }")
+    assert not overflow_hidden, "overflow hidden/clip must not be set on root"
+    for w in page.locator('.chart-canvas-wrap').all():
+        bb = w.bounding_box()
+        assert bb and 280 <= bb["height"] <= 300
+
+
+def test_reduced_motion_disables_pulse(browser_page, live_web):
+    page, _, _ = browser_page
+    page.emulate_media(reduced_motion="reduce")
+    page.goto(live_web.url + "/")
+    page.wait_for_selector('[data-testid="connectivity-status"]', timeout=10000)
+    live_web.state.fail()
+    page.locator('[data-range="3h"]').click()
+    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Web server disconnected", timeout=10000)
+    dot = page.locator('.dashboard-header.is-disconnected .state-dot')
+    anim = dot.evaluate("el => getComputedStyle(el).animationName")
+    assert anim == "none", f"expected animation none under reduced motion, got {anim}"
