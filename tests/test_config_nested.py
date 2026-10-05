@@ -238,6 +238,39 @@ class TestNodeInvariants:
 # Task 1, requirement 5: every section recursively rejects unknown keys.
 # --------------------------------------------------------------------------
 
+class TestDisplayName:
+   def test_display_name_omitted_is_none(self):
+      raw = _base_nested()
+      raw["nodes"][1] = {"hostname": "a", "role": "remote"}
+      cfg = load_nested_config(raw, home=HOME)
+      node = cfg.nodes[1]
+      assert node.display_name is None
+
+   def test_display_name_valid_string_retained(self):
+      raw = _base_nested()
+      raw["nodes"][1] = {"hostname": "a", "role": "remote", "display_name": "label-a"}
+      cfg = load_nested_config(raw, home=HOME)
+      assert cfg.nodes[1].display_name == "label-a"
+
+   def test_display_name_empty_string_rejected(self):
+      raw = _base_nested()
+      raw["nodes"][1] = {"hostname": "a", "role": "remote", "display_name": ""}
+      with pytest.raises(ConfigError):
+         load_nested_config(raw, home=HOME)
+
+   def test_display_name_whitespace_only_rejected(self):
+      raw = _base_nested()
+      raw["nodes"][1] = {"hostname": "a", "role": "remote", "display_name": "   "}
+      with pytest.raises(ConfigError):
+         load_nested_config(raw, home=HOME)
+
+   def test_display_name_non_string_rejected(self):
+      raw = _base_nested()
+      raw["nodes"][1] = {"hostname": "a", "role": "remote", "display_name": 123}
+      with pytest.raises(ConfigError):
+         load_nested_config(raw, home=HOME)
+
+
 class TestUnknownKeys:
    def test_top_level_unknown_key_rejected(self):
       raw = _base_nested()
@@ -611,7 +644,7 @@ class TestDiscoverConfigPath:
    def test_automatic_order_home_dotfile_first(self, tmp_path):
       home = tmp_path / "home"
       home.mkdir()
-      dotfile = home / ".node_monitor.yaml"
+      dotfile = home / ".node_monitor.yml"
       dotfile.write_text("system: polaris\n")
       xdg = home / ".config" / "node_monitor" / "config.yaml"
       xdg.parent.mkdir(parents=True)
@@ -666,6 +699,17 @@ class TestDiscoverConfigPath:
          discover_config_path(
             home=str(home), cwd=str(cwd), etc_path=str(tmp_path / "no-etc.yaml"))
 
+
+class TestDiscoverConfigOrder:
+   def test_explicit_yml_discovery_order_includes_legacy_yaml_after_yml(self, tmp_path):
+      home = tmp_path / "home"
+      home.mkdir()
+      yml = home / ".node_monitor.yml"
+      yml.write_text("system: polaris\n")
+      yaml_legacy = home / ".node_monitor.yaml"
+      yaml_legacy.write_text("system: legacy\n")
+      found = discover_config_path(home=str(home), cwd=str(tmp_path), etc_path=str(tmp_path / "etc.yaml"))
+      assert found == str(yml)
 
 class TestLoadConfigFileAny:
    def test_empty_yaml_rejected(self, tmp_path):

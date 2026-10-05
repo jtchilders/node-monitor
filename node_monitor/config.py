@@ -96,7 +96,7 @@ _NODE_REQUIRED_KEYS = ("hostname", "role")
 # differ from the node's own provenance-named ``hostname`` (e.g. Polaris's
 # `.head` login-node SSH fan-out alias). Design: "SSH aliases are transport
 # identifiers only, never provenance" -- kanban task t_88d97d8e.
-_NODE_ALLOWED_KEYS = frozenset(_NODE_REQUIRED_KEYS) | frozenset(("ssh_target",))
+_NODE_ALLOWED_KEYS = frozenset(_NODE_REQUIRED_KEYS) | frozenset(("ssh_target", "display_name",))
 _NODE_ROLES = frozenset(("local", "remote"))
 
 # node_monitor/collector/remote_probe.py: MIN_PYTHON = (3, 9). The probe
@@ -140,6 +140,7 @@ class NodeConfig:
    hostname: str
    role: str
    ssh_target: typing.Optional[str] = None
+   display_name: typing.Optional[str] = None
 
    @property
    def is_local(self):
@@ -291,6 +292,12 @@ def _validate_node(raw, home_hint=None):
    if role not in _NODE_ROLES:
       raise ConfigError(
          "node role must be one of %s, got %r" % (sorted(_NODE_ROLES), role))
+   display_name = raw.get("display_name")
+   if "display_name" in raw:
+      if not isinstance(display_name, str):
+         raise ConfigError("node display_name must be a string, got %r" % (display_name,))
+      if display_name.strip() == "":
+         raise ConfigError("node display_name must be non-empty after stripping whitespace, got %r" % (display_name,))
    ssh_target = raw.get("ssh_target")
    if "ssh_target" in raw:
       if role != "remote":
@@ -310,7 +317,7 @@ def _validate_node(raw, home_hint=None):
       if not isinstance(ssh_target, str) or not ssh_target:
          raise ConfigError(
             "node ssh_target must be a non-empty string, got %r" % (ssh_target,))
-   return NodeConfig(hostname=hostname, role=role, ssh_target=ssh_target)
+   return NodeConfig(hostname=hostname, role=role, ssh_target=ssh_target, display_name=display_name if "display_name" in raw else None)
 
 
 def _validate_nodes(raw_nodes):
@@ -925,9 +932,11 @@ def discover_config_path(explicit_path=None, home=None, cwd=None,
       raise ConfigError("config file not found: %r" % (explicit_path,))
 
    candidates = (
+      os.path.join(home, ".node_monitor.yml"),
       os.path.join(home, ".node_monitor.yaml"),
       os.path.join(home, ".config", "node_monitor", "config.yaml"),
       etc_path,
+      os.path.join(cwd, "node_monitor.yml"),
       os.path.join(cwd, "node_monitor.yaml"),
    )
    for candidate in candidates:
