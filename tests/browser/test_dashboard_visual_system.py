@@ -146,7 +146,7 @@ def test_desktop_geometry_4_cards_and_2_metric_columns_and_chart_height(browser_
    cards = [page.locator('[data-testid="counter-card"]'),
             page.locator('[data-testid="usage-card"]'),
             page.locator('[data-testid="poll-card"]'),
-            page.locator('[data-testid="mem-card"]')],
+            page.locator('[data-testid="mem-card"]')]
    for c in cards:
       expect(c).to_be_visible()
    tops = []
