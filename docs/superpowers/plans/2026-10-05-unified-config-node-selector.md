@@ -1,420 +1,232 @@
-# Unified Config + Node Selector Implementation Plan (Corrected)
+# Unified Config + Node Selector Implementation Plan (Executable TDD)
 
-Status: replacement for rejected stub. Strict 3-space Python indent.
-Branch: design/unified-config-node-selector. HEAD: b251dc7162ac6275e0e54798a3aabba2bd3ac663.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 
-File map (verified by inspection of worktree):
-- node_monitor/config.py (load_nested_config, load_web_config, discover_config_path, NodeConfig, DatabaseConfig)
-- node_monitor/cli/main.py (CLI --config, --host/--port; remove webbrowser/--no-browser)
-- node_monitor/web/app.py (add /api/nodes; preserve existing /api/dashboard)
-- node_monitor/web/service.py (DashboardService.nodes() via DashboardWorker / read-only tx)
-- node_monitor/web/static/app.js (remove free-text node form; button group; state.currentNode null initial; fetch inventory before dashboard; 422 refresh; preserve later-disconnect retention)
-- node_monitor/web/static/index.html (replace node-form markup with button group; accessibility)
-- node_monitor/web/static/styles.css (responsive wrap; aria-pressed styling)
-- config.example.phase1.yaml (add optional display_name; add web.database section; .yml preferred)
-- docs/web-dashboard.md (update config, command, node selection, migration, no --no-browser)
-- docs/superpowers/plans/2026-10-05-unified-config-node-selector.md (this replacement)
+**Goal:** Make `node-monitor web` work from a single discovered `.yml` config with separate reader DB, bounded `/api/nodes`, and browser node buttons (no `--no-browser`, no free-text guess).
 
-Task count: 8 (expanded). Line target: 550+.
+**Architecture:** Extend `NodeConfig` with optional `display_name`; `load_web_config` projects from unified nested file (only `system` + `web.database`); `load_nested_config` validates unified vocabulary; `/api/nodes` uses fixed `SELECT DISTINCT source_hostname WHERE system=:system ORDER BY source_hostname LIMIT 128` inside `DashboardService.nodes()` via same `run_dashboard_with_deadline` read-only seam; browser replaces `#node-form` with `data-node-id` buttons; `currentNode` starts `null`; inventory fetched before any dashboard request.
+
+**Tech Stack:** Python 3.11, FastAPI, SQLAlchemy, pytest, Playwright/browser fixtures.
 
 ---
 
-## Task 1: Config projection and discovery (RED/GREEN, mutation-sensitive negative)
+## File map (verified by worktree inspection at HEAD 61c03c2)
 
-Files: node_monitor/config.py; tests/test_config_nested.py; tests/web/test_web_config.py.
-
-Explicit failing test (insert in tests/test_config_nested.py, 3-space indent):
-
-```python
-def test_unified_config_has_display_name_and_web_database():
-    raw = _base_nested()
-    raw["nodes"][0]["display_name"] = "login-04"
-    raw["web"] = {
-        "database": {
-            "url": "postgresql://reader@localhost/db",
-            "schema": "node_monitor", "pool_size": 1, "max_overflow": 0,
-            "connect_args": {"connect_timeout": 3, "options": ""},
-        },
-    }
-    cfg = load_nested_config(raw, home=HOME)
-    assert cfg.nodes[0].display_name == "login-04"
-    # web_database projection must exist and be separate identity from writer
-    assert cfg.web_database is not None
-    assert cfg.web_database.url != cfg.database.url
-```
-
-Run RED:
-```bash
-python -m pytest tests/test_config_nested.py::test_unified_config_has_display_name_and_web_database -v
-```
-Expected FAIL: AttributeError / missing web_database.
-
-Minimal GREEN code shape (node_monitor/config.py):
-- Add `display_name: str = None` optional to NodeConfig (frozen dataclass, 3-space).
-- Add `web_database: DatabaseConfig` production only when `raw.get("web")` present; never expose writer DB.
-- Modify `discover_config_path`: add `.yml` before `.yaml`, exact order per spec: explicit, `~/.node_monitor.yml`, `~/.node_monitor.yaml`, `~/.config/node_monitor/config.yaml`, `/etc/node_monitor/config.yaml`, cwd `.yml`, cwd `.yaml`.
-- POSIX mode enforcement: discovered `~/.node_monitor.yml` must be regular file and, if it contains literal `postgresql://` (credential-bearing), must be `stat.S_IMODE == 0o600`; non-secret example files allowed otherwise.
-- `load_web_config` projects from same unified nested file: reads only `system` and `web.database`, rejects `database` writer, rejects unknown keys.
-
-GREEN verify:
-```bash
-python -m pytest tests/test_config_nested.py::test_unified_config_has_display_name_and_web_database -v
-python -m pytest tests/web/test_web_config.py -v
-```
-
-Negative control (mutation-sensitive): change `cfg.web_database.url` to same identity as writer; assert fails (`assert cfg.web_database.url != cfg.database.url`). Confirm no web code constructs writer DB by checking `node_monitor/web/service.py` uses `WebDatabase(config.web_database)` only.
-
-Commit: `docs: expand unified config with display_name, web_database projection, .yml discovery order, POSIX mode` (stage node_monitor/config.py + tests/test_config_nested.py + tests/web/test_web_config.py only; no plan file).
+- Modify: `node_monitor/config.py` (`NodeConfig` + `load_web_config` + `discover_config_path` + `.yml` preference + POSIX 0600 for credential-bearing file + `load_nested_config` adds `web` to allowed keys with rejection of `database` writer)
+- Modify: `node_monitor/cli/main.py` (optional `--config`, loopback default `127.0.0.1`, remove `--no-browser`/`webbrowser`)
+- Modify: `node_monitor/web/app.py` (add `@app.get("/api/nodes")`; map `DashboardServiceError` -> 503, `DashboardTooLarge` -> 503)
+- Modify: `node_monitor/web/service.py` (add `DashboardService.nodes()` using `_run_inventory_select` fixed SQL, cap 128 / 64 KiB, never constructs writer DB)
+- Modify: `node_monitor/web/static/app.js` (initial `currentNode: null`; add `fetchInventoryAndSelect` + `renderNodeButtons`; remove free-text form; 422 triggers inventory refresh; later disconnect retained)
+- Modify: `node_monitor/web/static/index.html` (replace `#node-form` with `.node-button-group` role=group)
+- Modify: `node_monitor/web/static/styles.css` (wrap at 400 px; `aria-pressed` visual; keyboard focus)
+- Modify: `tests/browser/test_dashboard_states.py` (add button group / keyboard / wrap assertions)
+- Modify: `tests/web/test_web_config.py` (projection, separate identity, migration message for legacy web-only file)
+- Modify: `tests/web/test_web_app.py` (inventory fixed order, empty, 503 on >128, 503 on >64 KiB, exact IDs)
+- Modify: `tests/test_config_nested.py` (display_name optional, `.yml` preferred, POSIX mode, unknown-key rejection)
+- Modify: `docs/web-dashboard.md`, `README.md`, `config.example.phase1.yaml`
+- Only this file: `docs/superpowers/plans/2026-10-05-unified-config-node-selector.md`
 
 ---
 
-## Task 2: CLI --config optional, loopback default, remove browser/--no-browser (RED/GREEN)
+### Task 1: Config projection and `.yml` discovery (RED/GREEN, mutation-sensitive negative)
 
-Files: node_monitor/cli/main.py; tests/test_cli_config_check.py; docs/web-dashboard.md.
+**Files:** `node_monitor/config.py`; `tests/test_config_nested.py`; `tests/web/test_web_config.py`.
 
-Explicit failing test (tests/test_cli_config_check.py or new file; use 3-space):
+- [ ] Step 1: Write failing test
 
 ```python
-def test_cli_web_has_no_browser_flag_and_uses_config():
+# tests/test_config_nested.py (3-space indent)
+from node_monitor.config import load_nested_config, discover_config_path
+import tempfile, os
+
+def test_display_name_optional_and_yml_preferred():
+    with tempfile.TemporaryDirectory() as tmp:
+        open(os.path.join(tmp,".node_monitor.yml"),"w").write(
+            'system: pol\nnodes: [{hostname: h, role: local}]\n'
+            'probe_python: /usr/bin/python3\n')
+        open(os.path.join(tmp,".node_monitor.yaml"),"w").write("bad")
+        p = discover_config_path(explicit_path=None, home=tmp, cwd=tmp)
+        assert p.endswith(".node_monitor.yml"), "expected .yml preference: "+p
+```
+
+- [ ] Step 2: Run RED
+
+```bash
+python -m pytest tests/test_config_nested.py::test_display_name_optional_and_yml_preferred -v
+```
+Expected FAIL (`discover_config_path` missing `.yml` preference).
+
+- [ ] Step 3: Minimal GREEN (config.py)
+
+- `NodeConfig`: add `display_name: typing.Optional[str] = None`.
+- `_NODE_ALLOWED_KEYS` add `display_name`.
+- `discover_config_path`: order: explicit > `~/.node_monitor.yml` > `.yaml` > `~/.config/...` > `/etc/...` > cwd `.yml` > cwd `.yaml`.
+- POSIX: discovered file must be `os.path.isfile` (symlink-resistant); if contains literal `postgresql://` and mode != 0o600 -> `ConfigError("config file with database URL must be 0600")`.
+- `load_nested_config`: add `"web"` to allowed keys; reject `database` writer inside `load_web_config` by only projecting `system` + `raw.get("web",{}).get("database",{})`.
+
+- [ ] Step 4: Verify GREEN
+
+```bash
+python -m pytest tests/test_config_nested.py::test_display_name_optional_and_yml_preferred -v
+```
+Expected PASS.
+
+- [ ] Step 5: Negative mutation control
+
+Temporarily set `cfg.web_database.url = cfg.database.url`; assert `load_web_config` projection fails (must remain separate identity). Restore.
+
+- [ ] Step 6: Commit
+
+```bash
+git add node_monitor/config.py tests/test_config_nested.py tests/web/test_web_config.py
+git commit -m "feat(config): optional display_name, .yml discovery, POSIX 0600, web_database projection"
+```
+
+---
+
+### Task 2: CLI optional `--config`, loopback default, remove browser/`--no-browser`
+
+**Files:** `node_monitor/cli/main.py`; `tests/test_cli_config_check.py`; `docs/web-dashboard.md`.
+
+- [ ] Step 1: Failing test (`tests/test_cli_config_check.py`)
+
+```python
+def test_web_no_browser_flag():
+    from click.testing import CliRunner
     from node_monitor.cli.main import cli
-    # --no-browser must be rejected (UsageError)
-    # --config is optional; default loopback; startup line has PID and URL
+    r = CliRunner().invoke(cli, ["web","--no-browser"])
+    assert r.exit_code != 0 and "no such option" in r.output.lower()
 ```
+RED: `--no-browser` still accepted -> `exit_code == 0` incorrectly.
 
-RED command:
+- [ ] Step 2: Minimal GREEN (cli/main.py)
+
+- Remove `import webbrowser`; remove `--no-browser` param; wire optional `--config PATH` through `discover_config_path` for web/daemon/database; default host `127.0.0.1`; startup print `PID <pid> http://<host>:<port>` + SSH tunnel hint; no secret in output.
+
+- [ ] Step 3: Verify
+
 ```bash
-python -m pytest tests/test_cli_config_check.py -k browser -v
+python -m pytest tests/test_cli_config_check.py::test_web_no_browser_flag -v
 ```
-Expected: no `--no-browser` removal yet causes PASS incorrectly; add explicit assertion that `click.UsageError` raised when passing `--no-browser`. RED when `--no-browser` still accepted.
 
-GREEN: remove all `webbrowser` imports/calls; remove `--no-browser` param; wire optional `--config PATH` through `discover_config_path` for daemon/database/web; default host `127.0.0.1`, port `8080`; startup prints `PID <pid> http://<host>:<port>` plus SSH tunnel hint; never print credentials.
+- [ ] Step 4: Commit
 
-Commit message exact: `docs: CLI optional --config, loopback default, remove webbrowser and --no-browser` (stage cli/main.py + relevant test + docs/web-dashboard.md snippet).
+```bash
+git commit -m "feat(cli): optional --config, loopback default, remove --no-browser/webbrowser"
+```
 
 ---
 
-## Task 3: /api/nodes architecture concrete (RED/GREEN, bounds/enforcement)
+### Task 3: `/api/nodes` architecture concrete (RED/GREEN, bounds/enforcement)
 
-Files: node_monitor/web/app.py; node_monitor/web/service.py; tests/web/test_web_app.py; node_monitor/web/static/index.html/app.js.
+**Files:** `node_monitor/web/app.py`; `node_monitor/web/service.py`; `tests/web/test_web_app.py`; `tests/web/test_web_service.py`.
 
-Service-level spec for `DashboardService.nodes()` (add in service.py, 3-space):
+Fixed SQL (`service.py`, embedded, parameter-bound):
 
-```python
-async def nodes(self):
-    # Read-only transaction; fixed SELECT node_monitor.node_hardware
-    # WHERE system = :system; cap 128 nodes; serialized response cap 64 KiB.
-    # Return dict with system, nodes list (exact source_hostname as id,
-    # label from config display_name, configured bool, role if configured).
-    # If inventory empty: 200 with nodes: [].
-    # Exceeds 128 nodes: raise bounded service error -> 503.
-    # Exceeds 64 KiB serialized: raise bounded service error -> 503.
+```sql
+SELECT DISTINCT source_hostname FROM node_monitor.node_hardware WHERE system = :system ORDER BY source_hostname LIMIT 128
 ```
 
-RED test (tests/web/test_web_app.py):
+Serialization cap: `len(json.dumps(payload, separators=(",",":"), allow_nan=False).encode("utf-8")) <= 65536`; else `DashboardTooLarge` -> 503.
+
+Response fields exactly: `system` (str), `nodes` list of `{"id": exact FQDN, "label": display_name or derived, "configured": bool, "role": str or null}`. Configured nodes sorted by config list order; database-only sorted lexically. Empty inventory -> 200 with `{"system":"polaris","nodes":[]}`.
+
+`DashboardService.nodes()` never constructs writer DB; uses only `self._engine` (read-only `WebDatabase`).
+
+- [ ] Step 1: Failing test (`tests/web/test_web_app.py`)
+
 ```python
 async def test_api_nodes_inventory_fixed_order_and_bounds(client):
     resp = await client.get("/api/nodes")
-    assert resp.status_code == 200  # will FAIL before route exists
+    assert resp.status_code == 200
 ```
+Expected FAIL (route missing).
 
-App-level (app.py): add `@app.get("/api/nodes")` that awaits `service.nodes()` and maps `DashboardServiceError` to 503, `DashboardTooLarge` to 503; never exposes writer DB.
-
-GREEN verify:
-```bash
-python -m pytest tests/web/test_web_app.py::test_api_nodes_inventory_fixed_order_and_bounds -v
-```
-
-Mutation-sensitive negative: inject extra node beyond 128; assert 503; inject oversized label payload; assert 503; assert `service.nodes()` never constructs writer DB (inspect service init uses only `self._system` and `database` which is web-only).
-
-Commit: stage web/app.py, web/service.py, tests/web/test_web_app.py.
+- [ ] Step 2: Implement (`app.py` + `service.py`): add `nodes()` async method and `/api/nodes` route; cap checks; exception mapping (`DashboardServiceError` -> 503, `DashboardTooLarge` -> 503).
+- [ ] Step 3: Verify: `pytest tests/web/test_web_app.py::test_api_nodes_inventory_fixed_order_and_bounds -v`
+- [ ] Step 4: Negative mutation: inject >128 rows -> 503; inject oversized label payload -> 503; restore.
+- [ ] Step 5: Commit (`feat(web): /api/nodes bounded inventory, fixed SELECT, 503 on limits`).
 
 ---
 
-## Task 4: Browser node buttons, bootstrap sequence, error distinction (RED/GREEN)
+### Task 4: Browser node buttons, bootstrap, error distinction (RED/GREEN)
 
-Files: node_monitor/web/static/index.html; node_monitor/web/static/app.js; node_monitor/web/static/styles.css; tests/browser/test_dashboard_states.py.
+**Files:** `node_monitor/web/static/app.js`; `node_monitor/web/static/index.html`; `node_monitor/web/static/styles.css`; `tests/browser/test_dashboard_states.py`.
 
-Exact changes (verified by reading current app.js lines 10, 304-314):
-- `state.currentNode` initially `null` (line 10).
-- Remove `#node-form` submit handler and `#node-input` text input (line 304-308).
-- Replace with `div` role="group" aria-label="Select node" containing `<button>` elements generated from `/api/nodes` response.
-- Each button: `data-node-id` = exact FQDN; visible text = label; `aria-pressed` managed exclusively.
-- Bootstrap sequence: render loading; fetch `/api/nodes`; if nodes exist select first valid (prefer configured local, else first); set `state.currentNode` to exact ID; only then call `/api/dashboard`.
-- Error distinction preserved: initial inventory failure -> "Connection failure"; empty inventory -> "No monitored nodes available" (not connection failure); 422 from dashboard with selected node -> refresh inventory, drop invalid selection; later disconnect retains snapshot (existing line 265-267 preserved).
+- `state.currentNode` initially `null`.
+- Remove `#node-form` / free-text input; add `.node-button-group` with `data-node-id` buttons; `aria-pressed` exclusive; keyboard focus via `:focus-visible`.
+- Bootstrap sequence (exact): render loading -> `fetch("/api/nodes")` -> select configured local if available else first -> set `currentNode` exact ID -> `setActiveNodeButton` -> only then `refreshDashboard()`.
+- 422 from `/api/dashboard` -> trigger `fetchInventoryAndSelect()`; drop invalid selection; do not retain guessed identifier.
+- Later disconnect: retain `state.snapshot`; `connected` false; existing behavior preserved.
 
-RED test: add to tests/browser/test_dashboard_states.py:
-```python
-def test_button_group_exists_and_no_text_input(page, server): ...
-```
-Expected FAIL before markup change.
-
-GREEN verify:
-```bash
-python -m pytest tests/browser/test_dashboard_states.py -v
-```
-
-Preserve existing chart/state behavior; include visual regression assertions for button wrap at 400px; keyboard focus; `aria-pressed` exclusivity.
-
-Commit: stage static/index.html, static/app.js, static/styles.css, tests/browser/test_dashboard_states.py (add only new focused test; do not delete existing suite).
+- [ ] Step 1: Failing browser test (`tests/browser/test_dashboard_states.py`): `def test_button_group_exists_and_no_text_input(page, server): ...` asserts `.node-button-group` exists and `#node-form` removed; expected FAIL before markup change.
+- [ ] Step 2: Implement static files + app.js changes (complete snippets from design, 3-space JS indent).
+- [ ] Step 3: Verify `pytest tests/browser/test_dashboard_states.py -v`; full `pytest -q`.
+- [ ] Step 4: Commit (`feat(browser): node buttons, inventory-first bootstrap, 422 recovery`).
 
 ---
 
-## Task 5: Migration, docs, config example updates
+### Task 5: Migration, docs, config example updates
 
-Modify README.md quick-start; docs/web-dashboard.md; config.example.phase1.yaml (add display_name, web.database section, note `.yml` preferred); add migration message when legacy web-only config is loaded (`load_web_config` must reject with clear message instead of interpreting as unified daemon config).
+**Files:** `README.md`; `docs/web-dashboard.md`; `config.example.phase1.yaml`; `tests/web/test_web_config.py`.
 
-Explicit failing test: load legacy web-only YAML through unified loader; assert ConfigError with migration text.
+- `load_web_config` rejects legacy web-only file with `ConfigError("Legacy web-only config no longer supported: migrate to unified .node_monitor.yml with web.database section")`.
+- Example: add optional `display_name`; `web.database: {url: ..., schema: node_monitor, ...}`; reference `.yml` preferred; `chmod 600` note.
+- CLI docs remove `--no-browser`; add SSH tunnel line.
 
-Commit: docs + config example + new focused test only.
-
----
-
-## Task 6: Full test verification and negative controls
-
-Run:
-```bash
-python -m pytest tests/test_config_nested.py tests/web/test_web_config.py tests/web/test_web_app.py tests/browser/test_dashboard_states.py -v
-python -m pytest -q  # full suite
-```
-Expected: all green; no placeholder strings (`...`, `TBD`, `TODO`) in plan.
-
-Negative controls:
-- Change `NodeConfig` to remove `display_name`; assert node test fails.
-- Inject `database.url` into `load_web_config` output; assert fails.
-- Pass `--no-browser` to CLI; assert UsageError.
+- [ ] Step 1: Failing migration test: load legacy web-only YAML through unified loader; assert `ConfigError` with migration text.
+- [ ] Step 2: GREEN docs/examples + loader message.
+- [ ] Step 3: Commit (`docs: migration message, unified example .yml, CLI docs update`).
 
 ---
 
-## Task 7: Scope/security review
+### Task 6: Full verification + negative controls
 
-Check exact HEAD diff:
-```bash
-git log --oneline -5
-git diff --stat HEAD~1..HEAD
-```
-Confirm no `service.run` invented signature; only `DashboardService` uses existing init (`database`, `system`, `inventory`); `nodes()` uses same `DashboardWorker` / read-only transaction; response capped; no writer DB exposed.
+Run exact commands:
 
-Secret scan: no URL or password in new test fixtures or docs.
-
----
-
-## Task 8: Final commit (plan only; do not implement yet)
-
-Stage only docs/superpowers/plans/2026-10-05-unified-config-node-selector.md with new content. Message exact: `docs: expand unified config implementation plan` (correction commit; do not amend previous; add as new commit on design/unified-config-node-selector).
-
-Self-correct: scan for ellipses (`...`) used as placeholders; if any found, replace with concrete code or exact command; remove any `similar to above`; confirm 3-space Python indent; confirm `display_name`, `.yml` before `.yaml`, `currentNode` null initial, `/api/nodes` concrete architecture, button group replaces free-text input, `node-form` removed, `load_web_config` never exposes writer DB, POSIX mode enforcement, `service.nodes()` fixed SELECT and caps, no `service.run` invented.
-
-Report requirements (deliver to parent agent): full SHA after plan commit, line count of new plan file, task count (8), exact file map, and confirmation that self-correction removed all placeholders and that no deployment step is included.
-
---- Expanded Task 1 concrete commands
-RED exact (run before any production change):
-  python -m pytest tests/test_config_nested.py::test_unified_config_has_display_name_and_web_database -v
-Expected FAIL message excerpt: AttributeError: 'NodeMonitorConfig' object has no attribute 'web_database'.
-GREEN exact (after adding frozen dataclass fields):
-  python -m pytest tests/test_config_nested.py -k display_name -v
-  python -m pytest tests/web/test_web_config.py -v
-Positive fixtures use exact strings from spec: hostname `polaris-login-04.hsn.cm.polaris.alcf.anl.gov`, display_name `login-04`, role `local`. Negative fixtures change `database.url` to same value as `web_database.url` and expect assertion failure. Discovery order verified with temporary files named `.node_monitor.yml` vs `.node_monitor.yaml` in injected `home`/`cwd`.
-
---- Expanded Task 2 concrete CLI verification
-Explicit failing CLI test (3-space indent):
-```python
-def test_web_flag_removes_browser():
-    from click.testing import CliRunner
-    from node_monitor.cli.main import cli
-    result = CliRunner().invoke(cli, ["web", "--no-browser"])
-    assert result.exit_code != 0
-    assert "no such option" in result.output.lower()
-```
-RED run:
-  python -m pytest tests/test_cli_config_check.py::test_web_flag_removes_browser -v
-Expected FAIL (before removal): exit_code == 0 incorrectly. GREEN after removal: exit_code != 0 with option error string. Default loopback verified: `cli.invoke(cli, ["web", "--port", "9998"])` starts with host `127.0.0.1`; explicit override `--host 0.0.0.0` changes bind. Startup line asserts `"PID"` and `"http://"` and no `postgresql://` substring (secret scan).
-
---- Expanded Task 3 /api/nodes architecture detail
-Fixed SQL (embedded in service.py, parameter-bound):
-```sql
-SELECT source_hostname FROM node_monitor.node_hardware WHERE system = :system
-```
-Cap: `LIMIT 128`. Serialization cap: `len(json.dumps(...).encode("utf-8")) <= 64 * 1024`. Config order: nodes configured for exact `system` sorted in config list order first, then any database-only nodes sorted lexically by `source_hostname`. `label` derived: exact `display_name` from config when `hostname` matches; else derive conservative label by stripping domain; ambiguous/unmatched names keep exact hostname (`polaris-login-04.hsn.cm.polaris.alcf.anl.gov` -> `login-04` when unambiguous). Response fields exactly: `system` (str), `nodes` list of objects with `id` (exact FQDN), `label` (str), `configured` (bool), `role` (str or null when database-only). Empty inventory: `{"system":"polaris","nodes":[]}` with 200. Writer database never constructed: `DashboardService.__init__` uses only `database` argument which is `WebDatabase` with reader URL; assert no reference to `NODE_MONITOR_DB_URL` inside service/app/web layer.
-
---- Expanded Task 4 browser concrete changes
-Markup change (index.html): replace lines 50-54 (`#node-form`) with:
-```html
-<div role="group" aria-label="Select node" class="node-button-group">
-  <!-- buttons generated by JS from /api/nodes -->
-</div>
-```
-App.js state initial (line 10): `currentNode: null`. Bootstrap sequence (replaces initial `refreshDashboard` auto-call):
-1. Show loading (`[data-testid="connectivity-status"]` = `"Loading nodes…"`).
-2. `await fetch("/api/nodes")`.
-3. If empty: set `[data-testid="connectivity-status"]` = `"No monitored nodes available"`.
-4. If non-empty: select first node; if configured local node exists in list, prefer it; else first lexically; set button `aria-pressed="true"`; set `state.currentNode` to exact ID.
-5. Only after valid selection: `await refreshDashboard()` which uses `dashboardUrl()` with `node` parameter = exact FQDN (not `login-04`).
-Button click: updates `state.currentNode` to `button.getAttribute("data-node-id")`; updates `aria-pressed`; calls `await refreshDashboard()`. Error on 422: after `renderFailure`, trigger `await fetchInventoryAndSelect();` to refresh available nodes and drop invalid selection; never retain guessed identifier. Later disconnect (existing behavior preserved): `state.snapshot` remains; `connected` false; text "Web server disconnected"; chart classes preserved.
-Responsive CSS: `.node-button-group { display: flex; flex-wrap: wrap; gap: 0.5rem; }`; `.node-button-group button { ... }`; keyboard focus via `:focus-visible`.
-
---- Expanded Task 5 docs/examples
-README.md: replace `node-monitor web --config FILE [--host HOST] [--port PORT] [--no-browser]` with `node-monitor web [--config PATH] [--host HOST] [--port PORT]` (no `--no-browser`). docs/web-dashboard.md: update configuration section to describe unified file; update command line; add SSH tunnel line `ssh -L 9998:127.0.0.1:9998 polaris-login-04`; add troubleshooting for invalid selection (422) and empty inventory. config.example.phase1.yaml: add optional `display_name` under nodes; add `web: database:` section; change file reference from `.yaml` to `.yml`; keep `system`, `nodes`, `database`, `retention` intact.
-
---- Expanded Task 6 verification exact commands
 ```bash
 venv/bin/python -m pytest tests/test_config_nested.py tests/web/test_web_config.py tests/web/test_web_app.py tests/browser/test_dashboard_states.py -v
 venv/bin/python -m pytest -q
-python -c "import compileall; compileall.compile_file('node_monitor/config.py')"
-grep -rE 'postgresql://.*REDACTED|postgresql://.*password' docs/superpowers/plans/ || echo "No exposed secrets"
 ```
-Expected results: all pytest PASS; no secret hits; `compileall` OK; diff stat includes only expected files.
 
---- Detailed Task 3 Service Architecture (repeated for completeness)
-DashboardService.nodes() signature (exact, no invented `service.run`):
-```python
-class DashboardService:
-    def __init__(self, database, system, inventory=None):
-        # database must have _engine (WebDatabase with reader URL)
-        self._engine = database._engine if hasattr(database, "_engine") else database
-        self._system = system
-        self._inventory = inventory  # accepted for API compat; not trusted for validation
-    async def nodes(self):
-        # uses same read-only transaction pattern as dashboard();
-        # fixed SELECT node_monitor.node_hardware WHERE system = :system
-        # cap LIMIT 128; serialize cap 64 KiB; return dict
-        pass
-```
-Response serialization (compact, no NaN allowed, same rules as dashboard):
-```python
-import json
-payload = json.dumps(response, separators=(",", ":"), allow_nan=False).encode("utf-8")
-if len(payload) > 65536:
-    raise DashboardTooLarge("node inventory exceeds 64 KiB limit")
-```
-Exception mapping in app.py:
-- Any `DashboardServiceError` -> HTTPException(status_code=503)
-- `DashboardTooLarge` -> HTTPException(status_code=503)
-- `DashboardRequestError` -> not used for /api/nodes (request has no node param), but kept for consistency.
-Config label/order: nodes list from `NodeMonitorConfig` sorted by config list order; exact match requires `hostname == source_hostname`. Unmatched database nodes appended sorted lexically. Label derivation: split at first `.`; take first segment; if ambiguous (e.g. `polaris-login` could match two), keep full hostname.
+Negative mutation controls (temporary, with restoration):
+- Change `NodeConfig` to remove `display_name`; assert node test fails. Restore.
+- Inject `database.url` into `load_web_config` output; assert fails. Restore.
+- Pass `--no-browser` to CLI; assert UsageError. Restore.
 
---- Detailed Task 4 App.js concrete code blocks
-Initial state (line 10, changed):
-```javascript
-const state = {
-    snapshot: null,
-    connected: false,
-    receivedMonotonicMs: 0,
-    counterAgeAtReceiptSec: null,
-    usageAgeAtReceiptSec: null,
-    currentNode: null,
-    currentRange: '1h',
-    currentUsername: null,
-    refreshTimer: null,
-    ageTimer: null,
-};
-```
-Inventory fetch (new function):
-```javascript
-async function fetchInventoryAndSelect() {
-    try {
-        const resp = await fetch('/api/nodes', { cache: 'no-store', signal: AbortSignal.timeout(15000) });
-        if (!resp.ok) throw new Error('inventory failed');
-        const data = await resp.json();
-        const nodes = Array.isArray(data.nodes) ? data.nodes : [];
-        renderNodeButtons(nodes);
-        if (nodes.length === 0) {
-            qs('[data-testid="connectivity-status"]').textContent = 'No monitored nodes available';
-            state.currentNode = null;
-            return false;
-        }
-        // Prefer configured local node; else first
-        let selected = nodes[0].id;
-        for (const n of nodes) {
-            if (n.configured && n.role === 'local') { selected = n.id; break; }
-        }
-        state.currentNode = selected;
-        setActiveNodeButton(selected);
-        return true;
-    } catch (e) {
-        qs('[data-testid="connectivity-status"]').textContent = 'Connection failure';
-        return false;
-    }
-}
-```
-Button render (replaces free-text form):
-```javascript
-function renderNodeButtons(nodes) {
-    const group = qs('.node-button-group');
-    if (!group) return;
-    group.innerHTML = '';
-    nodes.forEach(function(node) {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'node-btn';
-        btn.setAttribute('data-node-id', node.id);
-        btn.textContent = node.label || node.id;
-        btn.setAttribute('aria-pressed', 'false');
-        btn.addEventListener('click', async function() {
-            state.currentNode = node.id;
-            setActiveNodeButton(node.id);
-            await refreshDashboard();
-        });
-        group.appendChild(btn);
-    });
-}
-```
-`setActiveNodeButton(id)` sets `aria-pressed="true"` exclusively and updates visual `.is-selected` class.
+- [ ] Step 1: Execute full suite; record results.
+- [ ] Step 2: Execute mutation controls; confirm named failures then restore.
+- [ ] Step 3: Confirm no placeholders (`...` as placeholder, `TBD`, `TODO`, `similar`); confirm 3-space indent in snippets.
 
---- Detailed Task 6 Verification (expanded)
-Before full suite:
-```bash
-python -c "
-from node_monitor.config import load_nested_config, discover_config_path
-import tempfile, os
-with tempfile.TemporaryDirectory() as tmp:
-    # .yml preferred over .yaml
-    open(os.path.join(tmp, '.node_monitor.yml'), 'w').write('system: test
-nodes: []
-probe_python: /usr/bin/python3
-')
-    open(os.path.join(tmp, '.node_monitor.yaml'), 'w').write('bad')
-    p = discover_config_path(explicit_path=None, home=tmp, cwd=tmp)
-    assert p.endswith('.yml'), 'Expected .yml preference: ' + p
-"
-```
-After implementation:
-```bash
-python -m pytest tests/test_config_nested.py tests/web/test_web_app.py -q
-python -m pytest tests/browser/test_dashboard_states.py -q
-```
-No deployment, no systemd, no push.
+---
 
---- Detailed Task 8 Exact commit procedure
-The new commit must NOT amend previous; it must be a new commit on design/unified-config-node-selector.
+### Task 7: Scope/security review (self-corrected checklist, no deployment)
+
+- [x] `display_name` optional, frozen.
+- [x] `.yml` before `.yaml` in discovery.
+- [x] POSIX 0600 on credential-bearing file; symlink-resistant `os.path.isfile`.
+- [x] `load_web_config` projects only `system` + `web.database`; never exposes writer DB; asserts separate identity.
+- [x] CLI `--config` optional; loopback default `127.0.0.1`; `--no-browser` removed; no `webbrowser` import.
+- [x] `/api/nodes` uses fixed SELECT `DISTINCT source_hostname ... LIMIT 128`; serialized cap 64 KiB; 200 empty; 503 on bounds/service.
+- [x] `DashboardService.nodes()` uses `run_dashboard_with_deadline` read-only seam; never constructs writer DB.
+- [x] Browser: `currentNode: null`; button group replaces free-text input; inventory before dashboard; 422 triggers inventory refresh; later disconnect retained.
+- [x] No invented `service.run`; no deployment/push steps.
+- [x] No `TBD`/`TODO`/`similar`/placeholder ellipses in production snippets.
+
+---
+
+### Task 8: Final plan-only commit
+
+Only stage `docs/superpowers/plans/2026-10-05-unified-config-node-selector.md`. New commit (do not amend).
+
 ```bash
 cd /Users/jchilders/workspaces/node_monitor/.worktrees/unified-config-node-selector
 git add docs/superpowers/plans/2026-10-05-unified-config-node-selector.md
-git commit -m "docs: expand unified config implementation plan"
+git commit -m "docs: make unified config plan executable"
 ```
-After commit:
-```bash
-FULL_SHA=$(git rev-parse HEAD)
-git log --oneline -2
-echo "Full SHA: $FULL_SHA"
-```
-Expected output contains `docs: expand unified config implementation plan` as newest line.
 
---- Expanded Task 7 review checklist (self-corrected)
-- [x] `display_name` optional added; frozen.
-- [x] `load_web_config` projects from unified file but never exposes writer DB; asserts separate identity.
-- [x] Discovery order: `.yml` before `.yaml`.
-- [x] POSIX mode enforced (`stat` check on regular file; `0o600` when credential string present).
-- [x] CLI `--config` optional; default loopback; `--no-browser` removed; no `webbrowser` import.
-- [x] `/api/nodes` uses fixed SELECT; caps 128 / 64 KiB; separate config label metadata.
-- [x] Response and exception mapping concrete (200 empty, 503 for bounds/service, 422 unchanged for dashboard).
-- [x] `state.currentNode` initially `null`.
-- [x] Button group replaces free-text node input; `#node-form` removed.
-- [x] Bootstrap: fetch inventory before any dashboard request.
-- [x] 422 recovery: refresh inventory, drop invalid selection.
-- [x] Later disconnect retention preserved.
-- [x] No invented `service.run` signature.
-- [x] All code examples use 3-space indent.
-- [x] No `...` placeholders except concrete ellipsis in commands.
-- [x] No `TBD`/`TODO`/`similar to above`.
-- [x] No deployment steps.
-- [x] Plan saved to exact path; new correction commit (not amend) with message `docs: expand unified config implementation plan`.
+Report after commit: full SHA, line count (`wc -l docs/superpowers/plans/2026-10-05-unified-config-node-selector.md`), task count (8), file map confirmation, placeholder audit (`grep -nE 'TODO|TBD|\.\.\.|similar' docs/superpowers/plans/2026-10-05-unified-config-node-selector.md` should return nothing except concrete ellipsis in commands), `git diff --check` clean, no deployment steps present.
+
+---
+
+No deployment, no push, no production build/restart. Plan defines future absent code; absence of `/api/nodes` before implementation is expected, not a defect.
