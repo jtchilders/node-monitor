@@ -57,6 +57,7 @@ def _nested_raw(url="postgresql://file_user:file_pass@filehost/node_monitor"):
 
 def _write(path, raw):
    path.write_text(yaml.safe_dump(raw))
+   path.chmod(0o600)
    return str(path)
 
 

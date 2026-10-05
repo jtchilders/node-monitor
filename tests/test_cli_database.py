@@ -37,6 +37,7 @@ def _config(url="postgresql://file_user:file_password@filehost/node_monitor"):
 
 def _write(path, raw):
    path.write_text(yaml.safe_dump(raw))
+   path.chmod(0o600)
    return str(path)
 
 

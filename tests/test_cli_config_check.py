@@ -28,6 +28,7 @@ def _invoke(args, env=None):
 def _write_yaml(path, raw):
    with open(path, "w") as handle:
       yaml.safe_dump(raw, handle)
+   path.chmod(0o600)
    return str(path)
 
 

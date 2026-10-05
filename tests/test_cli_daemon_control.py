@@ -109,6 +109,7 @@ def test_control_watcher_fails_closed_when_file_disappears(tmp_path):
 def test_start_foreground_forces_indefinite_and_marks_exited(tmp_path, monkeypatch):
    config = tmp_path / "config.yaml"
    config.write_text(yaml.safe_dump(_nested_raw()))
+   config.chmod(0o600)
    path = tmp_path / "daemon.json"
    observed = []
    monkeypatch.setattr(cli_module, "_default_control_file_path", lambda: str(path))
@@ -179,6 +180,7 @@ def test_start_rejects_concurrent_start_while_lifetime_lock_is_held(
       tmp_path, monkeypatch):
    config = tmp_path / "config.yaml"
    config.write_text(yaml.safe_dump(_nested_raw()))
+   config.chmod(0o600)
    path = tmp_path / "daemon.json"
    lock_path = tmp_path / "daemon.lock"
    monkeypatch.setattr(cli_module, "_default_control_file_path", lambda: str(path))
