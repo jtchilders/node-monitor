@@ -271,16 +271,24 @@
       renderPresentationState(preservedCounters, preservedUsage, false);
    }
 
-   async function refreshDashboard() {
+   async function refreshDashboard(recoverUnavailable) {
       if (!state.currentNode) return false;
+      const mayRecover = recoverUnavailable !== false;
       try {
          render(await fetchDashboard());
          return true;
       } catch (error) {
-         if (error.status === 422) {
+         if (error.status === 422 && mayRecover) {
             state.currentNode = null;
-            await initInventorySelection();
+            await initInventorySelection(false);
             return state.connected;
+         }
+         if (error.status === 422) {
+            qs('#node-status').textContent = 'Node unavailable';
+            state.connected = false;
+            qs('[data-testid="connectivity-status"]').textContent =
+               'Node unavailable';
+            return false;
          }
          renderFailure(state.snapshot === null);
          return false;
@@ -1436,7 +1444,12 @@
          const resp = await fetch('/api/nodes', { cache: 'no-store' });
          if (!resp.ok) throw new Error('inventory failed');
          const data = await resp.json();
-         return data.nodes || [];
+         if (!data || !Array.isArray(data.nodes)) return null;
+         for (let i = 0; i < data.nodes.length; i++) {
+            if (!data.nodes[i] || typeof data.nodes[i].id !== 'string'
+                  || data.nodes[i].id.length === 0) return null;
+         }
+         return data.nodes;
       } catch (e) { return null; }
    }
 
@@ -1467,7 +1480,7 @@
       });
    }
 
-   async function initInventorySelection() {
+   async function initInventorySelection(recoverUnavailable) {
       const nodes = await fetchNodes();
       if (nodes === null) {
          qs('#node-status').textContent = 'Connection failure';
@@ -1495,8 +1508,8 @@
       state.currentNode = selection;
       renderNodeButtons(nodes); // refresh aria-pressed
       startTimers();
-      await refreshDashboard();
+      await refreshDashboard(recoverUnavailable);
    }
 
-   initInventorySelection();
+   initInventorySelection(true);
 })();

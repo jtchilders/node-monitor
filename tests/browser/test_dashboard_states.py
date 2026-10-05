@@ -325,3 +325,33 @@ def test_unavailable_node_refreshes_inventory_and_selects_valid_exact_id(
    assert len(live_web.state.inventory_requests) >= 2
    assert live_web.state.requests[-1]["node"] == [valid]
    assert all("422" in error for error in errors)
+
+
+def test_persistent_unavailable_node_stops_after_one_inventory_refresh(
+      browser_page, live_web):
+   live_web.state.set_inventory([
+      {"id": "gone.example", "label": "gone", "configured": True,
+       "role": "local"},
+   ])
+   live_web.state.fail(status=422)
+   page, errors, _ = browser_page
+   page.goto(live_web.url + "/", wait_until="domcontentloaded")
+
+   expect(page.locator('#node-status')).to_have_text("Node unavailable")
+   assert len(live_web.state.inventory_requests) == 2
+   assert len(live_web.state.requests) == 2
+   assert all("422" in error for error in errors)
+
+
+def test_malformed_inventory_is_a_connection_failure_without_dashboard_request(
+      browser_page, live_web):
+   live_web.state.inventory_body = {
+      "system": "polaris",
+      "nodes": [{"label": "missing exact id", "configured": True}],
+   }
+   page, errors, _ = browser_page
+   page.goto(live_web.url + "/", wait_until="domcontentloaded")
+
+   expect(page.locator('#node-status')).to_have_text("Connection failure")
+   assert live_web.state.requests == []
+   assert errors == []
