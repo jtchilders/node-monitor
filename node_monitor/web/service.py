@@ -67,6 +67,8 @@ RANGES = {
 
 #: Maximum serialized response size in bytes (inclusive).
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024  # 5 MiB
+MAX_NODE_INVENTORY_BYTES = 64 * 1024
+MAX_NODE_INVENTORY_COUNT = 128
 
 # Fixed parameterized SQL for in-transaction node inventory + hardware lookup.
 # Runs inside the same REPEATABLE READ READ ONLY snapshot as all other queries.
@@ -78,6 +80,14 @@ _HARDWARE_SQL = text(
    "       net_fs_mounts, gpus "
    "FROM node_monitor.node_hardware "
    "WHERE system = :system AND source_hostname = :node"
+)
+
+_NODES_SQL = text(
+   "SELECT DISTINCT source_hostname "
+   "FROM node_monitor.node_hardware "
+   "WHERE system = :system "
+   "ORDER BY source_hostname "
+   "LIMIT 129"
 )
 
 
@@ -98,6 +108,14 @@ class DashboardRequestError(DashboardServiceError):
 
 class DashboardTooLarge(DashboardServiceError):
    """Raised when the serialized dashboard payload exceeds MAX_RESPONSE_BYTES."""
+
+
+class NodesServiceError(DashboardServiceError):
+   """Bounded, sanitized node-inventory failure."""
+
+
+class NodesTooLarge(NodesServiceError):
+   """Raised when node inventory exceeds its count or byte bound."""
 
 
 # ---------------------------------------------------------------------------
@@ -144,12 +162,14 @@ class DashboardService:
        treats ``database`` as the engine directly.
    system : str -- system name (e.g. ``"polaris"``).
    inventory : frozenset of str, optional -- ignored for node validation.
-       Constructor-supplied inventory is NOT trusted.  Node validation
-       uses an in-transaction SELECT against node_hardware.  This
-       parameter is accepted for API compatibility only.
+      Constructor-supplied inventory is NOT trusted.  Node validation
+      uses an in-transaction SELECT against node_hardware.  This
+      parameter is accepted for API compatibility only.
+   config_nodes : tuple of NodeConfig, optional -- display metadata only.
+      These entries never establish availability; database rows do.
    """
 
-   def __init__(self, database, system, inventory=None):
+   def __init__(self, database, system, inventory=None, config_nodes=()):
       # Accept either a WebDatabase wrapper or a bare engine.
       if hasattr(database, "_engine"):
          self._engine = database._engine
@@ -158,6 +178,7 @@ class DashboardService:
       self._system = system
       # inventory is ignored for validation; kept only for API compat.
       self._inventory = inventory
+      self._config_nodes = tuple(config_nodes)
 
       # Allow tests to inject a synchronous operation replacement.
       # When set, dashboard() calls this instead of the real worker.
@@ -238,6 +259,34 @@ class DashboardService:
          raise DashboardServiceError(
             "dashboard serialization failed") from None
 
+   async def nodes(self):
+      """Return compact, bounded JSON for exact database-backed node IDs."""
+      def _operation(conn, dbapi_conn):
+         rows = conn.execute(_NODES_SQL, {"system": self._system}).all()
+         hostnames = [row[0] for row in rows]
+         if len(hostnames) > MAX_NODE_INVENTORY_COUNT:
+            raise NodesTooLarge("node inventory exceeds limit")
+         return hostnames
+
+      try:
+         from node_monitor.database.web import run_dashboard_with_deadline
+         hostnames = await run_dashboard_with_deadline(
+            self._engine, _operation, timeout_sec=12.0)
+         response = {
+            "system": self._system,
+            "nodes": _build_node_inventory(
+               self._system, hostnames, self._config_nodes),
+         }
+         payload = json.dumps(
+            response, separators=(",", ":"), allow_nan=False).encode("utf-8")
+         if len(payload) > MAX_NODE_INVENTORY_BYTES:
+            raise NodesTooLarge("node inventory exceeds limit")
+         return payload
+      except NodesServiceError:
+         raise
+      except Exception:
+         raise NodesServiceError("node inventory query failed") from None
+
    # ------------------------------------------------------------------
    # Internal -- async operation dispatch
    # ------------------------------------------------------------------
@@ -270,6 +319,38 @@ class DashboardService:
       from node_monitor.database.web import run_dashboard_with_deadline
       return await run_dashboard_with_deadline(
          self._engine, _operation, timeout_sec=12.0)
+
+
+def _conservative_node_label(system, hostname):
+   prefix = "%s-login-" % system
+   first_component = hostname.split(".", 1)[0]
+   if first_component.startswith(prefix):
+      suffix = first_component[len(prefix):]
+      if suffix.isdigit():
+         return "login-%s" % suffix
+   return hostname
+
+
+def _build_node_inventory(system, hostnames, config_nodes):
+   config_by_hostname = {node.hostname: node for node in config_nodes}
+   available = set(hostnames)
+   ordered = [
+      node.hostname for node in config_nodes if node.hostname in available]
+   ordered.extend(sorted(available.difference(ordered)))
+   result = []
+   for hostname in ordered:
+      configured = config_by_hostname.get(hostname)
+      label = (
+         configured.display_name
+         if configured is not None and configured.display_name is not None
+         else _conservative_node_label(system, hostname))
+      result.append({
+         "id": hostname,
+         "label": label,
+         "configured": configured is not None,
+         "role": configured.role if configured is not None else None,
+      })
+   return result
 
 
 # ---------------------------------------------------------------------------

@@ -316,6 +316,39 @@ def test_service_init_failure_db_dispose(monkeypatch):
 # Startup line format (TCP: PID <digits> http://...)
 # ------------------------------------------------------------------
 
+def test_service_receives_configured_nodes(monkeypatch):
+   import node_monitor.config as config_mod
+   import node_monitor.database.web as db_web_mod
+   import node_monitor.web.app as app_mod
+   import node_monitor.web.runtime as rt_mod
+   import node_monitor.web.service as service_mod
+
+   config = _make_fake_config()
+   marker = object()
+   config = config.__class__(
+      system=config.system, nodes=(marker,), database=config.database)
+   monkeypatch.setattr(config_mod, "load_web_config", lambda p, **kw: config)
+   class DB:
+      def preflight(self): pass
+      def dispose(self): pass
+   monkeypatch.setattr(db_web_mod, "WebDatabase", lambda cfg: DB())
+   captured = {}
+   def make_service(db, system, config_nodes=()):
+      captured["nodes"] = config_nodes
+      return object()
+   monkeypatch.setattr(service_mod, "DashboardService", make_service)
+   monkeypatch.setattr(app_mod, "create_app", lambda service: object())
+   monkeypatch.setattr(rt_mod, "run_uvicorn", lambda *args, **kwargs: None)
+   with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as fh:
+      cfg = fh.name
+   try:
+      result = CliRunner().invoke(web_command, ["--config", cfg])
+   finally:
+      os.unlink(cfg)
+   assert result.exit_code == 0, result.output
+   assert captured["nodes"] == (marker,)
+
+
 def test_startup_line_format(monkeypatch):
    import node_monitor.config as config_mod
    import node_monitor.database.web as db_web_mod

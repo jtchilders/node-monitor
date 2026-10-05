@@ -1414,7 +1414,8 @@ def web_command(config_path, host, port):
       except Exception: pass
       sys.exit(1)
    try:
-      service = DashboardService(db, system=config.system)
+      service = DashboardService(
+         db, system=config.system, config_nodes=config.nodes)
       app = create_app(service)
    except Exception:
       click.echo("service initialization failed", err=True)

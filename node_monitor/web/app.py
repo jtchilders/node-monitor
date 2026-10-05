@@ -18,6 +18,16 @@ def create_app(service):
    async def health():
       return {"status": "ok"}
 
+   @app.get("/api/nodes")
+   async def nodes():
+      from node_monitor.web.service import NodesServiceError
+      try:
+         payload = await service.nodes()
+         return Response(content=payload, media_type="application/json")
+      except NodesServiceError:
+         raise HTTPException(
+            status_code=503, detail="node inventory failed") from None
+
    @app.get("/api/dashboard")
    async def dashboard(node: str, range: str = "1h", username: str = None):
       from node_monitor.web.service import (
