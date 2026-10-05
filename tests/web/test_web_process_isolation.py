@@ -241,7 +241,7 @@ class TCPWebSubprocess:
       self.process = subprocess.Popen(
          [_repo_python(), "-m", "node_monitor.cli.main", "web",
           "--config", self._config_path,
-          "--host", self.host, "--port", str(self.port), "--no-browser"],
+          "--host", self.host, "--port", str(self.port)],
          cwd=_REPO_ROOT, env=env,
          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
       # TCP readiness: poll health endpoint on TCP loopback

@@ -1352,22 +1352,33 @@ def _run_daemon_postgres(nested, config_path, run_id, probe_version, home,
 
 
 @cli.command("web")
-@click.option("--config", "config_path", required=True,
-             type=click.Path(dir_okay=False, exists=True),
-             help="Path to the web-only YAML config file.")
+@click.option("--config", "config_path", required=False, default=None,
+             type=click.Path(dir_okay=False),
+             help="Path to the web-only YAML config file; discovered if omitted.")
 @click.option("--host", default="127.0.0.1", show_default=True,
              help="Bind address for the TCP listener.")
 @click.option("--port", default=8080, type=int, show_default=True,
              help="TCP port (1-65535).")
-@click.option("--no-browser", is_flag=True, default=False,
-             help="Suppress browser launch.")
-def web_command(config_path, host, port, no_browser):
-   import os, webbrowser
-   from node_monitor.config import load_web_config, ConfigError
+
+def web_command(config_path, host, port):
+   import os
+   from node_monitor.config import load_web_config, ConfigError, discover_config_path
    from node_monitor.database.web import WebDatabase, WebDatabaseError
    from node_monitor.web.service import DashboardService
    from node_monitor.web.app import create_app
    from node_monitor.web.runtime import run_uvicorn
+
+   if config_path is not None:
+      resolved_config_path = config_path
+      if not os.path.isfile(resolved_config_path):
+         click.echo("preflight failed", err=True)
+         sys.exit(1)
+   else:
+      try:
+         resolved_config_path = discover_config_path()
+      except ConfigError:
+         click.echo("preflight failed", err=True)
+         sys.exit(1)
 
    if not host or "\x00" in host:
       click.echo("invalid host: must be non-empty without NUL bytes", err=True)
@@ -1378,7 +1389,7 @@ def web_command(config_path, host, port, no_browser):
 
    config = None; db = None; service = None; app = None
    try:
-      config = load_web_config(config_path)
+      config = load_web_config(resolved_config_path)
    except (yaml.YAMLError, ConfigError):
       click.echo("preflight failed", err=True)
       sys.exit(1)
@@ -1412,14 +1423,7 @@ def web_command(config_path, host, port, no_browser):
       except Exception: pass
       sys.exit(1)
    display_host = host
-   browser_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-   url = "http://%s:%d" % (browser_host, port)
    click.echo("PID %d http://%s:%d" % (os.getpid(), display_host, port))
-   if not no_browser:
-      try:
-         webbrowser.open(url, new=2)
-      except Exception:
-         pass
    try:
       run_uvicorn(app, host=host, port=port)
    except Exception:

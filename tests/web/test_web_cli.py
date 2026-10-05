@@ -1,4 +1,4 @@
-"""TCP web CLI lifecycle regression tests (TCP --host/--port/--no-browser).
+"""TCP web CLI lifecycle regression tests (TCP --host/--port).
 
 Migrated from original Unix-socket test file (git 8790425) to TCP listener.
 Removed only Unix filesystem/stale-socket specific assertions; preserved
@@ -104,7 +104,7 @@ def test_default_host_and_port(monkeypatch):
       _write_valid_config(fh.name)
       cfg = fh.name
    try:
-      result = runner.invoke(web_command, ["--config", cfg, "--no-browser"])
+      result = runner.invoke(web_command, ["--config", cfg])
    finally:
       os.unlink(cfg)
    assert result.exit_code == 0, result.output
@@ -116,7 +116,7 @@ def test_default_host_and_port(monkeypatch):
 # Custom host/port wiring
 # ------------------------------------------------------------------
 
-def test_custom_host_port_and_no_browser(monkeypatch):
+def test_custom_host_and_port(monkeypatch):
    import node_monitor.config as config_mod
    import node_monitor.database.web as db_web_mod
    import node_monitor.web.app as app_mod
@@ -148,7 +148,7 @@ def test_custom_host_port_and_no_browser(monkeypatch):
    try:
       result = runner.invoke(
          web_command,
-         ["--config", cfg, "--host", "0.0.0.0", "--port", "9000", "--no-browser"])
+         ["--config", cfg, "--host", "0.0.0.0", "--port", "9000"])
    finally:
       os.unlink(cfg)
    assert result.exit_code == 0, result.output
@@ -158,81 +158,8 @@ def test_custom_host_port_and_no_browser(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# Wildcard browser URL normalization (monkeypatch webbrowser.open)
+# Browser launching is intentionally unsupported.
 # ------------------------------------------------------------------
-
-def test_wildcard_browser_url_normalization(monkeypatch):
-   import webbrowser
-   import node_monitor.config as config_mod
-   import node_monitor.database.web as db_web_mod
-   import node_monitor.web.app as app_mod
-   import node_monitor.web.runtime as rt_mod
-
-   monkeypatch.setattr(
-      config_mod, "load_web_config", lambda p, **kw: _make_fake_config())
-   class FakeDB:
-      def preflight(self): pass
-      def dispose(self): pass
-   monkeypatch.setattr(db_web_mod, "WebDatabase", lambda cfg: FakeDB())
-   monkeypatch.setattr(app_mod, "create_app", lambda s: object())
-
-   opened_urls = []
-
-   def fake_open(url, new=0, autoraise=True):
-      opened_urls.append(url)
-   monkeypatch.setattr(webbrowser, "open", fake_open)
-
-   monkeypatch.setattr(
-      rt_mod, "run_uvicorn", lambda app, host, port: None)
-
-   runner = CliRunner()
-   with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as fh:
-      _write_valid_config(fh.name)
-      cfg = fh.name
-   try:
-      result = runner.invoke(
-         web_command, ["--config", cfg, "--host", "0.0.0.0", "--port", "8080"])
-   finally:
-      os.unlink(cfg)
-   assert result.exit_code == 0, result.output
-   assert len(opened_urls) == 1
-   # Wildcard 0.0.0.0 normalized to 127.0.0.1 for browser URL
-   assert opened_urls[0] == "http://127.0.0.1:8080"
-
-
-def test_no_browser_suppresses_browser_open(monkeypatch):
-   import webbrowser
-   import node_monitor.config as config_mod
-   import node_monitor.database.web as db_web_mod
-   import node_monitor.web.app as app_mod
-   import node_monitor.web.runtime as rt_mod
-
-   monkeypatch.setattr(
-      config_mod, "load_web_config", lambda p, **kw: _make_fake_config())
-   class FakeDB:
-      def preflight(self): pass
-      def dispose(self): pass
-   monkeypatch.setattr(db_web_mod, "WebDatabase", lambda cfg: FakeDB())
-   monkeypatch.setattr(app_mod, "create_app", lambda s: object())
-   monkeypatch.setattr(rt_mod, "run_uvicorn", lambda app, host, port: None)
-
-   opened = []
-
-   def fake_open(url, new=0, autoraise=True):
-      opened.append(url)
-   monkeypatch.setattr(webbrowser, "open", fake_open)
-
-   runner = CliRunner()
-   with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as fh:
-      _write_valid_config(fh.name)
-      cfg = fh.name
-   try:
-      result = runner.invoke(
-         web_command, ["--config", cfg, "--host", "127.0.0.1", "--port", "8080", "--no-browser"])
-   finally:
-      os.unlink(cfg)
-   assert result.exit_code == 0, result.output
-   assert opened == []
 
 
 # ------------------------------------------------------------------
@@ -412,7 +339,7 @@ def test_startup_line_format(monkeypatch):
    try:
       result = runner.invoke(
          web_command,
-         ["--config", cfg, "--host", "127.0.0.1", "--port", "9999", "--no-browser"])
+         ["--config", cfg, "--host", "127.0.0.1", "--port", "9999"])
    finally:
       os.unlink(cfg)
    assert result.exit_code == 0, result.output
@@ -457,7 +384,7 @@ def test_runtime_failure_bounded_and_dispose(monkeypatch):
       _write_valid_config(fh.name)
       cfg = fh.name
    try:
-      result = runner.invoke(web_command, ["--config", cfg, "--no-browser"])
+      result = runner.invoke(web_command, ["--config", cfg])
    finally:
       os.unlink(cfg)
    assert result.exit_code != 0
@@ -499,7 +426,7 @@ def test_keyboard_interrupt_propagates_and_disposes(monkeypatch):
       _write_valid_config(fh.name)
       cfg = fh.name
    try:
-      result = runner.invoke(web_command, ["--config", cfg, "--no-browser"])
+      result = runner.invoke(web_command, ["--config", cfg])
    finally:
       os.unlink(cfg)
    assert "ki" in tracker.events
@@ -535,7 +462,7 @@ def test_system_exit_propagates_and_disposes(monkeypatch):
       _write_valid_config(fh.name)
       cfg = fh.name
    try:
-      result = runner.invoke(web_command, ["--config", cfg, "--no-browser"])
+      result = runner.invoke(web_command, ["--config", cfg])
    finally:
       os.unlink(cfg)
    assert "sysexit" in tracker.events
@@ -573,3 +500,67 @@ def test_no_raw_exception_interpolation_in_output(monkeypatch):
    assert result.exit_code != 0
    assert sentinel not in result.output
    assert "Traceback" not in result.output
+
+
+# ------------------------------------------------------------------
+# Config discovery, option rejection, no webbrowser
+# ------------------------------------------------------------------
+
+def test_omitted_config_uses_discovered_path(monkeypatch):
+   monkeypatch.setattr(
+      "node_monitor.config.discover_config_path",
+      lambda **kw: "/discovered/config.yaml")
+   discovered = {}
+   def capture_load(p, **kw):
+      discovered["path"] = p
+      from node_monitor.config import WebConfig, DatabaseConfig
+      db_cfg = DatabaseConfig(
+         url="postgresql://u:***@h/db",
+         schema="node_monitor",
+         pool_size=1,
+         max_overflow=0,
+         echo_sql=False,
+         pool_pre_ping=True,
+         pool_timeout_sec=30.0,
+         pool_recycle_sec=1800.0,
+         connect_args=(),
+      )
+      return WebConfig(system="test", nodes=(), database=db_cfg)
+   monkeypatch.setattr("node_monitor.config.load_web_config", capture_load)
+   import node_monitor.database.web as db_web_mod
+   import node_monitor.web.app as app_mod
+   import node_monitor.web.runtime as rt_mod
+   monkeypatch.setattr(
+      db_web_mod, "WebDatabase",
+      lambda cfg: type(
+         "DB", (), {"preflight": lambda s: None,
+                     "dispose": lambda s: None})())
+   monkeypatch.setattr(app_mod, "create_app", lambda s: object())
+   monkeypatch.setattr(rt_mod, "run_uvicorn", lambda *a, **k: None)
+   runner = CliRunner()
+   result = runner.invoke(web_command, ["--host", "127.0.0.1", "--port", "8888"])
+   assert result.exit_code == 0, result.output
+   assert discovered.get("path") == "/discovered/config.yaml", "discovered path must be loaded: got %s" % discovered
+
+def test_explicit_config_override_missing_fails():
+   runner = CliRunner()
+   sentinel = "/nonexistent/SECRET-PATH-SENTINEL.yaml"
+   result = runner.invoke(web_command, ["--config", sentinel])
+   assert result.exit_code != 0
+   assert "preflight failed" in result.output
+   assert "SECRET-PATH-SENTINEL" not in result.output
+
+def test_no_browser_option_is_rejected():
+   import node_monitor.cli.main as main
+   runner = CliRunner()
+   result = runner.invoke(main.cli, ["web", "--no-browser"])
+   assert result.exit_code != 0
+   assert "No such option" in result.output
+
+def test_no_webbrowser_import_or_use():
+   import node_monitor.cli.main as main_mod
+   # The module-level source should not reference webbrowser
+   import inspect
+   source = inspect.getsource(main_mod)
+   assert "webbrowser" not in source
+   assert "no_browser" not in source
