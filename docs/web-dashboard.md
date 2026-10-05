@@ -27,19 +27,25 @@ The web process is entirely separate from the collector/daemon:
   of one another; the web dashboard simply reads whatever has already been
   written.
 
-## Configuration (web-only YAML)
+## Unified configuration
 
-The web process loads a dedicated YAML file that is completely disjoint
-from the collector's configuration -- it accepts exactly `system` and
-`web` at the top level, and every collector-only key (`nodes`,
-`probe_python`, `output`, `collection`, `ssh`, `safety`, `retention`) is
-rejected on sight.
+The daemon and web process use one configuration file. The canonical path is
+`~/.node_monitor.yml`; an explicit `--config PATH` remains available. The
+daemon writer uses `database`, while the web process constructs only the
+separate SELECT-only reader in `web.database`. It never constructs or falls
+back to the writer credential. The validated `nodes` metadata supplies labels,
+roles, and configured ordering for exact database-hostname matches; it cannot
+invent an available node.
 
 ```yaml
-# web-config.yaml -- contains NO credential. The database URL below is
-# illustrative; see "Supplying the database URL" for how the real
-# connection string is injected without ever being committed to this file.
+# ~/.node_monitor.yml (web-relevant excerpt; see config.example.phase1.yaml
+# for the complete daemon and web configuration)
 system: polaris
+
+nodes:
+  - hostname: node.example
+    display_name: login-01
+    role: local
 
 web:
   database:
@@ -82,11 +88,11 @@ leak into the read-only web process by accident.
 ## Foreground run command
 
 ```console
-node-monitor web --config /path/to/web-config.yaml [--host HOST] [--port PORT] [--no-browser]
+node-monitor web [--config PATH] [--host HOST] [--port PORT]
 ```
 
-Defaults: `--host 127.0.0.1` `--port 8080`. `--no-browser` suppresses the
-best-effort browser open. The process always runs in the foreground,
+Defaults: `--host 127.0.0.1` `--port 8080`. The process never launches a
+browser; open the printed URL manually. It always runs in the foreground,
 bound to TCP; there is no `--daemonize` mode (the collector's separate
 `daemon start --foreground` controls a different lifecycle).
 
@@ -120,7 +126,7 @@ dashboard directly; the operator must confirm that is intentional.
 For intentional shared access, the PBS Monitor-style invocation is:
 
 ```console
-node-monitor web --config /path/to/web-config.yaml --host 0.0.0.0 --port 9998 --no-browser
+node-monitor web --host 0.0.0.0 --port 9998
 ```
 
 This service has no HTTP authentication. Its database role is constrained to
@@ -187,6 +193,34 @@ ssh -L 8080:localhost:8080 <host>
 
 This is optional: a `0.0.0.0` bind requires no tunnel, but exposes the
 listener to all interfaces reachable from the host.
+
+The ordinary loopback workflow with the canonical discovered configuration is:
+
+```console
+node-monitor web --port 9998
+ssh -L 9998:127.0.0.1:9998 polaris-login-04
+```
+
+Then open `http://localhost:9998` manually.
+
+## database-backed node selection
+
+The browser first requests `GET /api/nodes`, then renders keyboard-accessible
+buttons. Button labels may use configured `display_name` metadata, but each
+request uses the exact stored `source_hostname`. The browser never guesses or
+rewrites a hostname. Selection preference is the current valid node, then a
+configured local node, then the first available node.
+
+The UI reports these states separately:
+
+- **Loading nodes** while inventory is in flight, before any dashboard query.
+- **No monitored nodes available** for a successful empty inventory.
+- **Connection failure** for an inventory or initial-dashboard transport,
+  server, timeout, or invalid-response failure.
+- **Node unavailable** when one inventory refresh cannot replace a node that
+  returned HTTP 422 or disappeared.
+- **Web server disconnected** after a later failure, while retaining the last
+  complete dashboard values and charts.
 
 ## Log location
 

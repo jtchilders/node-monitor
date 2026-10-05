@@ -20,8 +20,10 @@ system: polaris
 
 nodes:
   - hostname: polaris-login-04.hsn.cm.polaris.alcf.anl.gov
+    display_name: login-04
     role: local
   - hostname: polaris-login-01.hsn.cm.polaris.alcf.anl.gov
+    display_name: login-01
     role: remote
     # Polaris-only SSH fan-out alias -- see config.example.yaml's own
     # comment on ssh_target for the full "transport identifier, never
@@ -92,6 +94,15 @@ database:
     keepalives_interval: 10
     keepalives_count: 3
     options: "-c statement_timeout=15000 -c lock_timeout=5000"
+
+# --- web: a separate SELECT-only reader for the dashboard. ---
+# Supply its URL with NODE_MONITOR_WEB_DB_URL, or add `url` only to an
+# untracked ~/.node_monitor.yml kept mode 0600. Never reuse the writer URL.
+web:
+  database:
+    schema: node_monitor
+    pool_size: 1
+    max_overflow: 0
 
 # --- retention: horizons are approximate MINIMUM ages, not exact
 # --- expiration instants. One housekeeping pass runs at a fixed UTC time

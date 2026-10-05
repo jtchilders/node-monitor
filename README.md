@@ -143,6 +143,26 @@ list.
 
 ## Web dashboard (TCP-only, `docs/web-dashboard.md`)
 
-`node-monitor web --config FILE [--host HOST] [--port PORT] [--no-browser]`.
-Default `127.0.0.1:8080`; TCP only (no Unix sockets; `socket_path` removed/rejected).
-Use `screen`/`tmux` for persistence. See `docs/web-dashboard.md`.
+The daemon and web dashboard use one configuration file. The canonical path is
+`~/.node_monitor.yml`; it contains the daemon writer under `database` and a
+separate SELECT-only web reader under `web.database`. Keep credential-bearing
+copies mode `0600`.
+
+Quick start:
+
+    cp config.example.phase1.yaml ~/.node_monitor.yml
+    chmod 600 ~/.node_monitor.yml
+    node-monitor web --port 9998
+
+The web command discovers the config automatically, defaults to
+`127.0.0.1`, and never launches a browser. `--config`, `--host`, and `--port`
+remain available for explicit overrides. The dashboard lists database-backed
+nodes as buttons; labels come from exact configured-node metadata, while exact
+stored hostnames are used for API requests.
+
+For access through the default loopback bind:
+
+    ssh -L 9998:127.0.0.1:9998 polaris-login-04
+
+Then open `http://localhost:9998` manually. Use `screen`/`tmux` for persistence.
+See `docs/web-dashboard.md` for the reader-role and failure-state details.
