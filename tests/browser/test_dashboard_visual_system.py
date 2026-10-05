@@ -203,6 +203,66 @@ def test_narrow_400px_no_overflow_and_content_visible_and_focus_and_chart_height
       assert 280 <= bb["height"] <= 300
 
 
+def screenshot_dir(tmp_path):
+   import os
+   d = os.environ.get("NODE_MONITOR_SCREENSHOT_DIR")
+   if d:
+      out = d
+   else:
+      out = str(tmp_path)
+   os.makedirs(out, exist_ok=True)
+   try:
+      os.chmod(out, 0o700)
+   except OSError:
+      pass
+   return out
+
+
+def test_capture_visual_acceptance_matrix(browser_page, live_web, snapshot_complete, tmp_path):
+   import copy, os
+   out_dir = screenshot_dir(tmp_path)
+   page, errors, external = open_dashboard(browser_page, live_web)
+   wait_connected_and_charts(page)
+   page.set_viewport_size({"width": 1440, "height": 1000})
+   desktop_path = os.path.join(out_dir, "desktop-current.png")
+   page.screenshot(path=desktop_path, full_page=True)
+
+   # Disconnect: fail server + range click; retain telemetry/charts
+   snapshot = copy.deepcopy(snapshot_complete)
+   snapshot["usage"]["status"] = "stale"
+   snapshot["usage"]["is_fresh"] = False
+   live_web.state.set_snapshot(snapshot)
+   live_web.state.fail()
+   page.locator('[data-range="3h"]').click()
+   expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Web server disconnected", timeout=CONNECTED_TIMEOUT)
+   disconnect_path = os.path.join(out_dir, "desktop-disconnected.png")
+   page.screenshot(path=disconnect_path, full_page=True)
+
+   # Narrow partial stale after restore + reload/action + connected/state waits
+   partial = copy.deepcopy(snapshot_complete)
+   partial["counters"]["status"] = "partial"
+   partial["usage"]["status"] = "stale"
+   partial["usage"]["is_fresh"] = False
+   live_web.state.set_snapshot(partial)
+   live_web.state.status = 200
+   page.goto(live_web.url + "/")
+   wait_connected_and_charts(page)
+   page.set_viewport_size({"width": 400, "height": 800})
+   page.locator('[data-range="1h"]').click()
+   narrow_path = os.path.join(out_dir, "narrow-partial-stale.png")
+   page.screenshot(path=narrow_path, full_page=True)
+
+   # Assert PNG evidence
+   for p in (desktop_path, disconnect_path, narrow_path):
+      assert os.path.isfile(p), f"missing screenshot: {p}"
+      assert os.path.getsize(p) > 10240, f"screenshot too small ({os.path.getsize(p)} bytes): {p}"
+
+   # Network / console assertions
+   assert external == [], f"unexpected external requests: {external}"
+   # Only expected 503 console/network errors (from disconnect failure)
+   assert all("503" in str(e) for e in errors) if errors else True
+
+
 def test_reduced_motion_disables_pulse(browser_page, live_web):
    page, _, _ = browser_page
    page.emulate_media(reduced_motion="reduce")
