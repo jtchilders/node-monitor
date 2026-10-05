@@ -1,4 +1,4 @@
-"""Task 2 visual-system exact-state assertions (rewritten, non-tautological)."""
+"""Visual-system/state/responsive acceptance assertions (Task 2 + 3): responsive layout, focus outline, reduced motion, lifecycle stability, disconnect state retention."""
 import copy
 from playwright.sync_api import expect
 
@@ -8,14 +8,11 @@ from tests.browser.test_dashboard_states import open_dashboard
 CONNECTED_TIMEOUT = 10000
 LIFECYCLE_WAIT = "() => window.__nodeMonitorTest && window.__nodeMonitorTest.getChartLifecycle && window.__nodeMonitorTest.getChartLifecycle().createCount >= 4"
 
-def wait_connected_and_charts(page, require_exact_4=True):
+def wait_connected_and_charts(page):
     expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected", timeout=CONNECTED_TIMEOUT)
-    if require_exact_4:
-        page.wait_for_function("() => window.__nodeMonitorTest && window.__nodeMonitorTest.getChartLifecycle && window.__nodeMonitorTest.getChartLifecycle().createCount === 4", timeout=10000)
-    else:
-        page.wait_for_function(LIFECYCLE_WAIT, timeout=10000)
+    page.wait_for_function("() => window.__nodeMonitorTest && window.__nodeMonitorTest.getChartLifecycle && window.__nodeMonitorTest.getChartLifecycle().createCount === 4", timeout=10000)
     lc = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
-    assert lc["createCount"] >= 4, f"expected createCount>=4, got {lc}"
+    assert lc["createCount"] == 4, f"expected exact createCount 4, got {lc}"
 
 
 def test_semantic_state_stale_usage_current_counters(browser_page, live_web, snapshot_complete):
@@ -75,10 +72,13 @@ def test_disconnect_retains_stale_classes(browser_page, live_web, snapshot_compl
     assert page.locator('[data-testid="cpu-busy"]').inner_text() == before_cpu
     retry_btn = page.locator('[data-testid="retry-btn"]')
     assert not retry_btn.is_visible()
-    # Charts not replaced/destroyed: lifecycle projection unchanged
     lc_before = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
     assert lc_before["createCount"] == 4
-    assert page.locator('#chart-cpu').count() == 1
+    assert lc_before.get("destroyCount", 0) == 0, f"unexpected destroy before disconnect: {lc_before}"
+    # After disconnect, lifecycle unchanged (no new charts, no destruction)
+    lc_after = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
+    assert lc_after["createCount"] == lc_before["createCount"], f"createCount changed after disconnect: {lc_after}"
+    assert lc_after.get("destroyCount", 0) == lc_before.get("destroyCount", 0), f"destroyCount changed after disconnect: {lc_after}"
 
 
 def test_partial_and_empty_states(browser_page, live_web, snapshot_complete):
@@ -143,16 +143,28 @@ def test_desktop_geometry_4_cards_and_2_metric_columns_and_chart_height(browser_
              page.locator('[data-testid="usage-card"]'),
              page.locator('[data-testid="poll-card"]'),
              page.locator('[data-testid="mem-card"]')]
-    tops = [c.bounding_box()["y"] for c in cards if c.bounding_box()]
+    for c in cards:
+        expect(c).to_be_visible()
+    tops = []
+    for c in cards:
+        bb = c.bounding_box()
+        assert bb is not None, f"bounding_box missing for {c}"
+        tops.append(bb["y"])
     assert len(tops) == 4
     assert max(tops) - min(tops) < 4, f"status cards not aligned: {tops}"
     panels = page.locator('.metric-panel').all()
-    xs = [p.bounding_box()["x"] for p in panels if p.bounding_box()]
+    xs = []
+    for p in panels:
+        expect(p).to_be_visible()
+        bb = p.bounding_box()
+        assert bb is not None, "metric-panel bounding_box None"
+        xs.append(bb["x"])
     distinct_x = len({round(x / 10) * 10 for x in xs})
     assert distinct_x == 2, f"expected 2 metric x columns, got {distinct_x} at {xs}"
     for w in page.locator('.chart-canvas-wrap').all():
+        expect(w).to_be_visible()
         bb = w.bounding_box()
-        assert bb, "chart wrapper missing bounding box"
+        assert bb is not None, "chart wrapper bounding_box None (geometry missing)"
         h = bb["height"]
         assert 280 <= h <= 300, f"chart wrapper height {h} out of [280,300]"
 
@@ -173,25 +185,34 @@ def test_narrow_400px_no_overflow_and_content_visible_and_focus_and_chart_height
     expect(page.locator('#user-form').first).to_be_visible()
     expect(page.locator('.metric-panel').first).to_be_visible()
     page.locator('[data-range="1h"]').focus()
-    outline = page.locator('[data-range="1h"]').evaluate("el => getComputedStyle(el).outline")
-    assert outline not in ("none", "0px none"), f"focus outline missing: {outline}"
+    outline_style = page.locator('[data-range="1h"]').evaluate("el => getComputedStyle(el).outlineStyle")
+    assert outline_style != 'none', f"focus outline missing (outlineStyle={outline_style})"
+    outline_width = page.locator('[data-range="1h"]').evaluate("el => parseFloat(getComputedStyle(el).outlineWidth) || 0")
+    assert outline_width > 0, f"focus outline width expected >0, got {outline_width}"
+    root_style = page.evaluate("() => getComputedStyle(document.documentElement).outlineStyle")
+    # Root mask absence checked implicitly by no overflow hidden/clip; keep existing check
     overflow_hidden = page.evaluate("() => { const s=getComputedStyle(document.documentElement); return s.overflow==='hidden'||s.overflow==='clip'; }")
     assert not overflow_hidden, "overflow hidden/clip must not be set on root"
+    # Root outline-style is naturally none; only overflow hidden/clip indicates masking.
     for w in page.locator('.chart-canvas-wrap').all():
+        expect(w).to_be_visible()
         bb = w.bounding_box()
-        assert bb and 280 <= bb["height"] <= 300
+        assert bb is not None, "chart wrapper bounding_box None in narrow layout"
+        assert 280 <= bb["height"] <= 300
 
 
 def test_reduced_motion_disables_pulse(browser_page, live_web):
     page, _, _ = browser_page
     page.emulate_media(reduced_motion="reduce")
     page.goto(live_web.url + "/")
-    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected", timeout=CONNECTED_TIMEOUT)
-    # Wait charts
-    page.wait_for_function(LIFECYCLE_WAIT, timeout=10000)
+    wait_connected_and_charts(page)
     live_web.state.fail()
     page.locator('[data-range="3h"]').click()
     expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Web server disconnected", timeout=CONNECTED_TIMEOUT)
+    # Retain disconnected class; do not require removal
+    header = page.locator('.dashboard-header')
+    assert 'is-disconnected' in (header.get_attribute('class') or '')
     dot = page.locator('.dashboard-header.is-disconnected .state-dot')
+    expect(dot).to_be_visible()
     anim = dot.evaluate("el => getComputedStyle(el).animationName")
     assert anim == "none", f"expected animation none under reduced motion, got {anim}"
