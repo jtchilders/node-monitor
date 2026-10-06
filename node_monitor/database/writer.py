@@ -267,18 +267,30 @@ _ADAPTERS = {
 
 def _extract_sqlstate(exc):
    """Extract SQLSTATE only from recognized driver interfaces."""
-   candidates = []
-   if hasattr(exc, "__cause__") and exc.__cause__ is not None:
-      candidates.append(exc.__cause__)
-   candidates.append(exc)
-   for c in candidates:
+   seen = set()
+   def visit(obj):
+      if obj is None or id(obj) in seen:
+         return None
+      seen.add(id(obj))
+      # Inspect recognized SQLAlchemy DBAPIError .orig and chain.
+      if hasattr(obj, "orig"):
+         inner = visit(obj.orig)
+         if inner is not None:
+            return inner
       for attr in ("sqlstate", "pgcode"):
-         value = getattr(c, attr, None)
+         value = getattr(obj, attr, None)
          if value is not None:
             s = str(value)
             if len(s) == 5 and s.isalnum():
                return s
-   return None
+      # Recurse through chained exceptions.
+      for next_exc in (getattr(obj, "__cause__", None),
+                       getattr(obj, "__context__", None)):
+         inner = visit(next_exc)
+         if inner is not None:
+            return inner
+      return None
+   return visit(exc)
 
 
 class DatabaseWriter:
@@ -289,9 +301,11 @@ class DatabaseWriter:
       self._clock = clock or (lambda: datetime.now(timezone.utc))
       if retry_policy is None:
          retry_policy = {}
-      self._max_attempts = retry_policy.get("max_attempts", 5)
+      self._max_attempts = min(retry_policy.get("max_attempts", 5), 5)
       self._initial_delay = retry_policy.get("initial_delay", 1.0)
       self._max_delay = retry_policy.get("max_delay", 8.0)
+      if self._max_attempts < 1:
+         raise DatabaseWriteError("database write failed") from None
       self._sleeper = sleeper or (__import__("time").sleep)
 
    def _prepare(self, record_type, record):
@@ -309,6 +323,8 @@ class DatabaseWriter:
       return self.write_records(((record_type, record),))
 
    def write_records(self, records):
+      # Materialize generator inputs exactly once before prepare.
+      records = list(records)
       # Validate and adapt complete batch once before any transaction.
       prepared = [self._prepare(record_type, record)
                   for record_type, record in records]
@@ -317,8 +333,11 @@ class DatabaseWriter:
       })
       batch_size = len(prepared)
 
-      delays = [2 ** (i - 1) for i in range(1, self._max_attempts)]
-      delays = [min(d, self._max_delay) for d in delays]
+      delay = self._initial_delay
+      delays = []
+      for i in range(1, self._max_attempts):
+         delays.append(min(delay, self._max_delay))
+         delay *= 2
 
       for attempt in range(1, self._max_attempts + 1):
          try:
@@ -341,6 +360,18 @@ class DatabaseWriter:
             if sqlstate not in _ALLOWLISTED_SQLSTATE:
                raise DatabaseWriteError("database write failed") from None
             if attempt == self._max_attempts:
+               sqlstate = _extract_sqlstate(exc)
+               assert sqlstate is not None
+               category = _SQLSTATE_CATEGORY_MAP.get(sqlstate, "transient")
+               logger.warning(
+                  "postgres transient write exhausted: "
+                  "event=write_exhausted "
+                  "sqlstate=%s "
+                  "category=%s "
+                  "failed_attempt=%d "
+                  "max_attempts=%d",
+                  sqlstate, category, attempt, self._max_attempts,
+               )
                raise DatabaseWriteError("database write failed") from None
             category = _SQLSTATE_CATEGORY_MAP.get(sqlstate, "transient")
             next_delay = delays[attempt - 1]

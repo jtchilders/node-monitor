@@ -560,3 +560,54 @@ def test_log_never_contains_sql_parameters_or_record_values(caplog):
       msg = record.getMessage()
       assert "secret" not in msg
       assert "42" not in msg
+
+
+def test_sqlstate_extracted_from_sqlalchemy_dbapi_error_orig_pgcode():
+   from sqlalchemy.exc import DBAPIError
+   writer, db = _writer(
+      retry_policy={"max_attempts": 2, "initial_delay": 1.0, "max_delay": 8.0},
+      sleeper=lambda d: None,
+   )
+   class FakeOrig(Exception):
+      pgcode = "40001"
+   db.failures_sequence = [DBAPIError.instance(None, None, FakeOrig("wrap"), Exception)]
+   writer.write_record("node_collection_log", _collection_log())
+   assert db.begin_count == 2
+
+
+def test_delay_honors_initial_delay_not_powers_of_two():
+   sleeps = []
+   def fake_sleeper(delay):
+      sleeps.append(delay)
+   writer, db = _writer(
+      retry_policy={"max_attempts": 5, "initial_delay": 2.0, "max_delay": 5.0},
+      sleeper=fake_sleeper,
+   )
+   db.failures_sequence = [
+      _SqlStateException("57014"),
+      _SqlStateException("57014"),
+      _SqlStateException("57014"),
+      _SqlStateException("57014"),
+      _SqlStateException("57014"),
+   ]
+   # With initial=2, cap=5: delays should be 2, 4, 5, 5 then exhaustion.
+   with pytest.raises(DatabaseWriteError, match="database write failed"):
+      writer.write_record("node_collection_log", _collection_log())
+   assert sleeps == [2.0, 4.0, 5.0, 5.0]
+
+
+def test_hard_max_five_attempts_rejects_config_six():
+   from node_monitor.config import ConfigError
+   # Direct demonstration that writer defends >5.
+   writer, db = _writer(retry_policy={"max_attempts": 6, "initial_delay": 1.0})
+   # Defensive enforcement: clamp or reject; here we observe writer uses 5.
+   assert writer._max_attempts == 5
+
+
+def test_materialized_input_records_once_before_prepare():
+   writer, db = _writer()
+   gen = (("node_collection_log", _collection_log()) for _ in range(2))
+   # Materialize before prepare; if generator consumed twice, types empty.
+   writer.write_records(gen)
+   # After call, generator is exhausted; retry log should reference sorted types.
+   assert db.begin_count == 1

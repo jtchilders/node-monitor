@@ -786,8 +786,8 @@ def _validate_database_section(raw, resolved_url):
       "database.pool_recycle_sec")
    connect_args = _validate_database_connect_args(raw.get("connect_args", {}))
    max_attempts = raw.get("write_retry_max_attempts", _DATABASE_DEFAULTS["write_retry_max_attempts"])
-   if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts <= 0:
-      raise ConfigError("database.write_retry_max_attempts must be a positive integer, got %r" % max_attempts)
+   if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts <= 0 or max_attempts > 5:
+      raise ConfigError("database.write_retry_max_attempts must be between 1 and 5, got %r" % max_attempts)
    initial_delay = _validate_finite_positive_number(
       raw.get("write_retry_initial_delay_sec", _DATABASE_DEFAULTS["write_retry_initial_delay_sec"]),
       "database.write_retry_initial_delay_sec")
