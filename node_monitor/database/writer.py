@@ -378,9 +378,7 @@ class DatabaseWriter:
             if sqlstate not in _ALLOWLISTED_SQLSTATE:
                raise DatabaseWriteError("database write failed") from None
             if attempt == self._max_attempts:
-               sqlstate = _extract_sqlstate(exc)
-               assert sqlstate is not None
-               category = _SQLSTATE_CATEGORY_MAP.get(sqlstate, "transient")
+               category = _SQLSTATE_CATEGORY_MAP[sqlstate]
                logger.warning(
                   "postgres transient write exhausted: "
                   "event=write_exhausted "
