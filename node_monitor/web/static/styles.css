@@ -28,12 +28,27 @@ body {
 .detail-panel { min-width: 0; }
 .header-identity,
 .header-hero,
-.header-stats { margin-top: 0; margin-bottom: 0; line-height: 1.1; }
-.header-identity { display: grid; grid-template-rows: auto auto; gap: 0; align-items: center; font-size: 16px; }
-.header-identity h1 { margin: 0; line-height: 1.0; font-size: 24px; }
-.header-identity .header-node,
-.header-identity .connection-line { margin: 0; line-height: 1.1; font-size: inherit; white-space: nowrap; }
-.header-identity > div:nth-child(n+2) { display: inline-flex; gap: .35rem; align-items: center; }
+.header-stats { margin-top: 0; margin-bottom: 0; line-height: 1; }
+.header-identity {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: .5rem;
+}
+.header-identity h1 {
+  grid-column: 1 / -1;
+  margin: 0;
+  line-height: 1;
+}
+.header-node,
+.connection-line {
+  min-width: 0;
+  margin: 0;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .dashboard-header {
   position: sticky;

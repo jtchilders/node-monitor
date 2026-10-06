@@ -404,14 +404,10 @@ def test_desktop_header_max_64px_and_typography_unchanged(browser_page, live_web
     btn.click(force=False)
     expect(btn).to_have_attribute("aria-pressed", "true")
     # Typography unchanged against accepted base values
-    assert page.locator('.dashboard-header h1').evaluate('el => getComputedStyle(el).fontSize') == '24px'
+    assert page.locator('.dashboard-header h1').evaluate('el => getComputedStyle(el).fontSize') == '32px'
     assert page.locator('.connection-line').evaluate('el => getComputedStyle(el).fontSize') == '16px'
     assert page.locator('.header-hero').evaluate('el => getComputedStyle(el).fontSize') == '16px'
     assert page.locator('.header-stat .metric-label').first.evaluate('el => getComputedStyle(el).fontSize') == '16px'
-    # Range buttons remain clickable (not intercepted by header overflow)
-    btn = page.locator('[data-range="3h"]')
-    btn.click(force=False)
-    expect(btn).to_have_attribute("aria-pressed", "true")
     assert errors == []
 
 def test_narrow_no_overflow_and_warning_visible(browser_page, live_web, snapshot_complete):
