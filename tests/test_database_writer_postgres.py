@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
 from node_monitor.database.migration import (
@@ -43,6 +43,42 @@ class _InjectedDB:
 def _writer(engine):
    MigrationRunner(engine, "test").migrate()
    return DatabaseWriter(_InjectedDB(engine), clock=lambda: NOW)
+
+
+class _OneShotSqlstate(Exception):
+   sqlstate = "57014"
+
+
+class _FailFirstTransactionDB:
+   def __init__(self, engine):
+      self._engine = engine
+      self.attempts = 0
+
+   def begin(self):
+      self.attempts += 1
+      if self.attempts == 1:
+         raise _OneShotSqlstate("test-only statement cancellation")
+      return self._engine.begin()
+
+
+def test_transient_transaction_retry_commits_one_row(postgres_engine):
+   MigrationRunner(postgres_engine, "test").migrate()
+   database = _FailFirstTransactionDB(postgres_engine)
+   delays = []
+   writer = DatabaseWriter(
+      database, clock=lambda: NOW,
+      retry_policy={"max_attempts": 2, "initial_delay": 1,
+                    "max_delay": 1},
+      sleeper=delays.append)
+
+   writer.write_record("node_hardware", _hardware())
+
+   assert database.attempts == 2
+   assert delays == [1.0]
+   with postgres_engine.connect() as connection:
+      count = connection.execute(text(
+         "SELECT count(*) FROM node_monitor.node_hardware")).scalar_one()
+   assert count == 1
 
 
 def test_hardware_retry_preserves_first_seen_and_known_boot_values(postgres_engine):
