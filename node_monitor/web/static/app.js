@@ -58,6 +58,22 @@
       return 'current';
    }
 
+   function renderGapWarning(counters) {
+      var strip = qs('#gap-warning-strip');
+      var text = qs('[data-testid="gap-warning-text"]');
+      if (!strip || !text) return;
+      var gaps = counters && counters.gaps ? counters.gaps : {};
+      var missing = gaps.missing_count || 0;
+      var maxGap = gaps.max_gap_minutes || 0;
+      if (missing > 0) {
+         strip.hidden = false;
+         text.textContent = missing + ' missing one-minute counter window(s) in the selected range (maximum gap ' + maxGap + ' minutes)';
+      } else {
+         strip.hidden = true;
+         text.textContent = '—';
+      }
+   }
+
    function setExclusiveStateClass(el, stateName) {
       if (!el) return;
       ALLOWED_CARD_STATES.forEach(function(s) {
@@ -253,6 +269,7 @@
       renderAges();
       qs('#retry-section').hidden = true;
       renderPresentationState(data.counters || {}, data.usage || {}, true);
+      renderGapWarning(data.counters || {});
    }
 
    function renderFailure(firstLoad) {
@@ -269,6 +286,7 @@
       const preservedCounters = (state.snapshot && state.snapshot.counters) ? state.snapshot.counters : {};
       const preservedUsage = (state.snapshot && state.snapshot.usage) ? state.snapshot.usage : {};
       renderPresentationState(preservedCounters, preservedUsage, false);
+      renderGapWarning(preservedCounters);
    }
 
    async function refreshDashboard(recoverUnavailable) {

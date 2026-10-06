@@ -355,3 +355,68 @@ def test_malformed_inventory_is_a_connection_failure_without_dashboard_request(
    expect(page.locator('#node-status')).to_have_text("Connection failure")
    assert live_web.state.requests == []
    assert errors == []
+
+def test_gap_warning_shown_exact_content(browser_page, live_web, snapshot_complete):
+    snapshot = copy.deepcopy(snapshot_complete)
+    snapshot["counters"]["gaps"] = {"missing_count": 7, "max_gap_minutes": 4, "intervals": [{"location":"internal"}]}
+    live_web.state.set_snapshot(snapshot)
+    page, errors, _ = open_dashboard(browser_page, live_web)
+    expect(page.locator('#gap-warning-strip')).not_to_be_hidden()
+    text = page.locator('[data-testid="gap-warning-text"]').inner_text()
+    assert "7 missing one-minute counter window(s)" in text
+    assert "maximum gap 4 minutes" in text
+    assert errors == []
+
+def test_gap_warning_hidden_at_zero_gaps(browser_page, live_web, snapshot_complete):
+    snapshot = copy.deepcopy(snapshot_complete)
+    snapshot["counters"]["gaps"] = {"missing_count": 0, "max_gap_minutes": 0, "intervals": []}
+    live_web.state.set_snapshot(snapshot)
+    page, errors, _ = open_dashboard(browser_page, live_web)
+    expect(page.locator('#gap-warning-strip')).to_be_hidden()
+    assert errors == []
+
+def test_gap_warning_retained_after_failed_refresh(browser_page, live_web, snapshot_complete):
+    snapshot = copy.deepcopy(snapshot_complete)
+    snapshot["counters"]["gaps"] = {"missing_count": 3, "max_gap_minutes": 2, "intervals": [{"location":"trailing"}]}
+    live_web.state.set_snapshot(snapshot)
+    page, errors, _ = open_dashboard(browser_page, live_web)
+    live_web.state.fail()
+    page.locator('[data-range="3h"]').click()
+    assert not page.locator('#gap-warning-strip').is_hidden()
+    assert "3 missing" in page.locator('[data-testid="gap-warning-text"]').inner_text()
+
+def test_desktop_header_max_64px_and_typography_unchanged(browser_page, live_web):
+    page, errors, _ = open_dashboard(browser_page, live_web)
+    header = page.locator('.dashboard-header')
+    height = header.evaluate('el => el.getBoundingClientRect().height')
+    assert height <= 64, "header height %d exceeds 64px" % height
+    # Confirm header children are actually contained (no overflow interception)
+    header_box = header.bounding_box()
+    for child_sel in ('.header-identity', '.header-hero', '.header-stats', '.header-node', '.connection-line'):
+        child_box = page.locator(child_sel).first.bounding_box()
+        assert child_box is not None, child_sel + " missing"
+        assert child_box['y'] >= header_box['y'] - 1, child_sel + " overflows top"
+        assert child_box['y'] + child_box['height'] <= header_box['y'] + header_box['height'] + 1, child_sel + " overflows bottom"
+        # Each required header element fully visible
+        assert child_box['width'] > 0 and child_box['height'] > 0, child_sel + " has zero size"
+    # Range buttons remain clickable (not intercepted by header overflow)
+    btn = page.locator('[data-range="3h"]')
+    btn.click(force=False)
+    expect(btn).to_have_attribute("aria-pressed", "true")
+    # Typography unchanged against accepted base values
+    assert page.locator('.dashboard-header h1').evaluate('el => getComputedStyle(el).fontSize') == '32px'
+    assert page.locator('.connection-line').evaluate('el => getComputedStyle(el).fontSize') == '16px'
+    assert page.locator('.header-hero').evaluate('el => getComputedStyle(el).fontSize') == '16px'
+    assert page.locator('.header-stat .metric-label').first.evaluate('el => getComputedStyle(el).fontSize') == '16px'
+    assert errors == []
+
+def test_narrow_no_overflow_and_warning_visible(browser_page, live_web, snapshot_complete):
+    snapshot = copy.deepcopy(snapshot_complete)
+    snapshot["counters"]["gaps"] = {"missing_count": 2, "max_gap_minutes": 1, "intervals": [{"location":"internal"}]}
+    live_web.state.set_snapshot(snapshot)
+    page, errors, _ = open_dashboard(browser_page, live_web)
+    page.set_viewport_size({"width": 400, "height": 800})
+    expect(page.locator('#gap-warning-strip')).to_be_visible()
+    overflow = page.evaluate('() => document.body.scrollWidth > window.innerWidth')
+    assert not overflow
+    assert errors == []

@@ -26,17 +26,42 @@ body {
 .status-grid,
 .metric-grid,
 .detail-panel { min-width: 0; }
-.dashboard-header {
+.header-identity,
+.header-hero,
+.header-stats { margin-top: 0; margin-bottom: 0; line-height: 1; }
+.header-identity {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: .5rem;
+}
+.header-identity h1 {
+  grid-column: 1 / -1;
+  margin: 0;
+  line-height: 1;
+}
+.header-node,
+.connection-line {
+  min-width: 0;
+  margin: 0;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
+.dashboard-header {
   position: sticky;
   top: 0;
   z-index: 100;
-  min-height: var(--header-height);
+  min-height: 40px;
+  max-height: 64px;
+  overflow: visible;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  gap: 1rem;
-  padding: .75rem 1.5rem;
+  gap: .35rem;
+  padding: .35rem .75rem;
   background: var(--panel-bg);
   border-bottom: 1px solid var(--accent-border);
   box-shadow: 0 4px 6px -1px rgba(0, 0, 0, .3);
@@ -156,6 +181,16 @@ button[aria-pressed="true"] {
 
 /* Operational-state presentation classes (semantic, independent) */
 .state-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: .35rem; vertical-align: middle; flex-shrink: 0; }
+
+.gap-warning-strip {
+  background: #7c2d12;
+  color: #f59e0b;
+  padding: .25rem .75rem;
+  font-size: .85rem;
+  display: block;
+}
+.gap-warning-strip[hidden] { display: none; }
+.gap-warning-amber { font-weight: 700; color: #f59e0b; }
 
 /* Connection / header states */
 .dashboard-header.is-connected .state-dot { background: #4ade80; box-shadow: 0 0 0 2px rgba(74, 222, 128, 0.35); }

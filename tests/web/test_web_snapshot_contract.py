@@ -738,3 +738,27 @@ def test_usage_gap_metadata_zero_when_contiguous():
       return True
 
    assert asyncio.run(_test()) is True
+
+def test_boundary_aware_leading_gap_startup_range_six_recent_rows():
+    from node_monitor.web.service import _enrich_snapshot
+    now = datetime(2026, 9, 30, 14, 0, 0, tzinfo=timezone.utc)
+    rows = [{"window_end": (now - timedelta(minutes=6 - i)).isoformat()} for i in range(6)]
+    snapshot = {"server_utc_now": now.isoformat(), "range_hours": 1,
+                "counters": {"rows": rows, "newest_window_end": max(r["window_end"] for r in rows), "is_fresh": True}}
+    result = _enrich_snapshot(snapshot)
+    gaps = result["counters"]["gaps"]
+    assert gaps["missing_count"] == 54
+    assert gaps["max_gap_minutes"] == 53
+    assert any(i["location"] == "leading" for i in gaps["intervals"])
+    assert any(i["location"] == "trailing" for i in gaps["intervals"])
+
+def test_no_double_count_complete_range():
+    from node_monitor.web.service import _enrich_snapshot
+    now = datetime(2026, 9, 30, 14, 0, 0, tzinfo=timezone.utc)
+    rows = [{"window_end": (now - timedelta(minutes=i)).isoformat()} for i in range(61)]
+    snapshot = {"server_utc_now": now.isoformat(), "range_hours": 1,
+                "counters": {"rows": rows, "newest_window_end": max(r["window_end"] for r in rows), "is_fresh": True}}
+    result = _enrich_snapshot(snapshot)
+    gaps = result["counters"]["gaps"]
+    assert gaps["missing_count"] == 0
+    assert gaps["max_gap_minutes"] == 0
