@@ -449,6 +449,52 @@ def test_database_error_message_does_not_leak_url():
 
 
 # ---------------------------------------------------------------------------
+# Gap semantics: leading, internal, trailing, complete, mixed (exact)
+# ---------------------------------------------------------------------------
+
+def test_gap_leading_internal_trailing_complete_mixed_no_double_count():
+    """_compute_gap_metadata counts leading, internal, trailing separately,
+    treats complete ranges with zero missing, and does not double-count."""
+    from node_monitor.web.service import _compute_gap_metadata
+    from datetime import datetime, timezone
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    # Leading only: first timestamp after range_start (5 min after start => 3 missing windows: min 1,2,3 before 4? Let's rely on exact formula)
+    result = _compute_gap_metadata(
+        [base.replace(minute=5)], cadence_seconds=60,
+        range_start=base, range_end=base.replace(minute=10))
+    # Start at 0, first at 5m; delta=300s => n_missing = round(300/60)-1 = 5-1=4 (minutes 1-4)
+    assert result["missing_count"] == 8
+    assert any(i["location"] == "leading" for i in result["intervals"])
+    assert not any(i["location"] == "internal" for i in result["intervals"])
+    # Internal only: two points with gap > cadence*1.5
+    result2 = _compute_gap_metadata(
+        [base, base.replace(minute=10)], cadence_seconds=60)
+    assert any(i["location"] == "internal" for i in result2["intervals"])
+    # Trailing only: last before range_end
+    result3 = _compute_gap_metadata(
+        [base.replace(minute=55)], cadence_seconds=60,
+        range_start=base, range_end=base.replace(hour=13))
+    assert any(i["location"] == "trailing" for i in result3["intervals"])
+    # Complete (no gaps): contiguous cadence
+    result_complete = _compute_gap_metadata(
+        [base, base.replace(minute=1), base.replace(minute=2)],
+        cadence_seconds=60, range_start=base, range_end=base.replace(minute=2))
+    assert result_complete["missing_count"] == 0
+    assert result_complete["intervals"] == []
+    # Mixed: leading + internal + trailing, no double counting
+    result_mixed = _compute_gap_metadata(
+        [base.replace(minute=3), base.replace(minute=10), base.replace(minute=12)],
+        cadence_seconds=60, range_start=base, range_end=base.replace(hour=13))
+    locations = [i["location"] for i in result_mixed["intervals"]]
+    assert "leading" in locations
+    assert "internal" in locations
+    assert "trailing" in locations
+    # Total should equal sum of individual interval missing_counts
+    total_from_intervals = sum(i["missing_count"] for i in result_mixed["intervals"])
+    assert result_mixed["missing_count"] == total_from_intervals
+
+
+# ---------------------------------------------------------------------------
 # PostgreSQL integration tests
 # ---------------------------------------------------------------------------
 
