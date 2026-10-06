@@ -355,3 +355,50 @@ def test_malformed_inventory_is_a_connection_failure_without_dashboard_request(
    expect(page.locator('#node-status')).to_have_text("Connection failure")
    assert live_web.state.requests == []
    assert errors == []
+
+def test_gap_warning_shown_exact_content(browser_page, live_web, snapshot_complete):
+    snapshot = copy.deepcopy(snapshot_complete)
+    snapshot["counters"]["gaps"] = {"missing_count": 7, "max_gap_minutes": 4, "intervals": [{"location":"internal"}]}
+    live_web.state.set_snapshot(snapshot)
+    page, errors, _ = open_dashboard(browser_page, live_web)
+    expect(page.locator('#gap-warning-strip')).not_to_be_hidden()
+    text = page.locator('[data-testid="gap-warning-text"]').inner_text()
+    assert "7 missing one-minute counter window(s)" in text
+    assert "maximum gap 4 minutes" in text
+    assert errors == []
+
+def test_gap_warning_hidden_at_zero_gaps(browser_page, live_web, snapshot_complete):
+    snapshot = copy.deepcopy(snapshot_complete)
+    snapshot["counters"]["gaps"] = {"missing_count": 0, "max_gap_minutes": 0, "intervals": []}
+    live_web.state.set_snapshot(snapshot)
+    page, errors, _ = open_dashboard(browser_page, live_web)
+    expect(page.locator('#gap-warning-strip')).to_be_hidden()
+    assert errors == []
+
+def test_gap_warning_retained_after_failed_refresh(browser_page, live_web, snapshot_complete):
+    snapshot = copy.deepcopy(snapshot_complete)
+    snapshot["counters"]["gaps"] = {"missing_count": 3, "max_gap_minutes": 2, "intervals": [{"location":"trailing"}]}
+    live_web.state.set_snapshot(snapshot)
+    page, errors, _ = open_dashboard(browser_page, live_web)
+    live_web.state.fail()
+    page.locator('[data-range="3h"]').click()
+    assert not page.locator('#gap-warning-strip').is_hidden()
+    assert "3 missing" in page.locator('[data-testid="gap-warning-text"]').inner_text()
+
+def test_desktop_header_max_64px_and_typography_unchanged(browser_page, live_web):
+    page, errors, _ = open_dashboard(browser_page, live_web)
+    header = page.locator('.dashboard-header')
+    height = header.evaluate('el => el.getBoundingClientRect().height')
+    assert height <= 64, "header height %d exceeds 64px" % height
+    assert errors == []
+
+def test_narrow_no_overflow_and_warning_visible(browser_page, live_web, snapshot_complete):
+    snapshot = copy.deepcopy(snapshot_complete)
+    snapshot["counters"]["gaps"] = {"missing_count": 2, "max_gap_minutes": 1, "intervals": [{"location":"internal"}]}
+    live_web.state.set_snapshot(snapshot)
+    page, errors, _ = open_dashboard(browser_page, live_web)
+    page.set_viewport_size({"width": 400, "height": 800})
+    expect(page.locator('#gap-warning-strip')).to_be_visible()
+    overflow = page.evaluate('() => document.body.scrollWidth > window.innerWidth')
+    assert not overflow
+    assert errors == []
