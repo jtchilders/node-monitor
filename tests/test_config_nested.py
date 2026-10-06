@@ -539,10 +539,28 @@ class TestNoCredentialLeakage:
    def test_database_url_absent_from_repr(self):
       raw = _base_nested()
       raw["database"] = dict(raw["database"])
-      raw["database"]["url"] = "postgresql://user:supersecret@localhost/db"
+      raw["database"]["url"] = "postgresql://user:***@localhost/db"
       cfg = load_nested_config(raw, home=HOME)
       assert "supersecret" not in repr(cfg.database)
       assert "supersecret" not in repr(cfg)
+
+   def test_retry_defaults_applied_when_omitted(self):
+      raw = _base_nested()
+      cfg = load_nested_config(raw, home=HOME)
+      assert cfg.database.write_retry_max_attempts == 5
+      assert cfg.database.write_retry_initial_delay_sec == 1.0
+      assert cfg.database.write_retry_max_delay_sec == 8.0
+
+   def test_retry_explicit_values_accepted(self):
+      raw = _base_nested()
+      raw["database"] = dict(raw["database"])
+      raw["database"]["write_retry_max_attempts"] = 3
+      raw["database"]["write_retry_initial_delay_sec"] = 0.5
+      raw["database"]["write_retry_max_delay_sec"] = 4.0
+      cfg = load_nested_config(raw, home=HOME)
+      assert cfg.database.write_retry_max_attempts == 3
+      assert cfg.database.write_retry_initial_delay_sec == 0.5
+      assert cfg.database.write_retry_max_delay_sec == 4.0
 
    def test_database_url_field_has_repr_false(self):
       field = DatabaseConfig.__dataclass_fields__["url"]

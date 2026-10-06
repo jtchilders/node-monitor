@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 import pytest
 
 from node_monitor.output.contracts import ContractError
-from node_monitor.database.writer import DatabaseWriteError, DatabaseWriter
+from node_monitor.database.writer import (
+   DatabaseWriteError, DatabaseWriter, _ALLOWLISTED_SQLSTATE,
+)
 
 
 NOW = datetime(2026, 9, 30, 14, 30, tzinfo=timezone.utc)
@@ -25,16 +27,37 @@ class _Connection:
       return _Result()
 
 
+# Driver-level exceptions that carry recognized SQLSTATE interfaces.
+class _SqlStateException(Exception):
+   def __init__(self, sqlstate, message=""):
+      super().__init__(message)
+      self.sqlstate = sqlstate
+
+
+class _PgCodeException(Exception):
+   def __init__(self, pgcode, message=""):
+      super().__init__(message)
+      self.pgcode = pgcode
+
+
 class _DB:
-   def __init__(self, failure=None):
+   def __init__(self, failure=None, failures_sequence=None):
       self.connection = _Connection()
       self.begin_count = 0
       self.failure = failure
+      self.failures_sequence = failures_sequence or []
+      self._fail_index = 0
 
    @contextmanager
    def begin(self):
       self.begin_count += 1
-      if self.failure is not None:
+      if self.failures_sequence:
+         if self._fail_index < len(self.failures_sequence):
+            exc = self.failures_sequence[self._fail_index]
+            self._fail_index += 1
+            raise exc
+         # No more failures -> succeed.
+      elif self.failure is not None:
          raise self.failure
       yield self.connection
 
@@ -132,9 +155,12 @@ def _collection_log(**overrides):
    return record
 
 
-def _writer(db=None):
+def _writer(db=None, retry_policy=None, sleeper=None):
    db = db or _DB()
-   return DatabaseWriter(db, clock=lambda: NOW), db
+   return DatabaseWriter(
+      db, clock=lambda: NOW, retry_policy=retry_policy or {},
+      sleeper=sleeper,
+   ), db
 
 
 def _single_call(writer, db, record_type, record):
@@ -144,15 +170,20 @@ def _single_call(writer, db, record_type, record):
    return db.connection.calls[0]
 
 
+# ------------------------------------------------------------------
+# Existing adapter/contract tests (unchanged behavior preserved)
+# ------------------------------------------------------------------
+
 def test_hardware_adapter_preserves_first_seen_and_known_boot_identity():
    writer, db = _writer()
    sql, params = _single_call(writer, db, "node_hardware", _hardware())
-
    assert "INSERT INTO node_monitor.node_hardware" in sql
    assert "ON CONFLICT (system, source_hostname) DO UPDATE" in sql
    assert "first_seen =" not in sql.split("DO UPDATE", 1)[1]
    assert "boot_id = COALESCE(EXCLUDED.boot_id, current.boot_id)" in sql
    assert "btime = COALESCE(EXCLUDED.btime, current.btime)" in sql
+   # Requirement 6: numa_nodes = EXCLUDED.numa_nodes preserved exactly.
+   assert "numa_nodes = EXCLUDED.numa_nodes" in sql
    assert params["first_seen"] == datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
    assert params["last_verified"] == NOW
    assert params["net_ifaces"] == _hardware()["net_ifaces"]
@@ -162,7 +193,6 @@ def test_hardware_adapter_preserves_first_seen_and_known_boot_identity():
 def test_counter_adapter_compacts_audit_and_lustre_independent_of_target_names():
    writer, db = _writer()
    sql, params = _single_call(writer, db, "node_counter_samples", _counter())
-
    assert "INSERT INTO node_monitor.node_counter_minute" in sql
    assert "ON CONFLICT (system, source_hostname, window_start) DO UPDATE" in sql
    assert params["invalid_pair_count"] == 2
@@ -184,7 +214,6 @@ def test_counter_adapter_compacts_audit_and_lustre_independent_of_target_names()
 def test_usage_adapter_never_supplies_identity_or_generated_username_key():
    writer, db = _writer()
    sql, params = _single_call(writer, db, "node_usage_intervals", _usage(None))
-
    assert "INSERT INTO node_monitor.node_usage_intervals" in sql
    assert "ON CONFLICT (system, source_hostname, interval_start, category, activity, username_key)" in sql
    assert "username_key" not in params
@@ -277,3 +306,257 @@ def test_malformed_nested_record_conversion_is_sanitized_before_transaction():
    assert caught.value.__cause__ is None
    assert db.begin_count == 0
    assert db.connection.calls == []
+
+
+# ------------------------------------------------------------------
+# Retry behavior: SQLSTATE extraction, retries, exhaustion, replay
+# ------------------------------------------------------------------
+
+@pytest.mark.parametrize("sqlstate", list(_ALLOWLISTED_SQLSTATE))
+def test_all_four_allowlisted_sqlstates_retry_then_recover(sqlstate):
+   """Each allowlisted SQLSTATE retries once then commits; full batch replayed."""
+   sleeps = []
+   def fake_sleeper(delay):
+      sleeps.append(delay)
+   # First attempt fails with allowlisted SQLSTATE; second succeeds.
+   writer, db = _writer(
+      retry_policy={"max_attempts": 5, "initial_delay": 1.0, "max_delay": 8.0},
+      sleeper=fake_sleeper,
+   )
+   db.failures_sequence = [_SqlStateException(sqlstate), None]
+   # Actually _DB.begin() raises exception objects; None is not an exception.
+   # Replace with a sequence of exceptions. Success is represented by empty sequence tail.
+   # Instead: first call raises, second yields.
+   db.failures_sequence = [_SqlStateException(sqlstate)]
+   # After consuming the sequence, begin succeeds (no exception raised).
+   # But our _DB logic: if sequence non-empty, pop and raise. After that sequence empty -> yield.
+   writer.write_record("node_collection_log", _collection_log())
+   # 2 attempts: first failed, second succeeded.
+   assert db.begin_count == 2
+   assert sleeps == [1.0]
+   assert len(db.connection.calls) == 1  # only on success
+
+
+def test_retry_log_contains_only_allowed_fields(caplog):
+   import logging
+   sleeps = []
+   def fake_sleeper(delay):
+      sleeps.append(delay)
+   writer, db = _writer(
+      retry_policy={"max_attempts": 5, "initial_delay": 1.0, "max_delay": 8.0},
+      sleeper=fake_sleeper,
+   )
+   db.failures_sequence = [_SqlStateException("57014")]
+   with caplog.at_level(logging.WARNING, logger="node_monitor.database.writer"):
+      writer.write_record("node_collection_log", _collection_log())
+   # There should be a retry warning with fixed-template fields only.
+   retry_msgs = [r for r in caplog.records if r.levelname == "WARNING"]
+   assert len(retry_msgs) >= 1
+   msg = retry_msgs[0].message
+   # Assert allowed fields present; no raw exception text/SQL/params/secrets.
+   assert "event=write_retry" in msg
+   assert "sqlstate=57014" in msg
+   assert "failed_attempt=1" in msg
+   assert "batch_size=1" in msg
+   assert "record_types=node_collection_log" in msg
+   # Assert forbidden content absent from the log message.
+   assert "secret" not in msg.lower()
+   assert "SELECT" not in msg
+   assert "postgresql://" not in msg
+
+
+def test_recovery_log_on_subsequent_success(caplog):
+   import logging
+   sleeps = []
+   def fake_sleeper(delay):
+      sleeps.append(delay)
+   writer, db = _writer(
+      retry_policy={"max_attempts": 5, "initial_delay": 1.0, "max_delay": 8.0},
+      sleeper=fake_sleeper,
+   )
+   db.failures_sequence = [_SqlStateException("40001")]
+   with caplog.at_level(logging.WARNING, logger="node_monitor.database.writer"):
+      writer.write_record("node_collection_log", _collection_log())
+   messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+   # One retry warning, then one recovery warning.
+   assert any("event=write_retry" in m for m in messages)
+   assert any("event=write_recovered" in m for m in messages)
+
+
+def test_exact_delays_1_2_4_8_for_five_total_attempts():
+   sleeps = []
+   def fake_sleeper(delay):
+      sleeps.append(delay)
+   writer, db = _writer(
+      retry_policy={"max_attempts": 5, "initial_delay": 1.0, "max_delay": 8.0},
+      sleeper=fake_sleeper,
+   )
+   # 4 failures then success on 5th attempt -> 4 delays.
+   db.failures_sequence = [
+      _SqlStateException("57014"),
+      _SqlStateException("55P03"),
+      _SqlStateException("40001"),
+      _SqlStateException("40P01"),
+   ]
+   writer.write_record("node_collection_log", _collection_log())
+   assert sleeps == [1.0, 2.0, 4.0, 8.0]
+
+
+def test_exhaustion_five_attempts_ends_with_database_write_error():
+   sleeps = []
+   def fake_sleeper(delay):
+      sleeps.append(delay)
+   writer, db = _writer(
+      retry_policy={"max_attempts": 5, "initial_delay": 1.0, "max_delay": 8.0},
+      sleeper=fake_sleeper,
+   )
+   # Always fail with allowlisted SQLSTATE; 5 attempts -> 4 sleeps then failure.
+   db.failures_sequence = [
+      _SqlStateException("57014"),
+      _SqlStateException("57014"),
+      _SqlStateException("57014"),
+      _SqlStateException("57014"),
+      _SqlStateException("57014"),
+   ]
+   with pytest.raises(DatabaseWriteError, match="database write failed"):
+      writer.write_record("node_collection_log", _collection_log())
+   assert db.begin_count == 5
+   assert sleeps == [1.0, 2.0, 4.0, 8.0]
+
+
+# ------------------------------------------------------------------
+# Permanent / missing / non-allowlisted SQLSTATE failures (no retry)
+# ------------------------------------------------------------------
+
+def test_permanent_non_allowlisted_sqlstate_fails_immediately():
+   writer, db = _writer()
+   db.failure = _SqlStateException("08006")  # connection failure
+   with pytest.raises(DatabaseWriteError, match="database write failed"):
+      writer.write_record("node_collection_log", _collection_log())
+   assert db.begin_count == 1  # only first attempt
+
+
+def test_missing_sqlstate_fails_immediately():
+   writer, db = _writer()
+   db.failure = RuntimeError("some random failure without sqlstate")
+   with pytest.raises(DatabaseWriteError, match="database write failed"):
+      writer.write_record("node_collection_log", _collection_log())
+   assert db.begin_count == 1
+
+
+def test_08xxx_never_retried():
+   writer, db = _writer()
+   db.failure = _SqlStateException("08S01")  # connection-class failure
+   with pytest.raises(DatabaseWriteError, match="database write failed"):
+      writer.write_record("node_collection_log", _collection_log())
+   assert db.begin_count == 1
+
+
+# ------------------------------------------------------------------
+# Whole-batch replay / rollback behavior in doubles
+# ------------------------------------------------------------------
+
+def test_whole_batch_replay_rollback_no_partial_commit():
+   sleeps = []
+   def fake_sleeper(delay):
+      sleeps.append(delay)
+   writer, db = _writer(
+      retry_policy={"max_attempts": 3, "initial_delay": 1.0, "max_delay": 4.0},
+      sleeper=fake_sleeper,
+   )
+   # First attempt fails; second succeeds. All records replayed.
+   db.failures_sequence = [_SqlStateException("57014")]
+   writer.write_records([
+      ("node_collection_log", _collection_log()),
+      ("node_poll_failures", _poll_failure()),
+   ])
+   assert db.begin_count == 2
+   # On success, both statements executed in one transaction (second attempt).
+   assert len(db.connection.calls) == 2
+
+
+def test_retry_never_includes_raw_exception_text(caplog):
+   secret = "SECRET_VALUE_MUST_NOT_LOG"
+   sleeps = []
+   def fake_sleeper(delay):
+      sleeps.append(delay)
+   writer, db = _writer(
+      retry_policy={"max_attempts": 2, "initial_delay": 1.0, "max_delay": 8.0},
+      sleeper=fake_sleeper,
+   )
+   exc = _SqlStateException("40001", "internal detail with %s" % secret)
+   db.failures_sequence = [exc]
+   import logging
+   with caplog.at_level(logging.WARNING, logger="node_monitor.database.writer"):
+      writer.write_record("node_collection_log", _collection_log())
+   for record in caplog.records:
+      msg = record.getMessage()
+      assert secret not in msg
+
+
+# ------------------------------------------------------------------
+# SQLSTATE extraction from recognized interfaces only
+# ------------------------------------------------------------------
+
+def test_sqlstate_extracted_from_orig_sqlstate():
+   writer, db = _writer(
+      retry_policy={"max_attempts": 2, "initial_delay": 1.0, "max_delay": 8.0},
+      sleeper=lambda d: None,
+   )
+   db.failures_sequence = [_SqlStateException("40P01")]
+   writer.write_record("node_collection_log", _collection_log())
+   assert db.begin_count == 2
+
+
+def test_sqlstate_extracted_from_chained_exception():
+   writer, db = _writer(
+      retry_policy={"max_attempts": 2, "initial_delay": 1.0, "max_delay": 8.0},
+      sleeper=lambda d: None,
+   )
+   inner = _SqlStateException("55P03")
+   class Chained(Exception):
+      pass
+   # Manually build exception with cause.
+   chained = Chained("wrapper")
+   chained.__cause__ = inner
+   db.failures_sequence = [chained]
+   writer.write_record("node_collection_log", _collection_log())
+   assert db.begin_count == 2
+
+
+def test_sqlstate_never_inferred_from_string_args():
+   writer, db = _writer(
+      retry_policy={"max_attempts": 2, "initial_delay": 1.0, "max_delay": 8.0},
+      sleeper=lambda d: None,
+   )
+   # Exception with a 5-char code embedded in message but no sqlstate attr.
+   db.failure = RuntimeError("error 57014 happened")
+   with pytest.raises(DatabaseWriteError, match="database write failed"):
+      writer.write_record("node_collection_log", _collection_log())
+   assert db.begin_count == 1
+
+
+def test_public_database_write_error_remains_fixed_bounded_chainless():
+   writer, db = _writer(_DB(RuntimeError("anything")))
+   with pytest.raises(DatabaseWriteError, match="database write failed") as caught:
+      writer.write_record("node_collection_log", _collection_log())
+   assert str(caught.value) == "database write failed"
+   assert caught.value.__cause__ is None
+
+
+def test_log_never_contains_sql_parameters_or_record_values(caplog):
+   import logging
+   sleeps = []
+   def fake_sleeper(delay):
+      sleeps.append(delay)
+   writer, db = _writer(
+      retry_policy={"max_attempts": 2, "initial_delay": 1.0, "max_delay": 8.0},
+      sleeper=fake_sleeper,
+   )
+   db.failures_sequence = [_SqlStateException("57014")]
+   with caplog.at_level(logging.WARNING, logger="node_monitor.database.writer"):
+      writer.write_record("node_collection_log", _collection_log(detail={"secret": 42}))
+   for record in caplog.records:
+      msg = record.getMessage()
+      assert "secret" not in msg
+      assert "42" not in msg

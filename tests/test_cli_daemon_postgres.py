@@ -229,7 +229,7 @@ def _patch_daemon_run(
       pass
 
    class FakeDBWriter:
-      def __init__(self, database, clock=None):
+      def __init__(self, database, clock=None, retry_policy=None, sleeper=None):
          db_writer_instances.append({"database": database})
          assert hasattr(database, "begin"), (
             "DatabaseWriter must receive an object with begin()")
@@ -800,9 +800,8 @@ def test_database_writer_receives_engine_backed_begin(tmp_path, monkeypatch):
    real_DBWriter = cli_module.__dict__.get("DatabaseWriter")
 
    class CapturingDBWriter:
-      def __init__(self, database, clock=None):
+      def __init__(self, database, clock=None, retry_policy=None, sleeper=None):
          db_writer_databases.append(database)
-         # must expose begin()
          assert hasattr(database, "begin"), (
             "database passed to DatabaseWriter must have begin()")
 
