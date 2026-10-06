@@ -90,6 +90,22 @@ There are no automatic down migrations. After a failed or incompatible change:
 Never delete ledger rows, change applied migration bytes, disable checksum
 validation, or run ad hoc destructive DDL merely to make status appear clean.
 
+## Retry behavior
+
+Transient retries apply only to the allowlisted SQLSTATE codes: `57014`
+(statement_cancellation), `55P03` (lock_unavailable), `40001`
+(serialization_failure), and `40P01` (deadlock_detected). `08xxx` codes
+(connection-class failures) are explicitly excluded because they have
+ambiguous commit outcomes for append-only records (e.g., a lost connection
+may or may not have committed the insert). The writer uses a strict nested
+retry policy: default 5 total attempts, initial delay 1.0 sec, cap 8.0 sec,
+with exponential backoff honoring the configured initial delay. On final
+transient failure, a bounded exhaustion warning logs the SQLSTATE, category,
+attempt, and max attempts — no exception text or record data. The writer
+materializes generator inputs once before prepare so sorted `record_types`
+logging and replay remain accurate. All public errors remain exactly
+`database write failed` with no chained context or driver details.
+
 ## Daemon boundary
 
 The daemon must never invoke migrations or issue schema DDL. Only the explicit

@@ -219,7 +219,9 @@ def test_postgres_runtime_ack_occurs_after_schema_gate_and_sink_creation(
                        lambda *_: events.append("gate"))
    monkeypatch.setattr(cli_module, "Phase0Sink", lambda *a, **k: Sink())
    monkeypatch.setattr(cli_module, "PostgresDaemonSink", lambda *a: Sink())
-   monkeypatch.setattr(cli_module, "DatabaseWriter", lambda *_: object())
+   monkeypatch.setattr(
+      cli_module, "DatabaseWriter",
+      lambda *args, **kwargs: object())
    monkeypatch.setattr(cli_module, "_make_transport_fn", lambda *a: object())
    monkeypatch.setattr(cli_module, "Daemon", Daemon)
    monkeypatch.setattr(cli_module.os, "makedirs", lambda *a, **k: None)

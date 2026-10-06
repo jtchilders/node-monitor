@@ -667,6 +667,9 @@ class DatabaseConfig:
    pool_timeout_sec: float
    pool_recycle_sec: float
    connect_args: tuple
+   write_retry_max_attempts: int = 5
+   write_retry_initial_delay_sec: float = 1.0
+   write_retry_max_delay_sec: float = 8.0
 
 
 _DATABASE_REQUIRED_SCHEMA = "node_monitor"
@@ -678,9 +681,14 @@ _DATABASE_DEFAULTS = {
    "pool_pre_ping": True,
    "pool_timeout_sec": 10,
    "pool_recycle_sec": 3600,
+   "write_retry_max_attempts": 5,
+   "write_retry_initial_delay_sec": 1.0,
+   "write_retry_max_delay_sec": 8.0,
 }
 _DATABASE_ALLOWED_KEYS = frozenset(
-   {"url", "connect_args"} | frozenset(_DATABASE_DEFAULTS))
+   {"url", "connect_args", "write_retry_max_attempts",
+    "write_retry_initial_delay_sec", "write_retry_max_delay_sec"}
+   | frozenset(_DATABASE_DEFAULTS))
 
 _DATABASE_CONNECT_ARGS_INT_KEYS = (
    "connect_timeout", "keepalives", "keepalives_idle",
@@ -777,11 +785,25 @@ def _validate_database_section(raw, resolved_url):
       raw.get("pool_recycle_sec", _DATABASE_DEFAULTS["pool_recycle_sec"]),
       "database.pool_recycle_sec")
    connect_args = _validate_database_connect_args(raw.get("connect_args", {}))
+   max_attempts = raw.get("write_retry_max_attempts", _DATABASE_DEFAULTS["write_retry_max_attempts"])
+   if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts <= 0 or max_attempts > 5:
+      raise ConfigError("database.write_retry_max_attempts must be between 1 and 5, got %r" % max_attempts)
+   initial_delay = _validate_finite_positive_number(
+      raw.get("write_retry_initial_delay_sec", _DATABASE_DEFAULTS["write_retry_initial_delay_sec"]),
+      "database.write_retry_initial_delay_sec")
+   max_delay = _validate_finite_positive_number(
+      raw.get("write_retry_max_delay_sec", _DATABASE_DEFAULTS["write_retry_max_delay_sec"]),
+      "database.write_retry_max_delay_sec")
+   if max_delay < initial_delay:
+      raise ConfigError("database.write_retry_max_delay_sec (%r) must be >= initial_delay_sec (%r)" % (max_delay, initial_delay))
    return DatabaseConfig(
       url=url, schema=schema, pool_size=pool_size, max_overflow=max_overflow,
       echo_sql=echo_sql, pool_pre_ping=pool_pre_ping,
       pool_timeout_sec=pool_timeout_sec, pool_recycle_sec=pool_recycle_sec,
-      connect_args=connect_args)
+      connect_args=connect_args,
+      write_retry_max_attempts=max_attempts,
+      write_retry_initial_delay_sec=initial_delay,
+      write_retry_max_delay_sec=max_delay)
 
 
 # --------------------------------------------------------------------------

@@ -1304,7 +1304,16 @@ def _run_daemon_postgres(nested, config_path, run_id, probe_version, home,
       # Any construction exception here is sanitized.
       try:
          adapter = _EngineAdapter(engine)
-         writer = DatabaseWriter(adapter)
+         # Requirement 1: pass validated retry policy explicitly.
+         db_config = nested.database
+         writer = DatabaseWriter(
+            adapter,
+            retry_policy={
+               "max_attempts": db_config.write_retry_max_attempts,
+               "initial_delay": db_config.write_retry_initial_delay_sec,
+               "max_delay": db_config.write_retry_max_delay_sec,
+            },
+         )
          sink = PostgresDaemonSink(writer, diagnostic_sink)
          transport_fn = _make_transport_fn(phase0_config, probe_version)
          daemon = Daemon(phase0_config, sink, transport_fn)

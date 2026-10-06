@@ -5,11 +5,23 @@ record before opening a transaction, converts the JSONL contract into the
 initial source schema, and never performs DDL or database lifecycle work.
 """
 
+import logging
+import math
 from datetime import datetime, timezone
 
 from sqlalchemy import JSON, bindparam, text
 
 from node_monitor.output.contracts import validate_record
+
+logger = logging.getLogger(__name__)
+
+_ALLOWLISTED_SQLSTATE = frozenset(("57014", "55P03", "40001", "40P01"))
+_SQLSTATE_CATEGORY_MAP = {
+   "57014": "statement_cancellation",
+   "55P03": "lock_unavailable",
+   "40001": "serialization_failure",
+   "40P01": "deadlock_detected",
+}
 
 
 class DatabaseWriteError(RuntimeError):
@@ -254,12 +266,59 @@ _ADAPTERS = {
 }
 
 
+def _extract_sqlstate(exc):
+   """Extract SQLSTATE only from recognized driver interfaces."""
+   seen = set()
+   def visit(obj):
+      if obj is None or id(obj) in seen:
+         return None
+      seen.add(id(obj))
+      # Inspect recognized SQLAlchemy DBAPIError .orig and chain.
+      if hasattr(obj, "orig"):
+         inner = visit(obj.orig)
+         if inner is not None:
+            return inner
+      for attr in ("sqlstate", "pgcode"):
+         value = getattr(obj, attr, None)
+         if value is not None:
+            s = str(value)
+            if len(s) == 5 and s.isalnum():
+               return s
+      # Recurse through chained exceptions.
+      for next_exc in (getattr(obj, "__cause__", None),
+                       getattr(obj, "__context__", None)):
+         inner = visit(next_exc)
+         if inner is not None:
+            return inner
+      return None
+   return visit(exc)
+
+
 class DatabaseWriter:
    """Validate, adapt, and transactionally persist source records."""
 
-   def __init__(self, database, clock=None):
+   def __init__(self, database, clock=None, retry_policy=None, sleeper=None):
       self._database = database
       self._clock = clock or (lambda: datetime.now(timezone.utc))
+      if retry_policy is None:
+         retry_policy = {}
+      max_attempts = retry_policy.get("max_attempts", 5)
+      initial_delay = retry_policy.get("initial_delay", 1.0)
+      max_delay = retry_policy.get("max_delay", 8.0)
+      valid_attempts = (
+         isinstance(max_attempts, int) and not isinstance(max_attempts, bool)
+         and 1 <= max_attempts <= 5)
+      valid_delays = all(
+         isinstance(value, (int, float)) and not isinstance(value, bool)
+         and math.isfinite(value) and value > 0
+         for value in (initial_delay, max_delay))
+      if (not valid_attempts or not valid_delays
+            or max_delay < initial_delay):
+         raise DatabaseWriteError("database write failed") from None
+      self._max_attempts = max_attempts
+      self._initial_delay = float(initial_delay)
+      self._max_delay = float(max_delay)
+      self._sleeper = sleeper or (__import__("time").sleep)
 
    def _prepare(self, record_type, record):
       if record_type not in _ACCEPTED_TYPES:
@@ -276,12 +335,77 @@ class DatabaseWriter:
       return self.write_records(((record_type, record),))
 
    def write_records(self, records):
+      # Materialize generator inputs exactly once before prepare.
+      records = list(records)
+      # Validate and adapt complete batch once before any transaction.
       prepared = [self._prepare(record_type, record)
                   for record_type, record in records]
-      try:
-         with self._database.begin() as connection:
-            for statement, parameters in prepared:
-               connection.execute(statement, parameters)
-      except Exception:
-         raise DatabaseWriteError("database write failed") from None
-      return len(prepared)
+      record_types_sorted = sorted({
+         rt for rt, _ in records if rt in _ACCEPTED_TYPES
+      })
+      batch_size = len(prepared)
+      last_transient_sqlstate = None
+      last_transient_category = None
+
+      delay = self._initial_delay
+      delays = []
+      for i in range(1, self._max_attempts):
+         delays.append(min(delay, self._max_delay))
+         delay *= 2
+
+      for attempt in range(1, self._max_attempts + 1):
+         try:
+            with self._database.begin() as connection:
+               for statement, parameters in prepared:
+                  connection.execute(statement, parameters)
+            if attempt > 1:
+               logger.warning(
+                  "postgres transient write recovered: "
+                  "event=write_recovered "
+                  "category=%s "
+                  "sqlstate=%s "
+                  "successful_attempt=%d "
+                  "max_attempts=%d "
+                  "batch_size=%d "
+                  "record_types=%s",
+                  last_transient_category, last_transient_sqlstate,
+                  attempt, self._max_attempts, batch_size,
+                  ",".join(record_types_sorted),
+               )
+            return len(prepared)
+         except Exception as exc:
+            sqlstate = _extract_sqlstate(exc)
+            if sqlstate not in _ALLOWLISTED_SQLSTATE:
+               raise DatabaseWriteError("database write failed") from None
+            if attempt == self._max_attempts:
+               category = _SQLSTATE_CATEGORY_MAP[sqlstate]
+               logger.warning(
+                  "postgres transient write exhausted: "
+                  "event=write_exhausted "
+                  "sqlstate=%s "
+                  "category=%s "
+                  "failed_attempt=%d "
+                  "max_attempts=%d",
+                  sqlstate, category, attempt, self._max_attempts,
+               )
+               raise DatabaseWriteError("database write failed") from None
+            category = _SQLSTATE_CATEGORY_MAP.get(sqlstate, "transient")
+            last_transient_sqlstate = sqlstate
+            last_transient_category = category
+            next_delay = delays[attempt - 1]
+            logger.warning(
+               "postgres transient write retry: "
+               "event=write_retry "
+               "category=%s "
+               "sqlstate=%s "
+               "failed_attempt=%d "
+               "max_attempts=%d "
+               "next_delay_sec=%.1f "
+               "batch_size=%d "
+               "record_types=%s",
+               category, sqlstate, attempt, self._max_attempts,
+               next_delay, batch_size,
+               ",".join(record_types_sorted),
+            )
+            self._sleeper(next_delay)
+      raise DatabaseWriteError("database write failed") from None
