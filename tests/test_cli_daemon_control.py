@@ -136,6 +136,67 @@ def test_start_foreground_forces_indefinite_and_marks_exited(tmp_path, monkeypat
    assert state.outcome == "partial"
 
 
+def test_start_discovers_default_config_when_option_omitted(tmp_path, monkeypatch):
+   home = tmp_path / "home"
+   home.mkdir()
+   config = home / ".node_monitor.yml"
+   config.write_text(yaml.safe_dump(_nested_raw()))
+   config.chmod(0o600)
+   control_path = tmp_path / "daemon.json"
+   observed = []
+   monkeypatch.setattr(cli_module, "_default_control_file_path",
+                       lambda: str(control_path))
+   monkeypatch.setattr(cli_module, "current_process_start_ticks", lambda: 7)
+   monkeypatch.setattr(cli_module, "_resolve_probe_version", lambda *_: 4)
+
+   def fake_runtime(nested, config_path, run_id, probe_version, runtime_home,
+                    phase0_config=None, control_file=None, startup_ack=None):
+      observed.append(config_path)
+      if startup_ack is not None:
+         startup_ack("/runs/default-config")
+      return 0
+
+   monkeypatch.setattr(cli_module, "_run_daemon_postgres", fake_runtime)
+   result = CliRunner().invoke(
+      cli, ["daemon", "start", "--home", str(home), "--foreground"],
+      catch_exceptions=False)
+
+   assert result.exit_code == 0, result.output
+   assert observed == [str(config)]
+
+
+def test_start_explicit_config_overrides_default(tmp_path, monkeypatch):
+   home = tmp_path / "home"
+   home.mkdir()
+   default = home / ".node_monitor.yml"
+   default.write_text(yaml.safe_dump(_nested_raw()))
+   default.chmod(0o600)
+   explicit = tmp_path / "custom.yaml"
+   explicit.write_text(yaml.safe_dump(_nested_raw()))
+   explicit.chmod(0o600)
+   control_path = tmp_path / "daemon.json"
+   observed = []
+   monkeypatch.setattr(cli_module, "_default_control_file_path",
+                       lambda: str(control_path))
+   monkeypatch.setattr(cli_module, "current_process_start_ticks", lambda: 7)
+   monkeypatch.setattr(cli_module, "_resolve_probe_version", lambda *_: 4)
+
+   def fake_runtime(nested, config_path, run_id, probe_version, runtime_home,
+                    phase0_config=None, control_file=None, startup_ack=None):
+      observed.append(config_path)
+      if startup_ack is not None:
+         startup_ack("/runs/explicit-config")
+      return 0
+
+   monkeypatch.setattr(cli_module, "_run_daemon_postgres", fake_runtime)
+   result = CliRunner().invoke(
+      cli, ["daemon", "start", "--config", str(explicit), "--home",
+            str(home), "--foreground"], catch_exceptions=False)
+
+   assert result.exit_code == 0, result.output
+   assert observed == [str(explicit)]
+
+
 def test_postgres_runtime_ack_occurs_after_schema_gate_and_sink_creation(
       tmp_path, monkeypatch):
    events = []

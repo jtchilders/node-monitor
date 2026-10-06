@@ -629,14 +629,21 @@ def daemon_stop():
 
 
 @daemon.command("start")
-@click.option("--config", "config_path", required=True,
-              type=click.Path(dir_okay=False))
+@click.option("--config", "config_path", required=False, default=None,
+              type=click.Path(dir_okay=False),
+              help="Path to the unified YAML config; discovered if omitted.")
 @click.option("--home", default=None)
 @click.option("--run-id", default=None)
 @click.option("--foreground", is_flag=True, default=False)
 def daemon_start(config_path, home, run_id, foreground):
    """Start the PostgreSQL-backed daemon indefinitely."""
    resolved_home = home if home is not None else os.path.expanduser("~")
+   try:
+      config_path = discover_config_path(
+         explicit_path=config_path, home=resolved_home, cwd=os.getcwd())
+   except ConfigError:
+      _exit(1, "invalid configuration: no usable configuration found",
+            err=True)
    loaded = _load_nested_daemon_config(config_path, resolved_home)
    probe_version = _resolve_probe_version(loaded.probe_python)
    run_id = run_id if run_id is not None else _default_run_id()
