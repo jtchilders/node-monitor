@@ -761,9 +761,10 @@ def test_boundary_aware_leading_gap_startup_range_six_recent_rows():
                 "counters": {"rows": rows, "newest_window_end": max(r["window_end"] for r in rows), "is_fresh": True}}
     result = _enrich_snapshot(snapshot)
     gaps = result["counters"]["gaps"]
-    assert gaps["missing_count"] == 53
+    assert gaps["missing_count"] == 54
     assert gaps["max_gap_minutes"] == 53
     assert any(i["location"] == "leading" for i in gaps["intervals"])
+    assert any(i["location"] == "trailing" for i in gaps["intervals"])
 
 def test_no_double_count_complete_range():
     from node_monitor.web.service import _enrich_snapshot

@@ -383,44 +383,70 @@ def _parse_ts(v):
       return None
 
 
-def _compute_gap_metadata(timestamps, cadence_seconds, range_start=None, range_end=None):
-   """Return canonical gap metadata: missing_count, max_gap_minutes, intervals."""
+def _compute_gap_metadata(timestamps, cadence_seconds, range_start=None,
+                          range_end=None):
+   """Return missing cadence windows, including selected-range boundaries.
+
+   Stored counter timestamps represent closed-window ends.  For a bounded
+   range, expected window ends occupy ``(range_start, range_end]``.  Boundary
+   counts intentionally differ: the leading boundary excludes ``range_start``
+   while the trailing boundary includes ``range_end``.  This makes an empty
+   one-hour range contain 60 missing one-minute windows and avoids treating a
+   not-yet-closed partial cadence after the newest row as missing.
+   """
+   import math
+
    distinct = sorted({ts for ts in timestamps if ts is not None})
+   start_ts = (_parse_ts(range_start)
+               if not isinstance(range_start, datetime) else range_start)
+   end_ts = (_parse_ts(range_end)
+             if not isinstance(range_end, datetime) else range_end)
    intervals = []
-   missing_count = 0
-   max_gap_minutes = 0
 
-   if range_start is not None and distinct:
-      start_ts = _parse_ts(range_start) if not isinstance(range_start, datetime) else range_start
-      first = distinct[0]
-      if start_ts is not None and first > start_ts:
-         delta = (first - start_ts).total_seconds()
-         n_missing = int(round(delta / cadence_seconds)) - 1
-         if n_missing > 0:
-            missing_count += n_missing
-            intervals.append({"location":"leading","after":_dt(start_ts),"before":_dt(first),"missing_count":n_missing,"max_gap_minutes":n_missing})
-            max_gap_minutes = max(max_gap_minutes, n_missing)
+   def _append(location, after, before, count):
+      if count <= 0:
+         return
+      gap_minutes = count * cadence_seconds / 60.0
+      if gap_minutes.is_integer():
+         gap_minutes = int(gap_minutes)
+      intervals.append({
+         "location": location,
+         "after": _dt(after),
+         "before": _dt(before),
+         "missing_count": count,
+         "max_gap_minutes": gap_minutes,
+      })
 
-   for i in range(1, len(distinct)):
-      delta = (distinct[i] - distinct[i-1]).total_seconds()
-      if delta > cadence_seconds * 1.5:
-         n_missing = int(round(delta / cadence_seconds)) - 1
-         missing_count += n_missing
-         intervals.append({"location":"internal","after":_dt(distinct[i-1]),"before":_dt(distinct[i]),"missing_count":n_missing,"max_gap_minutes":n_missing})
-         max_gap_minutes = max(max_gap_minutes, n_missing)
+   if not distinct:
+      if start_ts is not None and end_ts is not None and end_ts > start_ts:
+         count = int(math.floor(
+            (end_ts - start_ts).total_seconds() / cadence_seconds))
+         _append("leading", start_ts, end_ts, count)
+   else:
+      if start_ts is not None and distinct[0] > start_ts:
+         delta = (distinct[0] - start_ts).total_seconds()
+         count = max(0, int(math.ceil(delta / cadence_seconds)) - 1)
+         _append("leading", start_ts, distinct[0], count)
 
-   if range_end is not None and distinct:
-      end_ts = _parse_ts(range_end) if not isinstance(range_end, datetime) else range_end
-      last = distinct[-1]
-      if end_ts is not None and last < end_ts:
-         delta = (end_ts - last).total_seconds()
-         n_missing = int(round(delta / cadence_seconds)) - 1
-         if n_missing > 0:
-            missing_count += n_missing
-            intervals.append({"location":"trailing","after":_dt(last),"before":_dt(end_ts),"missing_count":n_missing,"max_gap_minutes":n_missing})
-            max_gap_minutes = max(max_gap_minutes, n_missing)
+      for previous, current in zip(distinct, distinct[1:]):
+         delta = (current - previous).total_seconds()
+         if delta > cadence_seconds * 1.5:
+            count = max(0, int(round(delta / cadence_seconds)) - 1)
+            _append("internal", previous, current, count)
 
-   return {"missing_count": missing_count, "max_gap_minutes": max_gap_minutes, "intervals": intervals}
+      if end_ts is not None and distinct[-1] < end_ts:
+         delta = (end_ts - distinct[-1]).total_seconds()
+         count = max(0, int(math.floor(delta / cadence_seconds)))
+         _append("trailing", distinct[-1], end_ts, count)
+
+   missing_count = sum(item["missing_count"] for item in intervals)
+   max_gap_minutes = max(
+      (item["max_gap_minutes"] for item in intervals), default=0)
+   return {
+      "missing_count": missing_count,
+      "max_gap_minutes": max_gap_minutes,
+      "intervals": intervals,
+   }
 
 
 def _enrich_snapshot(snapshot):

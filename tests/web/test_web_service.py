@@ -458,12 +458,12 @@ def test_gap_leading_internal_trailing_complete_mixed_no_double_count():
     from node_monitor.web.service import _compute_gap_metadata
     from datetime import datetime, timezone
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    # Leading only: first timestamp after range_start (5 min after start => 3 missing windows: min 1,2,3 before 4? Let's rely on exact formula)
+    # One observed window end at minute 5: minutes 1-4 and 6-10 are missing.
     result = _compute_gap_metadata(
         [base.replace(minute=5)], cadence_seconds=60,
         range_start=base, range_end=base.replace(minute=10))
-    # Start at 0, first at 5m; delta=300s => n_missing = round(300/60)-1 = 5-1=4 (minutes 1-4)
-    assert result["missing_count"] == 8
+    assert result["missing_count"] == 9
+    assert [i["missing_count"] for i in result["intervals"]] == [4, 5]
     assert any(i["location"] == "leading" for i in result["intervals"])
     assert not any(i["location"] == "internal" for i in result["intervals"])
     # Internal only: two points with gap > cadence*1.5
@@ -492,6 +492,41 @@ def test_gap_leading_internal_trailing_complete_mixed_no_double_count():
     # Total should equal sum of individual interval missing_counts
     total_from_intervals = sum(i["missing_count"] for i in result_mixed["intervals"])
     assert result_mixed["missing_count"] == total_from_intervals
+
+
+def test_gap_metadata_counts_empty_range_and_final_expected_window():
+    """Expected counter window ends occupy (range_start, range_end]."""
+    from node_monitor.web.service import _compute_gap_metadata
+    from datetime import datetime, timedelta, timezone
+    start = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+
+    empty = _compute_gap_metadata(
+        [], cadence_seconds=60, range_start=start, range_end=end)
+    assert empty == {
+        "missing_count": 60,
+        "max_gap_minutes": 60,
+        "intervals": [{
+            "location": "leading",
+            "after": start.isoformat(),
+            "before": end.isoformat(),
+            "missing_count": 60,
+            "max_gap_minutes": 60,
+        }],
+    }
+
+    missing_final = _compute_gap_metadata(
+        [start + timedelta(minutes=i) for i in range(1, 60)],
+        cadence_seconds=60, range_start=start, range_end=end)
+    assert missing_final["missing_count"] == 1
+    assert missing_final["max_gap_minutes"] == 1
+    assert missing_final["intervals"] == [{
+        "location": "trailing",
+        "after": (end - timedelta(minutes=1)).isoformat(),
+        "before": end.isoformat(),
+        "missing_count": 1,
+        "max_gap_minutes": 1,
+    }]
 
 
 # ---------------------------------------------------------------------------
