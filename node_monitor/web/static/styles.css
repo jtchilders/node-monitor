@@ -28,14 +28,12 @@ body {
 .detail-panel { min-width: 0; }
 .header-identity,
 .header-hero,
-.header-stats { margin-top: 0; margin-bottom: 0; line-height: 1.25; overflow: hidden; }
-.header-identity h1 { margin: 0; font-size: 1rem; line-height: 1.2; }
-.header-node { margin: 0; font-size: .85rem; line-height: 1.2; }
-.connection-line { margin: 0; font-size: .8rem; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.header-hero { text-align: center; font-size: .85rem; margin: 0; }
-.header-stats { display: flex; gap: .5rem; margin: 0; font-size: .8rem; align-items: center; }
-.header-stat { margin: 0; line-height: 1.2; }
-.header-stat .metric-label { font-size: .7rem; letter-spacing: .04em; }
+.header-stats { margin-top: 0; margin-bottom: 0; line-height: 1.1; }
+.header-identity { display: grid; grid-template-rows: auto auto; gap: 0; align-items: center; font-size: 16px; }
+.header-identity h1 { margin: 0; line-height: 1.0; font-size: 24px; }
+.header-identity .header-node,
+.header-identity .connection-line { margin: 0; line-height: 1.1; font-size: inherit; white-space: nowrap; }
+.header-identity > div:nth-child(n+2) { display: inline-flex; gap: .35rem; align-items: center; }
 
 .dashboard-header {
   position: sticky;
@@ -43,7 +41,7 @@ body {
   z-index: 100;
   min-height: 40px;
   max-height: 64px;
-  overflow: hidden; /* keep header contents within 64px; prevent intercept */
+  overflow: visible;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;

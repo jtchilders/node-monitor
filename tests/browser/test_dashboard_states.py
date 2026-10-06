@@ -392,16 +392,22 @@ def test_desktop_header_max_64px_and_typography_unchanged(browser_page, live_web
     assert height <= 64, "header height %d exceeds 64px" % height
     # Confirm header children are actually contained (no overflow interception)
     header_box = header.bounding_box()
-    for child_sel in ('.header-identity', '.header-hero', '.header-stats', '.connection-line'):
+    for child_sel in ('.header-identity', '.header-hero', '.header-stats', '.header-node', '.connection-line'):
         child_box = page.locator(child_sel).first.bounding_box()
         assert child_box is not None, child_sel + " missing"
         assert child_box['y'] >= header_box['y'] - 1, child_sel + " overflows top"
         assert child_box['y'] + child_box['height'] <= header_box['y'] + header_box['height'] + 1, child_sel + " overflows bottom"
+        # Each required header element fully visible
+        assert child_box['width'] > 0 and child_box['height'] > 0, child_sel + " has zero size"
+    # Range buttons remain clickable (not intercepted by header overflow)
+    btn = page.locator('[data-range="3h"]')
+    btn.click(force=False)
+    expect(btn).to_have_attribute("aria-pressed", "true")
     # Typography unchanged against accepted base values
-    assert page.locator('.dashboard-header h1').evaluate('el => getComputedStyle(el).fontSize') == '16px'  # 1rem
-    assert 'font-size' in page.locator('.connection-line').evaluate('el => getComputedStyle(el).fontSize')
-    assert page.locator('.header-hero').evaluate('el => getComputedStyle(el).fontSize') == '13.6px'  # ~.85rem
-    assert page.locator('.header-stat .metric-label').first.evaluate('el => getComputedStyle(el).fontSize') == '11.2px'  # .7rem
+    assert page.locator('.dashboard-header h1').evaluate('el => getComputedStyle(el).fontSize') == '24px'
+    assert page.locator('.connection-line').evaluate('el => getComputedStyle(el).fontSize') == '16px'
+    assert page.locator('.header-hero').evaluate('el => getComputedStyle(el).fontSize') == '16px'
+    assert page.locator('.header-stat .metric-label').first.evaluate('el => getComputedStyle(el).fontSize') == '16px'
     # Range buttons remain clickable (not intercepted by header overflow)
     btn = page.locator('[data-range="3h"]')
     btn.click(force=False)
