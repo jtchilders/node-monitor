@@ -157,7 +157,7 @@ def test_d_state_sparse_maxima_exact_values_and_username(browser_page, live_web,
 # ---- Memory tests ----
 
 def test_memory_gib_exact_values_and_derived_used(browser_page, live_web, snapshot_complete):
-    """Memory available series is exact per-row; used = MemTotal - MemAvailable per row.
+    """Memory total and used preserve real rows and explicit null gaps.
 
     With 2-row fixture and 1 gap slot: indices 0 and 2 are real rows; index 1 is gap (None).
     """
@@ -167,15 +167,13 @@ def test_memory_gib_exact_values_and_derived_used(browser_page, live_web, snapsh
     wait_chart_data(page)
 
     data = page.evaluate("() => window.__nodeMonitorTest.chartData")
-    mem_avail = data["memoryAvailableSeries"]
+    assert "memoryAvailableSeries" not in data
+    mem_total = data["memoryTotalSeries"]
     mem_used = data["memoryUsedSeries"]
     total_kb = data["memoryTotalKb"]
 
     # After gap expansion: [row0, None(gap), row1]
-    assert len(mem_avail) == 3, f"Expected 3 avail slots, got {len(mem_avail)}"
-    assert mem_avail[0] == 65000000, f"Row0 avail wrong: {mem_avail[0]}"
-    assert mem_avail[1] is None, f"Gap slot avail must be None, got: {mem_avail[1]}"
-    assert mem_avail[2] == 64000000, f"Row1 avail wrong: {mem_avail[2]}"
+    assert mem_total == [131072000, None, 131072000]
 
     # Used = total - available (131072000 - 65000000 = 66072000)
     assert total_kb == 131072000, f"totalKb wrong: {total_kb}"
@@ -209,7 +207,7 @@ def test_memory_percent_disabled_when_total_null(browser_page, live_web, snapsho
 
 
 def test_memory_percent_disabled_when_total_zero(browser_page, live_web, snapshot_complete):
-    """When mem_total_kb is 0, percent mode stays null; GiB available series still works."""
+    """When mem_total_kb is 0, used and total series remain null."""
     snap = copy.deepcopy(snapshot_complete)
     snap["hardware"]["mem_total_kb"] = 0
     live_web.state.set_snapshot(snap)
@@ -220,12 +218,72 @@ def test_memory_percent_disabled_when_total_zero(browser_page, live_web, snapsho
     wait_chart_data(page)
 
     data = page.evaluate("() => window.__nodeMonitorTest.chartData")
-    # total=0: used series null; avail series should still have values
+    # total=0: used and total series are null
     for i, v in enumerate(data["memoryUsedSeries"]):
         assert v is None, f"memoryUsedSeries[{i}] must be None when total=0, got {v}"
-    # Available values still present
-    real_avail = [v for v in data["memoryAvailableSeries"] if v is not None]
-    assert len(real_avail) > 0, "Should have non-null available values even when total=0"
+    assert all(v is None for v in data["memoryTotalSeries"])
+
+    assert errors == []
+
+
+def test_memory_category_rss_p50_groups_by_category_and_uses_max_activity(
+        browser_page, live_web, snapshot_complete):
+    """Category RSS is exact, non-additive, and aligned to one-minute labels."""
+    snap = copy.deepcopy(snapshot_complete)
+    snap["counters"]["rows"] = [
+        dict(snap["counters"]["rows"][0], window_end="2026-10-03T11:30:00+00:00"),
+        dict(snap["counters"]["rows"][1], window_end="2026-10-03T11:45:00+00:00"),
+    ]
+    snap["usage"]["grains"].append({
+        "interval_end": "2026-10-03T11:30:00+00:00",
+        "category": "interactive", "activity": "editor",
+        "rss_p50_kb": 153600,
+    })
+    snap["usage"]["grains"].append({
+        "interval_end": "2026-10-03T11:45:00+00:00",
+        "category": "interactive", "activity": "shell",
+        "rss_p50_kb": 81920,
+    })
+    live_web.state.set_snapshot(snap)
+
+    page, errors, external = browser_page
+    page.goto(live_web.url + "/")
+    wait_connected(page)
+    wait_chart_data(page)
+
+    data = page.evaluate("() => window.__nodeMonitorTest.chartData")
+    assert data["memoryCategoryRSSP50"] == {
+        "batch": [None] * 15 + [51200],
+        "interactive": [153600] + [None] * 14 + [81920],
+    }
+    assert data["memoryCategoryRSSP50"]["interactive"][0] != 102400 + 153600
+
+    state = page.evaluate("() => window.__nodeMonitorTest.getChartRenderState().memory")
+    by_label = {item["label"]: item for item in state["datasets"]}
+    assert "Available (GiB)" not in by_label
+    assert "interactive RSS p50 (non-additive)" in by_label
+    assert "batch RSS p50 (non-additive)" in by_label
+    assert by_label["System used (GiB)"]["pointStyle"] == "circle"
+    assert by_label["System used (GiB)"]["pointRadius"] == 4
+    assert by_label["System used (GiB)"]["borderDash"] == []
+    assert by_label["Total memory (GiB)"]["borderDash"] == [4, 4]
+    assert by_label["Total memory (GiB)"]["pointRadius"] == 0
+    assert by_label["interactive RSS p50 (non-additive)"]["data"] == [
+        153600 / (1024 * 1024), *([None] * 14), 81920 / (1024 * 1024),
+    ]
+
+    page.locator('[data-testid="mem-mode-percent"]').click()
+    page.wait_for_function(
+        "() => window.__nodeMonitorTest.getChartRenderState().memory.mode === 'mem-mode-percent'"
+    )
+    percent = page.evaluate("() => window.__nodeMonitorTest.getChartRenderState().memory")
+    percent_by_label = {item["label"]: item for item in percent["datasets"]}
+    expected = 153600 / 131072000 * 100
+    assert percent_by_label["interactive RSS p50 (non-additive)"]["data"][0] == expected
+
+    note = page.locator('[aria-label="Memory chart"] .chart-note').inner_text()
+    assert "non-additive" in note
+    assert "do not reconcile" in note
 
     assert errors == []
 
@@ -484,7 +542,7 @@ def test_chart_source_arrays_nonempty_after_render(browser_page, live_web, snaps
     assert len(data["cpu"]["labels"]) > 0, "CPU labels empty"
     assert len(data["cpu"]["cpuP50"]) > 0, "cpuP50 empty"
     assert len(data["memoryLabels"]) > 0, "memoryLabels empty"
-    assert len(data["memoryAvailableSeries"]) > 0, "memoryAvailableSeries empty"
+    assert len(data["memoryTotalSeries"]) > 0, "memoryTotalSeries empty"
     assert len(data["processLabels"]) > 0, "processLabels empty"
     assert len(data["networkLabels"]) > 0, "networkLabels empty"
     assert len(data["ifaceList"]) > 0, "ifaceList empty"

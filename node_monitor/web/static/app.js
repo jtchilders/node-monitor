@@ -470,8 +470,8 @@
       const load15 = extractSeries(function(r) { return r.load15 != null ? r.load15 : null; });
 
       // Memory: per-row MemAvailable; derived used = MemTotal - MemAvailable (null if total missing)
-      const memAvailableSeries = extractSeries(function(r) {
-         return r.mem_available_kb != null ? r.mem_available_kb : null;
+      const memTotalSeries = extractSeries(function() {
+         return memTotalKb != null && memTotalKb > 0 ? memTotalKb : null;
       });
       const memUsedSeries = extractSeries(function(r) {
          // Used = MemTotal_kb - MemAvailable_kb; null if total missing, zero, or avail missing
@@ -625,6 +625,33 @@
       const processRSSP95 = aggregatedIntervals.map(function(iv) {
          return iv.rssP95;
       });
+
+      // RSS percentiles are not additive.  Select the largest activity grain
+      // for each (category, interval_end), then align it to the one-minute
+      // counter timeline without interpolation or zero-filling.
+      const memoryCategoryRSSByTime = {};
+      grains.forEach(function(g) {
+         if (!g.category || !g.interval_end || g.rss_p50_kb == null) return;
+         const timestamp = new Date(g.interval_end).getTime();
+         if (!Number.isFinite(timestamp)) return;
+         const key = String(timestamp);
+         if (!memoryCategoryRSSByTime[g.category]) {
+            memoryCategoryRSSByTime[g.category] = {};
+         }
+         const current = memoryCategoryRSSByTime[g.category][key];
+         if (current == null || g.rss_p50_kb > current) {
+            memoryCategoryRSSByTime[g.category][key] = g.rss_p50_kb;
+         }
+      });
+      const memoryCategoryRSSP50 = {};
+      Object.keys(memoryCategoryRSSByTime).sort().forEach(function(category) {
+         memoryCategoryRSSP50[category] = rowIndices.map(function(idx) {
+            if (idx === null) return null;
+            const timestamp = new Date(sortedRows[idx].window_end).getTime();
+            const value = memoryCategoryRSSByTime[category][String(timestamp)];
+            return value == null ? null : value;
+         });
+      });
       // Per-interval contributor usernames (independently attributed)
       const processCountMaxUsername = aggregatedIntervals.map(function(iv) {
          return iv.cntMaxUser;
@@ -749,8 +776,9 @@
             spanGaps: false,
          },
          memoryLabels: expandedLabels,
-         memoryAvailableSeries: memAvailableSeries,
+         memoryTotalSeries: memTotalSeries,
          memoryUsedSeries: memUsedSeries,
+         memoryCategoryRSSP50: memoryCategoryRSSP50,
          memoryTotalKb: memTotalKb,
          memoryUsedKbLatest: memoryUsedKbLatest,
          dStatePoints: dStatePoints,
@@ -984,29 +1012,45 @@
          }
 
          const memUsedDisplay = input.memoryUsedSeries.map(toDisplayVal);
-         const memAvailDisplay = input.memoryAvailableSeries.map(toDisplayVal);
+         const memTotalDisplay = input.memoryTotalSeries.map(toDisplayVal);
          const yLabel = isPercent ? 'Percent (%)' : 'GiB';
 
          const memDatasets = [
             {
-               label: 'Used (' + yLabel + ')',
+               label: 'System used (' + yLabel + ')',
                data: memUsedDisplay,
                borderColor: '#880000',
                backgroundColor: 'rgba(136,0,0,0.1)',
                spanGaps: false,
-               pointStyle: 'rect',
+               pointStyle: 'circle',
+               pointRadius: 4,
                fill: false,
             },
             {
-               label: 'Available (' + yLabel + ')',
-               data: memAvailDisplay,
-               borderColor: '#005fcc',
-               backgroundColor: 'rgba(0,95,204,0.1)',
+               label: 'Total memory (' + yLabel + ')',
+               data: memTotalDisplay,
+               borderColor: '#666666',
+               backgroundColor: 'rgba(102,102,102,0.05)',
+               borderDash: [4, 4],
                spanGaps: false,
-               pointStyle: 'circle',
+               pointStyle: false,
+               pointRadius: 0,
                fill: false,
             },
          ];
+         const categoryColors = ['#228833', '#cc6600', '#660099', '#aa8800', '#005fcc', '#aa3377'];
+         Object.keys(input.memoryCategoryRSSP50).sort().forEach(function(category, index) {
+            memDatasets.push({
+               label: category + ' RSS p50 (non-additive)',
+               data: input.memoryCategoryRSSP50[category].map(toDisplayVal),
+               borderColor: categoryColors[index % categoryColors.length],
+               backgroundColor: 'rgba(0,0,0,0)',
+               spanGaps: false,
+               pointStyle: 'circle',
+               pointRadius: 3,
+               fill: false,
+            });
+         });
 
          replaceChart('memory', 'chart-memory', {
             type: 'line',
@@ -1040,7 +1084,15 @@
             mode: mode,
             labels: input.memoryLabels.slice(),
             datasets: memDatasets.map(function(ds) {
-               return { label: ds.label, data: ds.data.slice() };
+               return {
+                  label: ds.label,
+                  data: ds.data.slice(),
+                  borderDash: (ds.borderDash || []).slice(),
+                  pointStyle: ds.pointStyle,
+                  pointRadius: ds.pointRadius == null ? null : ds.pointRadius,
+                  fill: ds.fill,
+                  spanGaps: ds.spanGaps,
+               };
             }),
          };
 

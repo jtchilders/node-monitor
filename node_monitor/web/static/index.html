@@ -122,8 +122,8 @@
   </article>
   <article class="metric-panel" aria-label="Memory chart">
     <div class="panel-header"><h2>Memory (physical)</h2></div>
-    <div class="chart-canvas-wrap"><canvas id="chart-memory" data-testid="chart-memory" aria-label="MemAvailable and MemTotal minus MemAvailable, percent or GiB toggle"></canvas></div>
-    <div class="chart-note"><p>Used = MemTotal − MemAvailable. Percentage disabled if mem_total_kb is null or zero; GiB remains available. Missing values shown as null, not zero.</p></div>
+    <div class="chart-canvas-wrap"><canvas id="chart-memory" data-testid="chart-memory" aria-label="System used, total memory, and category RSS p50; percent or GiB toggle"></canvas></div>
+    <div class="chart-note"><p>System used = MemTotal − MemAvailable and includes kernel/cache. Total memory is the dotted capacity reference. Category RSS p50 lines are 15-minute, non-additive hotspot grains: they may double-count shared pages and do not reconcile to system-used memory. Missing values remain null.</p></div>
   </article>
   <article class="metric-panel" aria-label="Process chart">
     <div class="panel-header"><h2>Process</h2></div>
