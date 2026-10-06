@@ -739,20 +739,6 @@ def test_usage_gap_metadata_zero_when_contiguous():
 
    assert asyncio.run(_test()) is True
 
-# --- RED: boundary-aware counter gap tests (Task 1) ---
-from datetime import timedelta, timezone
-
-def test_boundary_aware_counter_gaps_leading_internal_trailing():
-    from node_monitor.web.service import _enrich_snapshot
-    now = datetime(2026, 9, 30, 14, 0, 0, tzinfo=timezone.utc)
-    rows_all = [{"window_end": (now - timedelta(minutes=55 - i)).isoformat()} for i in range(6)]
-    rows_all += [{"window_end": (now - timedelta(minutes=20)).isoformat()}]
-    snapshot = {"server_utc_now": now.isoformat(), "counters": {"rows": rows_all, "newest_window_end": max(r["window_end"] for r in rows_all), "is_fresh": True}}
-    result = _enrich_snapshot(snapshot)
-    gaps = result["counters"]["gaps"]
-    print("RED EVIDENCE: gaps keys =", list(gaps.keys()))
-    assert "missing_count" in gaps
-
 def test_boundary_aware_leading_gap_startup_range_six_recent_rows():
     from node_monitor.web.service import _enrich_snapshot
     now = datetime(2026, 9, 30, 14, 0, 0, tzinfo=timezone.utc)
