@@ -256,6 +256,7 @@ def test_memory_category_rss_p50_groups_by_category_and_uses_max_activity(
         "batch": [None] * 15 + [51200],
         "interactive": [153600] + [None] * 14 + [81920],
     }
+    assert data["memoryCategoryRSSP50"]["interactive"][0] != 102400 + 153600
 
     state = page.evaluate("() => window.__nodeMonitorTest.getChartRenderState().memory")
     by_label = {item["label"]: item for item in state["datasets"]}
