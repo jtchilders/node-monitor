@@ -6,6 +6,7 @@ initial source schema, and never performs DDL or database lifecycle work.
 """
 
 import logging
+import math
 from datetime import datetime, timezone
 
 from sqlalchemy import JSON, bindparam, text
@@ -301,11 +302,22 @@ class DatabaseWriter:
       self._clock = clock or (lambda: datetime.now(timezone.utc))
       if retry_policy is None:
          retry_policy = {}
-      self._max_attempts = min(retry_policy.get("max_attempts", 5), 5)
-      self._initial_delay = retry_policy.get("initial_delay", 1.0)
-      self._max_delay = retry_policy.get("max_delay", 8.0)
-      if self._max_attempts < 1:
+      max_attempts = retry_policy.get("max_attempts", 5)
+      initial_delay = retry_policy.get("initial_delay", 1.0)
+      max_delay = retry_policy.get("max_delay", 8.0)
+      valid_attempts = (
+         isinstance(max_attempts, int) and not isinstance(max_attempts, bool)
+         and 1 <= max_attempts <= 5)
+      valid_delays = all(
+         isinstance(value, (int, float)) and not isinstance(value, bool)
+         and math.isfinite(value) and value > 0
+         for value in (initial_delay, max_delay))
+      if (not valid_attempts or not valid_delays
+            or max_delay < initial_delay):
          raise DatabaseWriteError("database write failed") from None
+      self._max_attempts = max_attempts
+      self._initial_delay = float(initial_delay)
+      self._max_delay = float(max_delay)
       self._sleeper = sleeper or (__import__("time").sleep)
 
    def _prepare(self, record_type, record):
@@ -332,6 +344,8 @@ class DatabaseWriter:
          rt for rt, _ in records if rt in _ACCEPTED_TYPES
       })
       batch_size = len(prepared)
+      last_transient_sqlstate = None
+      last_transient_category = None
 
       delay = self._initial_delay
       delays = []
@@ -348,10 +362,14 @@ class DatabaseWriter:
                logger.warning(
                   "postgres transient write recovered: "
                   "event=write_recovered "
-                  "category=transient_write_recovery "
+                  "category=%s "
+                  "sqlstate=%s "
+                  "successful_attempt=%d "
+                  "max_attempts=%d "
                   "batch_size=%d "
                   "record_types=%s",
-                  batch_size,
+                  last_transient_category, last_transient_sqlstate,
+                  attempt, self._max_attempts, batch_size,
                   ",".join(record_types_sorted),
                )
             return len(prepared)
@@ -374,6 +392,8 @@ class DatabaseWriter:
                )
                raise DatabaseWriteError("database write failed") from None
             category = _SQLSTATE_CATEGORY_MAP.get(sqlstate, "transient")
+            last_transient_sqlstate = sqlstate
+            last_transient_category = category
             next_delay = delays[attempt - 1]
             logger.warning(
                "postgres transient write retry: "

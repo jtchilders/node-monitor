@@ -597,17 +597,50 @@ def test_delay_honors_initial_delay_not_powers_of_two():
 
 
 def test_hard_max_five_attempts_rejects_config_six():
-   from node_monitor.config import ConfigError
-   # Direct demonstration that writer defends >5.
-   writer, db = _writer(retry_policy={"max_attempts": 6, "initial_delay": 1.0})
-   # Defensive enforcement: clamp or reject; here we observe writer uses 5.
-   assert writer._max_attempts == 5
+   with pytest.raises(DatabaseWriteError, match="database write failed"):
+      _writer(retry_policy={"max_attempts": 6, "initial_delay": 1.0})
 
 
-def test_materialized_input_records_once_before_prepare():
-   writer, db = _writer()
+@pytest.mark.parametrize("policy", [
+   {"max_attempts": 0},
+   {"max_attempts": True},
+   {"initial_delay": 0},
+   {"initial_delay": float("inf")},
+   {"max_delay": 0},
+   {"max_delay": float("nan")},
+   {"initial_delay": 2, "max_delay": 1},
+])
+def test_direct_retry_policy_rejects_invalid_values_chainlessly(policy):
+   with pytest.raises(DatabaseWriteError, match="database write failed") as caught:
+      _writer(retry_policy=policy)
+   assert str(caught.value) == "database write failed"
+   assert caught.value.__cause__ is None
+   assert caught.value.__context__ is None
+
+
+def test_materialized_generator_retains_retry_log_metadata(caplog):
+   import logging
+   writer, db = _writer(sleeper=lambda _: None)
+   db.failures_sequence = [_SqlStateException("57014")]
    gen = (("node_collection_log", _collection_log()) for _ in range(2))
-   # Materialize before prepare; if generator consumed twice, types empty.
-   writer.write_records(gen)
-   # After call, generator is exhausted; retry log should reference sorted types.
-   assert db.begin_count == 1
+   with caplog.at_level(logging.WARNING, logger="node_monitor.database.writer"):
+      writer.write_records(gen)
+   assert db.begin_count == 2
+   retry = next(r.getMessage() for r in caplog.records
+                if "event=write_retry" in r.getMessage())
+   assert "batch_size=2" in retry
+   assert "record_types=node_collection_log" in retry
+
+
+def test_recovery_log_identifies_recovered_failure_and_attempt(caplog):
+   import logging
+   writer, db = _writer(sleeper=lambda _: None)
+   db.failures_sequence = [_SqlStateException("40P01")]
+   with caplog.at_level(logging.WARNING, logger="node_monitor.database.writer"):
+      writer.write_record("node_collection_log", _collection_log())
+   recovered = next(r.getMessage() for r in caplog.records
+                    if "event=write_recovered" in r.getMessage())
+   assert "category=deadlock_detected" in recovered
+   assert "sqlstate=40P01" in recovered
+   assert "successful_attempt=2" in recovered
+   assert "max_attempts=5" in recovered
