@@ -644,12 +644,27 @@
          }
       });
       const memoryCategoryRSSP50 = {};
+      const categoryAlignmentToleranceMs = 30000;
       Object.keys(memoryCategoryRSSByTime).sort().forEach(function(category) {
+         const categoryPoints = Object.keys(memoryCategoryRSSByTime[category]).map(function(key) {
+            return {
+               timestamp: Number(key),
+               value: memoryCategoryRSSByTime[category][key],
+            };
+         });
          memoryCategoryRSSP50[category] = rowIndices.map(function(idx) {
             if (idx === null) return null;
-            const timestamp = new Date(sortedRows[idx].window_end).getTime();
-            const value = memoryCategoryRSSByTime[category][String(timestamp)];
-            return value == null ? null : value;
+            const counterTimestamp = new Date(sortedRows[idx].window_end).getTime();
+            let nearest = null;
+            let nearestDistance = categoryAlignmentToleranceMs + 1;
+            categoryPoints.forEach(function(point) {
+               const distance = Math.abs(point.timestamp - counterTimestamp);
+               if (distance < nearestDistance) {
+                  nearest = point.value;
+                  nearestDistance = distance;
+               }
+            });
+            return nearestDistance <= categoryAlignmentToleranceMs ? nearest : null;
          });
       });
       // Per-interval contributor usernames (independently attributed)

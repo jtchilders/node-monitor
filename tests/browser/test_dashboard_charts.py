@@ -231,8 +231,8 @@ def test_memory_category_rss_p50_groups_by_category_and_uses_max_activity(
     """Category RSS is exact, non-additive, and aligned to one-minute labels."""
     snap = copy.deepcopy(snapshot_complete)
     snap["counters"]["rows"] = [
-        dict(snap["counters"]["rows"][0], window_end="2026-10-03T11:30:00+00:00"),
-        dict(snap["counters"]["rows"][1], window_end="2026-10-03T11:45:00+00:00"),
+        dict(snap["counters"]["rows"][0], window_end="2026-10-03T11:30:11+00:00"),
+        dict(snap["counters"]["rows"][1], window_end="2026-10-03T11:45:13+00:00"),
     ]
     snap["usage"]["grains"].append({
         "interval_end": "2026-10-03T11:30:00+00:00",
