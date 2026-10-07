@@ -1,6 +1,92 @@
 (function() {
    'use strict';
 
+   // ---- PBS Monitor color palette ----
+   const PALETTE = [
+      '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4',
+      '#10b981', '#f43f5e', '#eab308', '#14b8a6', '#ec4899',
+   ];
+   const GRID_COLOR = '#2d3748';
+   const TICK_COLOR = '#94a3b8';
+   const LEGEND_COLOR = '#e0e0e0';
+
+   // ---- Legend hover descriptions ----
+   // Maps dataset label text (or the start of it) to a plain-English explanation.
+   // Dynamic labels (interface names, Lustre ops, categories) are matched by suffix.
+   const SERIES_HELP = {
+      // CPU / Load
+      'CPU p50 %':   'Median CPU busy percentage across all logical cores in each 1-minute window.',
+      'CPU p95 %':   '95th-percentile CPU busy % — only 5% of samples were higher.',
+      'CPU max %':   'Peak CPU busy % seen in any sample within each 1-minute window.',
+      'Load1':       '1-minute load average: mean number of processes in runnable or uninterruptible (D-state/IO-wait) state. Spiky — reacts within seconds to bursts. Values above the logical CPU count signal saturation.',
+      'Load5':       '5-minute load average: same metric exponentially smoothed over 5 minutes. Filters out short spikes; sustained elevation means persistent demand.',
+      'Load15':      '15-minute load average: longest smoothing window. Shows the background trend — if load15 is high while load1 is low, a burst just ended; if load1 >> load15, a burst is in progress.',
+      'CPU count':   'Saturation threshold: the number of logical CPUs on this node. Load above this line means processes are queuing for CPU time.',
+      // Memory (labels include units that change with toggle)
+      'System used':  'Physical memory in use (MemTotal − MemAvailable) at each 1-minute sample. Includes kernel buffers and page cache.',
+      'Total memory': 'Total installed physical memory (constant reference line).',
+      // Process
+      'cpu_seconds (additive, 15-min interval)':   'Total CPU seconds consumed by all matched processes in each 15-minute usage interval.',
+      'process count max per grain':               'Highest concurrent process count observed in any single grain within each 15-minute interval.',
+      'grain total RSS (rss_max_kb)':              'Maximum total resident set size (KB) of the largest-contributing grain in each 15-minute interval.',
+   };
+
+   // Patterns checked by suffix / contains for dynamic labels
+   const SERIES_HELP_PATTERNS = [
+      // Category RSS (memory chart)
+      { match: 'RSS p50 (non-additive)',
+        help: 'Median RSS for this process category — non-additive hotspot grain; may double-count shared pages.' },
+      // Network
+      { match: 'RX p50 (B/s)',   help: 'Median receive throughput (bytes/sec) in each 1-minute window.' },
+      { match: 'TX p50 (B/s)',   help: 'Median transmit throughput (bytes/sec) in each 1-minute window.' },
+      { match: 'RX p95 (B/s)',   help: '95th-percentile receive throughput (bytes/sec).' },
+      { match: 'TX p95 (B/s)',   help: '95th-percentile transmit throughput (bytes/sec).' },
+      { match: 'RX max (B/s)',   help: 'Peak receive throughput (bytes/sec) seen in any sample.' },
+      { match: 'TX max (B/s)',   help: 'Peak transmit throughput (bytes/sec) seen in any sample.' },
+      // Lustre
+      { match: 'p50-sum (sum of per-target p50)',          help: 'Sum of per-target median rates for this Lustre metadata operation.' },
+      { match: 'p95-sum (sum of per-target p95)',          help: 'Sum of per-target 95th-percentile rates for this Lustre operation.' },
+      { match: 'peak-sum/max_sum (sum of per-target maxima)', help: 'Sum of per-target peak rates — not an instantaneous global peak.' },
+      { match: 'target_count',   help: 'Number of Lustre OST/MDT targets seen for this operation.' },
+   ];
+
+   function seriesDescription(label) {
+      if (!label) return null;
+      // Exact match first (static labels)
+      if (SERIES_HELP[label]) return SERIES_HELP[label];
+      // Prefix match for labels that include dynamic units, e.g. "System used (GiB)"
+      var keys = Object.keys(SERIES_HELP);
+      for (var i = 0; i < keys.length; i++) {
+         if (label.indexOf(keys[i]) === 0) return SERIES_HELP[keys[i]];
+      }
+      // Suffix / contains match for dynamic interface/op/category names
+      for (var j = 0; j < SERIES_HELP_PATTERNS.length; j++) {
+         if (label.indexOf(SERIES_HELP_PATTERNS[j].match) !== -1) {
+            return SERIES_HELP_PATTERNS[j].help;
+         }
+      }
+      return null;
+   }
+
+   // Floating tooltip element for legend hovers — created once
+   var legendTip = document.createElement('div');
+   legendTip.className = 'legend-tip';
+   legendTip.setAttribute('role', 'tooltip');
+   legendTip.style.display = 'none';
+   document.body.appendChild(legendTip);
+
+   // Format an ISO timestamp or epoch-ms as local HH:MM for chart labels.
+   // Range is 1–24 h, so the date is always implicit.
+   function formatTimeLabel(value) {
+      if (!value) return '';
+      const d = (typeof value === 'number') ? new Date(value) : new Date(value);
+      if (isNaN(d.getTime())) return '';
+      const h = d.getHours();
+      const m = d.getMinutes();
+      return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m;
+   }
+
+   // ---- State ----
    const state = {
       snapshot: null,
       connected: false,
@@ -44,7 +130,6 @@
       return 'Current';
    }
 
-
    // Narrow presentation-state helpers for operational-state styling.
    // Derive exclusively from response semantics; never parse text.
    const ALLOWED_CARD_STATES = ['current', 'partial', 'stale', 'empty'];
@@ -85,8 +170,7 @@
    }
 
    function renderPresentationState(counters, usage, connected) {
-      // Header connection state from connected flag (not text)
-      const header = qs('.dashboard-header');
+      const header = qs('.header-bar');
       if (header) {
          header.classList.remove('is-connected', 'is-disconnected');
          header.classList.add(connected ? 'is-connected' : 'is-disconnected');
@@ -274,7 +358,7 @@
 
    function renderFailure(firstLoad) {
       state.connected = false;
-      const header = qs('.dashboard-header');
+      const header = qs('.header-bar');
       if (header) {
          header.classList.remove('is-connected');
          header.classList.add('is-disconnected');
@@ -367,21 +451,82 @@
       cpu: { mode: 'cpu', labels: [], datasets: [] },
       memory: { mode: 'mem-mode-gib', labels: [], datasets: [] },
       process: { mode: 'proc-mode-cpusum', labels: [], datasets: [], contributorSummary: null },
-      networkLustre: { mode: 'nl-mode-network', labels: [], datasets: [] },
+      networkLustre: { mode: 'nl-network-p50', labels: [], datasets: [] },
    };
 
-   function replaceChart(name, canvasId, config) {
+   // ---- Chart lifecycle: create once, update in-place ----
+   function renderOrUpdateChart(name, canvasId, config) {
       const canvas = document.getElementById(canvasId);
       if (!canvas) return null;
+
       if (chartRegistry[name]) {
-         chartRegistry[name].destroy();
-         chartLifecycle.destroyCount++;
+         // In-place update: replace data + options, call update()
+         const chart = chartRegistry[name];
+         chart.data = config.data;
+         chart.options = config.options;
+         chart.update();
+         chartLifecycle.renders[name] = (chartLifecycle.renders[name] || 0) + 1;
+         return chart;
       }
+
+      // First render: create the chart
       const chart = new Chart(canvas, config);
       chartRegistry[name] = chart;
       chartLifecycle.createCount++;
       chartLifecycle.renders[name] = (chartLifecycle.renders[name] || 0) + 1;
       return chart;
+   }
+
+   // ---- PBS-themed scale defaults ----
+   function pbsScaleDefaults(overrides) {
+      const base = {
+         grid: { color: GRID_COLOR },
+         ticks: { color: TICK_COLOR },
+      };
+      return Object.assign(base, overrides);
+   }
+
+   function pbsChartOptions(scales, tooltipLabelCb) {
+      return {
+         responsive: true,
+         maintainAspectRatio: false,
+         plugins: {
+            legend: {
+               position: 'bottom',
+               labels: { color: LEGEND_COLOR, boxWidth: 24, boxHeight: 2 },
+               onHover: function(evt, legendItem) {
+                  var desc = seriesDescription(legendItem.text);
+                  if (!desc) { legendTip.style.display = 'none'; return; }
+                  legendTip.textContent = desc;
+                  legendTip.style.display = 'block';
+                  // Position near cursor; stay on-screen
+                  var x = evt.x != null ? evt.x : (evt.native ? evt.native.clientX : 0);
+                  var y = evt.y != null ? evt.y : (evt.native ? evt.native.clientY : 0);
+                  // evt.x/y are canvas-relative; convert to page coords
+                  var canvas = evt.chart ? evt.chart.canvas : null;
+                  if (canvas) {
+                     var rect = canvas.getBoundingClientRect();
+                     x = rect.left + x;
+                     y = rect.top + y;
+                  }
+                  var tipW = legendTip.offsetWidth || 200;
+                  var tipH = legendTip.offsetHeight || 30;
+                  var maxX = window.innerWidth - tipW - 12;
+                  legendTip.style.left = Math.max(4, Math.min(x + 12, maxX)) + 'px';
+                  legendTip.style.top = Math.max(4, y - tipH - 8) + 'px';
+               },
+               onLeave: function() {
+                  legendTip.style.display = 'none';
+               },
+            },
+            tooltip: {
+               mode: 'index',
+               intersect: false,
+               callbacks: tooltipLabelCb ? { label: tooltipLabelCb } : {},
+            },
+         },
+         scales: scales,
+      };
    }
 
    // ---- Aligned gap expansion for counter time series ----
@@ -397,7 +542,7 @@
       const labels = [];
       const rowIndices = []; // null = gap insertion, integer = original sortedRows index
 
-      labels.push(sortedRows[0].window_end ? sortedRows[0].window_end.slice(0, 16) : '');
+      labels.push(formatTimeLabel(sortedRows[0].window_end));
       rowIndices.push(0);
 
       let totalInserted = 0;
@@ -413,14 +558,14 @@
             // Align to cadence from prevTime
             let nextAligned = prevTime + CADENCE_MS;
             while (nextAligned < currTime - 30000 && totalInserted < MAX_INSERTIONS) {
-               const gapLabel = new Date(nextAligned).toISOString().slice(0, 16) + ' (gap)';
+               const gapLabel = formatTimeLabel(nextAligned) + ' (gap)';
                labels.push(gapLabel);
                rowIndices.push(null);
                nextAligned += CADENCE_MS;
                totalInserted++;
             }
          }
-         labels.push(sortedRows[i].window_end ? sortedRows[i].window_end.slice(0, 16) : '');
+         labels.push(formatTimeLabel(sortedRows[i].window_end));
          rowIndices.push(i);
       }
 
@@ -602,7 +747,7 @@
 
       // Process series: one entry per distinct interval (aggregated)
       const processLabels = aggregatedIntervals.map(function(iv) {
-         return iv.interval_end ? iv.interval_end.slice(0, 16) : '-';
+         return iv.interval_end ? formatTimeLabel(iv.interval_end) : '-';
       });
       const processCPU = aggregatedIntervals.map(function(iv) {
          return iv.cpuSum;
@@ -855,7 +1000,7 @@
          var intVal = ip.value != null ? (ip.value * 100).toFixed(1) + '%' : '-';
          var intUser = ip.username || '-';
          rows += '<tr>'
-            + '<td>' + interval.slice(0, 16) + '</td>'
+            + '<td>' + formatTimeLabel(interval) + '</td>'
             + '<td>' + dsVal + '</td>'
             + '<td>' + dsUser + '</td>'
             + '<td>' + intVal + '</td>'
@@ -874,115 +1019,211 @@
 
    // ---- Chart rendering ----
 
+   // One-time toggle handler binding (prevents listener leak)
+   let controlsBound = false;
+
+   function ensureControlHandlers() {
+      if (controlsBound) return;
+      controlsBound = true;
+
+      // Memory toggle
+      const memControls = document.getElementById('mem-controls');
+      if (memControls) {
+         memControls.querySelectorAll('button').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+               memControls.querySelectorAll('button').forEach(function(b) {
+                  b.setAttribute('aria-pressed', 'false');
+               });
+               btn.setAttribute('aria-pressed', 'true');
+               if (state.snapshot) renderCharts(state.snapshot);
+            });
+         });
+      }
+
+      // Process toggle
+      const procControls = document.getElementById('proc-controls');
+      if (procControls) {
+         procControls.querySelectorAll('button').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+               procControls.querySelectorAll('button').forEach(function(b) {
+                  b.setAttribute('aria-pressed', 'false');
+               });
+               btn.setAttribute('aria-pressed', 'true');
+               if (state.snapshot) renderCharts(state.snapshot);
+            });
+         });
+      }
+
+      // Network/Lustre toggle
+      const nlControls = document.getElementById('nl-controls');
+      if (nlControls) {
+         nlControls.querySelectorAll('button').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+               nlControls.querySelectorAll('button').forEach(function(b) {
+                  b.setAttribute('aria-pressed', 'false');
+               });
+               btn.setAttribute('aria-pressed', 'true');
+               if (state.snapshot) renderCharts(state.snapshot);
+            });
+         });
+      }
+   }
+
    function renderCharts(snapshot) {
       const input = buildChartData(snapshot);
       const totalKb = input.memoryTotalKb;
+
+      // Bind toggle handlers once
+      ensureControlHandlers();
 
       // Update D-state hotspot table
       updateDStateHotspotTable(input.dStatePoints, input.interactivityPoints);
 
       // 1. CPU / Load chart
-      replaceChart('cpu', 'chart-cpu', {
-         type: 'line',
-         data: {
-            labels: input.cpu.labels,
-            datasets: [
+      const hardware = snapshot && snapshot.hardware ? snapshot.hardware : {};
+      const cpuLogical = hardware.cpu_logical != null ? hardware.cpu_logical : null;
+
+      // Show logical CPU count in panel header
+      const cpuLogicalLabel = qs('[data-testid="cpu-logical-label"]');
+      if (cpuLogicalLabel) {
+         cpuLogicalLabel.textContent = cpuLogical != null
+            ? cpuLogical + ' logical CPUs' : '';
+      }
+
+      // Build CPU datasets; add a saturation reference line when cpu_logical is known
+      const cpuDatasets = [
                {
                   label: 'CPU p50 %',
                   data: input.cpu.cpuP50,
-                  borderColor: '#005fcc',
-                  backgroundColor: 'rgba(0,95,204,0.08)',
+                  borderColor: PALETTE[0],
+                  backgroundColor: 'rgba(59,130,246,0.08)',
                   spanGaps: false,
                   pointStyle: 'circle',
+                  pointRadius: 2,
+                  borderWidth: 2,
                   tension: 0.2,
                   yAxisID: 'y',
                },
                {
                   label: 'CPU p95 %',
                   data: input.cpu.cpuP95,
-                  borderColor: '#cc6600',
-                  backgroundColor: 'rgba(204,102,0,0.08)',
-                  borderDash: [6, 4],
+                  borderColor: PALETTE[1],
+                  backgroundColor: 'rgba(245,158,11,0.08)',
                   spanGaps: false,
                   pointStyle: 'rectRot',
+                  pointRadius: 2,
+                  borderWidth: 2,
                   tension: 0.2,
                   yAxisID: 'y',
                },
                {
                   label: 'CPU max %',
                   data: input.cpu.cpuMax,
-                  borderColor: '#880000',
-                  backgroundColor: 'rgba(136,0,0,0.08)',
-                  borderDash: [2, 2],
+                  borderColor: PALETTE[2],
+                  backgroundColor: 'rgba(239,68,68,0.08)',
                   spanGaps: false,
                   pointStyle: 'triangle',
+                  pointRadius: 2,
+                  borderWidth: 2,
                   tension: 0.2,
                   yAxisID: 'y',
                },
                {
                   label: 'Load1',
                   data: input.cpu.load1,
-                  borderColor: '#660099',
-                  backgroundColor: 'rgba(102,0,153,0.08)',
+                  borderColor: PALETTE[3],
+                  backgroundColor: 'rgba(139,92,246,0.08)',
+                  borderDash: [4, 3],
                   spanGaps: false,
                   pointStyle: 'crossRot',
+                  pointRadius: 2,
+                  borderWidth: 1.5,
                   tension: 0.2,
                   yAxisID: 'yLoad',
                },
                {
                   label: 'Load5',
                   data: input.cpu.load5,
-                  borderColor: '#228833',
-                  backgroundColor: 'rgba(34,136,51,0.08)',
+                  borderColor: PALETTE[5],
+                  backgroundColor: 'rgba(16,185,129,0.08)',
+                  borderDash: [4, 3],
                   spanGaps: false,
                   pointStyle: 'star',
+                  pointRadius: 2,
+                  borderWidth: 1.5,
                   tension: 0.2,
                   yAxisID: 'yLoad',
                },
                {
                   label: 'Load15',
                   data: input.cpu.load15,
-                  borderColor: '#aa8800',
-                  backgroundColor: 'rgba(170,136,0,0.08)',
+                  borderColor: PALETTE[7],
+                  backgroundColor: 'rgba(234,179,8,0.08)',
+                  borderDash: [4, 3],
                   spanGaps: false,
                   pointStyle: 'diamond',
+                  pointRadius: 2,
+                  borderWidth: 1.5,
                   tension: 0.2,
                   yAxisID: 'yLoad',
                },
-            ],
+      ];
+
+      // Saturation reference line: flat line at cpu_logical on the load axis
+      if (cpuLogical != null && input.cpu.labels.length > 0) {
+         cpuDatasets.push({
+            label: 'CPU count (' + cpuLogical + ')',
+            data: input.cpu.labels.map(function() { return cpuLogical; }),
+            borderColor: 'rgba(239,68,68,0.45)',
+            backgroundColor: 'rgba(0,0,0,0)',
+            borderDash: [10, 5],
+            borderWidth: 1.5,
+            pointRadius: 0,
+            pointHoverRadius: 0,
+            spanGaps: true,
+            tension: 0,
+            yAxisID: 'yLoad',
+            fill: false,
+         });
+      }
+
+      const loadAxisTitle = cpuLogical != null
+         ? 'Load avg (' + cpuLogical + ' CPUs = saturation)'
+         : 'Load avg';
+
+      renderOrUpdateChart('cpu', 'chart-cpu', {
+         type: 'line',
+         data: {
+            labels: input.cpu.labels,
+            datasets: cpuDatasets,
          },
-         options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-               y: {
+         options: pbsChartOptions(
+            {
+               y: pbsScaleDefaults({
                   beginAtZero: true,
                   type: 'linear',
                   display: true,
                   position: 'left',
-                  title: { display: true, text: 'CPU %' },
-               },
-               yLoad: {
+                  title: { display: true, text: 'CPU %', color: TICK_COLOR },
+               }),
+               yLoad: pbsScaleDefaults({
                   beginAtZero: true,
                   type: 'linear',
                   display: true,
                   position: 'right',
                   grid: { drawOnChartArea: false },
-                  title: { display: true, text: 'Load avg' },
-               },
+                  title: { display: true, text: loadAxisTitle, color: TICK_COLOR },
+               }),
+               x: pbsScaleDefaults({
+                  ticks: { color: TICK_COLOR, maxRotation: 45 },
+               }),
             },
-            plugins: {
-               tooltip: {
-                  callbacks: {
-                     label: function(c) {
-                        if (c.raw === null) return c.dataset.label + ': (gap/null)';
-                        const unit = c.dataset.yAxisID === 'yLoad' ? '' : '%';
-                        return c.dataset.label + ': ' + c.raw + unit;
-                     },
-                  },
-               },
-            },
-         },
+            function(c) {
+               if (c.raw === null) return c.dataset.label + ': (gap/null)';
+               const unit = c.dataset.yAxisID === 'yLoad' ? '' : '%';
+               return c.dataset.label + ': ' + c.raw + unit;
+            }
+         ),
       });
       chartRenderState.cpu = {
          mode: 'cpu',
@@ -990,31 +1231,18 @@
          datasets: [],
       };
 
-      // 2. Memory chart (GiB, with optional Percent toggle)
+      // 2. Memory chart (GiB / Percent toggle)
       (function() {
-         // Ensure controls exist
-         let memControls = document.getElementById('mem-controls');
-         if (!memControls) {
-            memControls = document.createElement('div');
-            memControls.id = 'mem-controls';
-            memControls.setAttribute('data-testid', 'mem-controls');
-            memControls.innerHTML =
-               '<button type="button" data-testid="mem-mode-gib" aria-pressed="true">GiB</button>'
-               + '<button type="button" data-testid="mem-mode-percent" aria-pressed="false">Percent</button>';
-            const canvas = document.getElementById('chart-memory');
-            if (canvas && canvas.parentElement) {
-               canvas.parentElement.insertBefore(memControls, canvas);
-            }
-         }
+         const memControls = document.getElementById('mem-controls');
          // Disable Percent button when total memory is unavailable
-         const percentBtn = memControls.querySelector('[data-testid="mem-mode-percent"]');
+         const percentBtn = memControls ? memControls.querySelector('[data-testid="mem-mode-percent"]') : null;
          const percentAvailable = totalKb != null && totalKb > 0;
          if (percentBtn) {
             percentBtn.disabled = !percentAvailable;
          }
 
          // Determine current mode
-         const activeBtn = memControls.querySelector('button[aria-pressed="true"]');
+         const activeBtn = memControls ? memControls.querySelector('button[aria-pressed="true"]') : null;
          const mode = activeBtn ? activeBtn.getAttribute('data-testid') : 'mem-mode-gib';
          const isPercent = mode === 'mem-mode-percent' && percentAvailable;
 
@@ -1030,15 +1258,18 @@
          const memTotalDisplay = input.memoryTotalSeries.map(toDisplayVal);
          const yLabel = isPercent ? 'Percent (%)' : 'GiB';
 
+         const categoryColors = [PALETTE[5], PALETTE[1], PALETTE[3], PALETTE[7], PALETTE[0], PALETTE[9]];
+
          const memDatasets = [
             {
                label: 'System used (' + yLabel + ')',
                data: memUsedDisplay,
-               borderColor: '#880000',
-               backgroundColor: 'rgba(136,0,0,0.1)',
+               borderColor: PALETTE[2],
+               backgroundColor: 'rgba(239,68,68,0.1)',
                spanGaps: false,
                pointStyle: 'circle',
-               pointRadius: 4,
+               pointRadius: 2,
+               borderWidth: 2,
                yAxisID: 'y',
                fill: false,
             },
@@ -1051,11 +1282,11 @@
                spanGaps: false,
                pointStyle: false,
                pointRadius: 0,
+               borderWidth: 1.5,
                yAxisID: 'y',
                fill: false,
             },
          ];
-         const categoryColors = ['#228833', '#cc6600', '#660099', '#aa8800', '#005fcc', '#aa3377'];
          Object.keys(input.memoryCategoryRSSP50).sort().forEach(function(category, index) {
             memDatasets.push({
                label: category + ' RSS p50 (non-additive)',
@@ -1065,48 +1296,45 @@
                spanGaps: false,
                pointStyle: 'circle',
                pointRadius: 3,
+               borderWidth: 1.5,
                yAxisID: 'yCategory',
                fill: false,
             });
          });
 
-         replaceChart('memory', 'chart-memory', {
+         renderOrUpdateChart('memory', 'chart-memory', {
             type: 'line',
             data: {
                labels: input.memoryLabels,
                datasets: memDatasets,
             },
-            options: {
-               responsive: true,
-               maintainAspectRatio: false,
-               scales: {
-                  y: {
+            options: pbsChartOptions(
+               {
+                  y: pbsScaleDefaults({
                      beginAtZero: true,
                      position: 'left',
-                     title: { display: true, text: 'System memory (' + yLabel + ')' },
-                  },
-                  yCategory: {
+                     title: { display: true, text: 'System memory (' + yLabel + ')', color: TICK_COLOR },
+                  }),
+                  yCategory: pbsScaleDefaults({
                      beginAtZero: true,
                      position: 'right',
                      grid: { drawOnChartArea: false },
                      title: {
                         display: true,
                         text: 'Category RSS p50 (' + yLabel + ', non-additive)',
+                        color: TICK_COLOR,
                      },
-                  },
+                  }),
+                  x: pbsScaleDefaults({
+                     ticks: { color: TICK_COLOR, maxRotation: 45 },
+                  }),
                },
-               plugins: {
-                  tooltip: {
-                     callbacks: {
-                        label: function(c) {
-                           if (c.raw === null) return c.dataset.label + ': (null/missing)';
-                           return c.dataset.label + ': '
-                              + (isPercent ? c.raw.toFixed(1) + '%' : c.raw.toFixed(3) + ' GiB');
-                        },
-                     },
-                  },
-               },
-            },
+               function(c) {
+                  if (c.raw === null) return c.dataset.label + ': (null/missing)';
+                  return c.dataset.label + ': '
+                     + (isPercent ? c.raw.toFixed(1) + '%' : c.raw.toFixed(3) + ' GiB');
+               }
+            ),
          });
          chartRenderState.memory = {
             mode: mode,
@@ -1134,38 +1362,12 @@
                },
             },
          };
-
-         // Re-bind toggle handlers each time (buttons may be recreated)
-         memControls.querySelectorAll('button').forEach(function(btn) {
-            btn.addEventListener('click', function() {
-               memControls.querySelectorAll('button').forEach(function(b) {
-                  b.setAttribute('aria-pressed', 'false');
-               });
-               btn.setAttribute('aria-pressed', 'true');
-               // Re-render with new mode using stored snapshot
-               if (state.snapshot) renderCharts(state.snapshot);
-            });
-         });
       })();
 
       // 3. Process chart (mode toggle: CPU sum / process max / grain total RSS)
       (function() {
-         let procControls = document.getElementById('proc-controls');
-         if (!procControls) {
-            procControls = document.createElement('div');
-            procControls.id = 'proc-controls';
-            procControls.setAttribute('data-testid', 'proc-controls');
-            procControls.innerHTML =
-               '<button type="button" data-testid="proc-mode-cpusum" aria-pressed="true">CPU sum</button>'
-               + '<button type="button" data-testid="proc-mode-max" aria-pressed="false">Process max</button>'
-               + '<button type="button" data-testid="proc-mode-rss" aria-pressed="false">Grain total RSS</button>';
-            const canvas = document.getElementById('chart-process');
-            if (canvas && canvas.parentElement) {
-               canvas.parentElement.insertBefore(procControls, canvas);
-            }
-         }
-
-         const activeBtn = procControls.querySelector('button[aria-pressed="true"]');
+         const procControls = document.getElementById('proc-controls');
+         const activeBtn = procControls ? procControls.querySelector('button[aria-pressed="true"]') : null;
          const mode = activeBtn ? activeBtn.getAttribute('data-testid') : 'proc-mode-cpusum';
 
          let dataArr, yText, usernameArr;
@@ -1188,39 +1390,35 @@
             {
                label: yText,
                data: dataArr,
-               backgroundColor: '#005fcc',
+               backgroundColor: PALETTE[0],
+               borderColor: PALETTE[0],
                spanGaps: false,
             },
          ];
 
-         replaceChart('process', 'chart-process', {
+         renderOrUpdateChart('process', 'chart-process', {
             type: 'bar',
             data: {
                labels: input.processLabels,
                datasets: procDatasets,
             },
-            options: {
-               responsive: true,
-               maintainAspectRatio: false,
-               scales: {
-                  y: {
+            options: pbsChartOptions(
+               {
+                  y: pbsScaleDefaults({
                      beginAtZero: true,
-                     title: { display: true, text: yText },
-                  },
+                     title: { display: true, text: yText, color: TICK_COLOR },
+                  }),
+                  x: pbsScaleDefaults({
+                     ticks: { color: TICK_COLOR, maxRotation: 45 },
+                  }),
                },
-               plugins: {
-                  tooltip: {
-                     callbacks: {
-                        label: function(c) {
-                           const val = c.raw === null ? 'null' : c.raw;
-                           if (!usernameArr) return yText + ': ' + val;
-                           const user = usernameArr[c.dataIndex] || '-';
-                           return yText + ': ' + val + ' (contributor: ' + user + ')';
-                        },
-                     },
-                  },
-               },
-            },
+               function(c) {
+                  const val = c.raw === null ? 'null' : c.raw;
+                  if (!usernameArr) return yText + ': ' + val;
+                  const user = usernameArr[c.dataIndex] || '-';
+                  return yText + ': ' + val + ' (contributor: ' + user + ')';
+               }
+            ),
          });
          chartRenderState.process = {
             mode: mode,
@@ -1230,47 +1428,12 @@
             }),
             contributorSummary: usernameArr ? usernameArr.slice() : null,
          };
-
-         procControls.querySelectorAll('button').forEach(function(btn) {
-            btn.addEventListener('click', function() {
-               procControls.querySelectorAll('button').forEach(function(b) {
-                  b.setAttribute('aria-pressed', 'false');
-               });
-               btn.setAttribute('aria-pressed', 'true');
-               if (state.snapshot) renderCharts(state.snapshot);
-            });
-         });
       })();
 
       // 4. Network / Lustre chart (mode toggle)
-      // Network has three statistic sub-modes: p50, p95, max
-      // Lustre sub-modes: p50-sum, p95-sum, peak-sum, target-count
       (function() {
-         let nlControls = document.getElementById('nl-controls');
-         if (!nlControls) {
-            nlControls = document.createElement('div');
-            nlControls.id = 'nl-controls';
-            nlControls.setAttribute('data-testid', 'nl-controls');
-            nlControls.innerHTML =
-               // Network family (three statistic modes)
-               '<button type="button" data-testid="nl-network-p50" aria-pressed="true">Network (p50)</button>'
-               + '<button type="button" data-testid="nl-network-p95" aria-pressed="false">Network (p95)</button>'
-               + '<button type="button" data-testid="nl-network-max" aria-pressed="false">Network (max)</button>'
-               // Lustre family
-               + '<button type="button" data-testid="nl-mode-lustre-p50" aria-pressed="false">Lustre p50-sum</button>'
-               + '<button type="button" data-testid="nl-mode-lustre-p95" aria-pressed="false">Lustre p95-sum</button>'
-               + '<button type="button" data-testid="nl-mode-lustre-peak" aria-pressed="false">Lustre peak-sum</button>'
-               + '<button type="button" data-testid="nl-mode-lustre-targets" aria-pressed="false">Lustre target count</button>';
-            const canvas = document.getElementById('chart-network-lustre');
-            if (canvas && canvas.parentElement) {
-               canvas.parentElement.insertBefore(nlControls, canvas);
-            }
-
-            // --- BACKWARD COMPAT: keep nl-mode-network button functional ---
-            // Tests using nl-mode-network testid still work via the button group logic below
-         }
-
-         const activeBtn = nlControls.querySelector('button[aria-pressed="true"]');
+         const nlControls = document.getElementById('nl-controls');
+         const activeBtn = nlControls ? nlControls.querySelector('button[aria-pressed="true"]') : null;
          // Determine active mode using data-testid
          const mode = activeBtn ? activeBtn.getAttribute('data-testid') : 'nl-network-p50';
 
@@ -1280,21 +1443,21 @@
          const nlLabels = input.networkLabels.length ? input.networkLabels : ['—'];
          const datasets = [];
 
-         // Color-blind-safe palette with distinct line styles
-         const colors = ['#005fcc', '#cc6600', '#228833', '#880000', '#660099', '#aa8800'];
+         // PBS palette with distinct line styles
          const dashes = [[], [6, 4], [2, 2], [8, 2, 2, 2], [4, 4], [10, 2]];
 
          if (effectiveMode === 'nl-network-p50') {
-            // Per-interface RX/TX p50 time series (default)
             input.ifaceList.forEach(function(iface, idx) {
-               const rxColor = colors[idx * 2 % colors.length];
-               const txColor = colors[(idx * 2 + 1) % colors.length];
+               const rxColor = PALETTE[idx * 2 % PALETTE.length];
+               const txColor = PALETTE[(idx * 2 + 1) % PALETTE.length];
                datasets.push({
                   label: iface + ' RX p50 (B/s)',
                   data: input.networkRXP50[iface],
                   borderColor: rxColor,
                   backgroundColor: rxColor,
                   borderDash: dashes[idx % dashes.length],
+                  borderWidth: 2,
+                  pointRadius: 2,
                   spanGaps: false,
                   pointStyle: 'circle',
                });
@@ -1304,21 +1467,24 @@
                   borderColor: txColor,
                   backgroundColor: txColor,
                   borderDash: dashes[(idx + 1) % dashes.length],
+                  borderWidth: 2,
+                  pointRadius: 2,
                   spanGaps: false,
                   pointStyle: 'rectRot',
                });
             });
          } else if (effectiveMode === 'nl-network-p95') {
-            // Per-interface RX/TX p95 time series
             input.ifaceList.forEach(function(iface, idx) {
-               const rxColor = colors[idx * 2 % colors.length];
-               const txColor = colors[(idx * 2 + 1) % colors.length];
+               const rxColor = PALETTE[idx * 2 % PALETTE.length];
+               const txColor = PALETTE[(idx * 2 + 1) % PALETTE.length];
                datasets.push({
                   label: iface + ' RX p95 (B/s)',
                   data: input.networkRXP95[iface],
                   borderColor: rxColor,
                   backgroundColor: rxColor,
                   borderDash: dashes[idx % dashes.length],
+                  borderWidth: 2,
+                  pointRadius: 2,
                   spanGaps: false,
                   pointStyle: 'circle',
                });
@@ -1328,21 +1494,24 @@
                   borderColor: txColor,
                   backgroundColor: txColor,
                   borderDash: dashes[(idx + 1) % dashes.length],
+                  borderWidth: 2,
+                  pointRadius: 2,
                   spanGaps: false,
                   pointStyle: 'rectRot',
                });
             });
          } else if (effectiveMode === 'nl-network-max') {
-            // Per-interface RX/TX max time series
             input.ifaceList.forEach(function(iface, idx) {
-               const rxColor = colors[idx * 2 % colors.length];
-               const txColor = colors[(idx * 2 + 1) % colors.length];
+               const rxColor = PALETTE[idx * 2 % PALETTE.length];
+               const txColor = PALETTE[(idx * 2 + 1) % PALETTE.length];
                datasets.push({
                   label: iface + ' RX max (B/s)',
                   data: input.networkRXMax[iface],
                   borderColor: rxColor,
                   backgroundColor: rxColor,
                   borderDash: dashes[idx % dashes.length],
+                  borderWidth: 2,
+                  pointRadius: 2,
                   spanGaps: false,
                   pointStyle: 'circle',
                });
@@ -1352,45 +1521,50 @@
                   borderColor: txColor,
                   backgroundColor: txColor,
                   borderDash: dashes[(idx + 1) % dashes.length],
+                  borderWidth: 2,
+                  pointRadius: 2,
                   spanGaps: false,
                   pointStyle: 'rectRot',
                });
             });
          } else if (effectiveMode === 'nl-mode-lustre-p50') {
-            // p50-sum is sum of per-target p50 values (NOT maxima)
             input.lustreOps.forEach(function(op, idx) {
                datasets.push({
                   label: op + ' p50-sum (sum of per-target p50)',
                   data: input.lustreP50Sum[op],
-                  borderColor: colors[idx % colors.length],
-                  backgroundColor: colors[idx % colors.length],
+                  borderColor: PALETTE[idx % PALETTE.length],
+                  backgroundColor: PALETTE[idx % PALETTE.length],
                   borderDash: dashes[idx % dashes.length],
+                  borderWidth: 2,
+                  pointRadius: 2,
                   spanGaps: false,
                   pointStyle: 'circle',
                });
             });
          } else if (effectiveMode === 'nl-mode-lustre-p95') {
-            // p95-sum is sum of per-target p95 values (NOT maxima)
             input.lustreOps.forEach(function(op, idx) {
                datasets.push({
                   label: op + ' p95-sum (sum of per-target p95)',
                   data: input.lustreP95Sum[op],
-                  borderColor: colors[idx % colors.length],
-                  backgroundColor: colors[idx % colors.length],
+                  borderColor: PALETTE[idx % PALETTE.length],
+                  backgroundColor: PALETTE[idx % PALETTE.length],
                   borderDash: dashes[idx % dashes.length],
+                  borderWidth: 2,
+                  pointRadius: 2,
                   spanGaps: false,
                   pointStyle: 'rectRot',
                });
             });
          } else if (effectiveMode === 'nl-mode-lustre-peak') {
-            // peak-sum/max_sum: sum of per-target maxima (correct - this is where maxima caveat belongs)
             input.lustreOps.forEach(function(op, idx) {
                datasets.push({
                   label: op + ' peak-sum/max_sum (sum of per-target maxima)',
                   data: input.lustreMaxSum[op],
-                  borderColor: colors[idx % colors.length],
-                  backgroundColor: colors[idx % colors.length],
+                  borderColor: PALETTE[idx % PALETTE.length],
+                  backgroundColor: PALETTE[idx % PALETTE.length],
                   borderDash: dashes[idx % dashes.length],
+                  borderWidth: 2,
+                  pointRadius: 2,
                   spanGaps: false,
                   pointStyle: 'triangle',
                });
@@ -1400,9 +1574,11 @@
                datasets.push({
                   label: op + ' target_count',
                   data: input.lustreTargetCount[op],
-                  borderColor: colors[idx % colors.length],
-                  backgroundColor: colors[idx % colors.length],
+                  borderColor: PALETTE[idx % PALETTE.length],
+                  backgroundColor: PALETTE[idx % PALETTE.length],
                   borderDash: dashes[idx % dashes.length],
+                  borderWidth: 2,
+                  pointRadius: 2,
                   spanGaps: false,
                   pointStyle: 'diamond',
                });
@@ -1413,35 +1589,27 @@
             ? 'Bytes/sec (' + effectiveMode.replace('nl-network-', '') + ')'
             : 'Sum / count';
 
-         replaceChart('networkLustre', 'chart-network-lustre', {
+         renderOrUpdateChart('networkLustre', 'chart-network-lustre', {
             type: 'line',
             data: {
                labels: nlLabels,
                datasets: datasets,
             },
-            options: {
-               responsive: true,
-               maintainAspectRatio: false,
-               scales: {
-                  y: {
+            options: pbsChartOptions(
+               {
+                  y: pbsScaleDefaults({
                      beginAtZero: true,
-                     title: {
-                        display: true,
-                        text: nlYText,
-                     },
-                  },
+                     title: { display: true, text: nlYText, color: TICK_COLOR },
+                  }),
+                  x: pbsScaleDefaults({
+                     ticks: { color: TICK_COLOR, maxRotation: 45 },
+                  }),
                },
-               plugins: {
-                  tooltip: {
-                     callbacks: {
-                        label: function(c) {
-                           if (c.raw === null) return c.dataset.label + ': (null/gap)';
-                           return c.dataset.label + ': ' + c.raw;
-                        },
-                     },
-                  },
-               },
-            },
+               function(c) {
+                  if (c.raw === null) return c.dataset.label + ': (null/gap)';
+                  return c.dataset.label + ': ' + c.raw;
+               }
+            ),
          });
          // Store effective mode for getChartRenderState
          chartRenderState.networkLustre = {
@@ -1451,16 +1619,6 @@
                return { label: ds.label, data: ds.data ? ds.data.slice() : [] };
             }),
          };
-
-         nlControls.querySelectorAll('button').forEach(function(btn) {
-            btn.addEventListener('click', function() {
-               nlControls.querySelectorAll('button').forEach(function(b) {
-                  b.setAttribute('aria-pressed', 'false');
-               });
-               btn.setAttribute('aria-pressed', 'true');
-               if (state.snapshot) renderCharts(state.snapshot);
-            });
-         });
       })();
    }
 

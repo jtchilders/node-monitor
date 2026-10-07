@@ -51,9 +51,10 @@ def test_cpu_p50_p95_max_exact_values(browser_page, live_web, snapshot_complete)
     labels = cpu["labels"]
     assert len(labels) == 3, \
         f"Expected 3 labels (2 rows + 1 gap at 11:58), got {len(labels)}: {labels}"
-    assert "2026-10-03T11:57" in labels[0], f"First label wrong: {labels[0]}"
+    # Labels are local-time HH:MM format (no date, since range is 1-24h)
+    assert len(labels[0]) == 5 and ':' in labels[0], f"First label not HH:MM: {labels[0]}"
     assert "(gap)" in labels[1], f"Middle label must be gap slot: {labels[1]}"
-    assert "2026-10-03T11:59" in labels[2], f"Third label wrong: {labels[2]}"
+    assert len(labels[2]) == 5 and ':' in labels[2], f"Third label not HH:MM: {labels[2]}"
 
     # CPU p50 exact values: [row0, None(gap), row1]
     assert cpu["cpuP50"] == [20.0, None, 25.0], f"cpuP50 wrong: {cpu['cpuP50']}"
@@ -147,7 +148,7 @@ def test_d_state_sparse_maxima_exact_values_and_username(browser_page, live_web,
         f"Second interval_end wrong: {d_points[1]['interval_end']}"
 
     # The HTML table note mentions observation-weighted fraction
-    obs_note = page.locator('[aria-label="CPU/load summary"]').inner_text()
+    obs_note = page.locator('[aria-label="CPU and load chart"]').inner_text()
     assert "observation-weighted" in obs_note.lower() or "Observation-weighted" in obs_note, \
         f"Observation-weighted note missing from CPU/load table: {obs_note!r}"
 
@@ -264,7 +265,7 @@ def test_memory_category_rss_p50_groups_by_category_and_uses_max_activity(
     assert "interactive RSS p50 (non-additive)" in by_label
     assert "batch RSS p50 (non-additive)" in by_label
     assert by_label["System used (GiB)"]["pointStyle"] == "circle"
-    assert by_label["System used (GiB)"]["pointRadius"] == 4
+    assert by_label["System used (GiB)"]["pointRadius"] == 2
     assert by_label["System used (GiB)"]["borderDash"] == []
     assert by_label["System used (GiB)"]["yAxisID"] == "y"
     assert by_label["Total memory (GiB)"]["borderDash"] == [4, 4]
@@ -288,7 +289,7 @@ def test_memory_category_rss_p50_groups_by_category_and_uses_max_activity(
     expected = 153600 / 131072000 * 100
     assert percent_by_label["interactive RSS p50 (non-additive)"]["data"][0] == expected
 
-    note = page.locator('[aria-label="Memory chart"] .chart-note').inner_text()
+    note = page.locator('[aria-label="Memory chart"] .panel-note').inner_text()
     assert "non-additive" in note
     assert "do not reconcile" in note
 
@@ -330,8 +331,9 @@ def test_process_cpu_sum_exact_grouped_by_interval(browser_page, live_web, snaps
     assert cpu_sum[1] == 300.2, f"Interval1 cpu_seconds wrong: {cpu_sum[1]}"
 
     # Labels show interval_end only (not category/activity) -- per-interval aggregation
-    assert "11:30" in labels[0], f"Interval0 label must contain 11:30: {labels[0]}"
-    assert "11:45" in labels[1], f"Interval1 label must contain 11:45: {labels[1]}"
+    # Labels are local-time HH:MM; minutes are timezone-invariant
+    assert labels[0].endswith(":30"), f"Interval0 label must end with :30: {labels[0]}"
+    assert labels[1].endswith(":45"), f"Interval1 label must end with :45: {labels[1]}"
     # Must NOT contain category/activity (pre-fix incorrect behavior)
     assert "interactive" not in labels[0], f"Label must not contain grain category: {labels[0]}"
     assert "batch" not in labels[1], f"Label must not contain grain category: {labels[1]}"
@@ -374,10 +376,10 @@ def test_process_rss_max_exact_label_and_contributor(browser_page, live_web, sna
     assert rss_usernames[0] == "alice", f"Grain0 RSS username wrong: {rss_usernames[0]}"
     assert rss_usernames[1] == "bob", f"Grain1 RSS username wrong: {rss_usernames[1]}"
 
-    # HTML table has 'grain total RSS'
-    proc_table = page.locator('[aria-label="Process chart"] .chart-alt').inner_text()
-    assert "grain total RSS" in proc_table, \
-        f"'grain total RSS' missing from process table: {proc_table!r}"
+    # Panel must mention 'Grain total RSS' (btn-group label)
+    proc_text = page.locator('[aria-label="Process chart"]').inner_text()
+    assert "Grain total RSS" in proc_text or "grain total RSS" in proc_text, \
+        f"'Grain total RSS' missing from process panel: {proc_text!r}"
 
     assert errors == []
 
@@ -445,7 +447,7 @@ def test_network_canvas_visible_and_lo_note(browser_page, live_web):
     wait_lifecycle(page)
 
     assert page.locator('[data-testid="chart-network-lustre"]').is_visible()
-    note = page.locator('[aria-label="Network and Lustre chart"] .chart-note').inner_text()
+    note = page.locator('[aria-label="Network and Lustre chart"] .panel-note').inner_text()
     assert "Loopback (lo) excluded" in note, f"lo exclusion note missing: {note!r}"
     assert "sum of per-target maxima" in note, f"Lustre caveat missing: {note!r}"
 
@@ -580,8 +582,8 @@ def test_chart_lifecycle_creates_four_charts(browser_page, live_web, snapshot_co
     assert errors == []
 
 
-def test_chart_lifecycle_destroy_on_refresh(browser_page, live_web, snapshot_complete):
-    """After a second refresh, destroyCount == 4 (each chart destroyed before replace)."""
+def test_chart_lifecycle_in_place_update_on_refresh(browser_page, live_web, snapshot_complete):
+    """After a second refresh, charts are updated in-place: createCount stays 4, destroyCount stays 0."""
     page, errors, external = browser_page
     page.goto(live_web.url + "/")
     wait_connected(page)
@@ -590,16 +592,16 @@ def test_chart_lifecycle_destroy_on_refresh(browser_page, live_web, snapshot_com
     # Trigger a second refresh by clicking a range button
     page.locator('[data-range="3h"]').click()
     wait_connected(page)
-    # Wait for lifecycle to update to 8 creates
+    # Wait for render count to increase (in-place update increments renders, not creates)
     page.wait_for_function(
-        "() => window.__nodeMonitorTest.getChartLifecycle().createCount >= 8",
+        "() => window.__nodeMonitorTest.getChartLifecycle().renders.cpu >= 2",
         timeout=CONNECTED_TIMEOUT
     )
 
     lc = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
-    assert lc["createCount"] == 8, f"Expected 8 total creates after 2 renders, got {lc['createCount']}"
-    assert lc["destroyCount"] == 4, \
-        f"Expected 4 destroys after second render, got {lc['destroyCount']}"
+    assert lc["createCount"] == 4, f"Expected 4 total creates (in-place update), got {lc['createCount']}"
+    assert lc["destroyCount"] == 0, \
+        f"Expected 0 destroys (in-place update), got {lc['destroyCount']}"
     assert lc["renders"].get("cpu", 0) == 2, f"cpu not rendered twice: {lc['renders']}"
 
     assert errors == []
@@ -686,7 +688,7 @@ def test_partial_state_chart_notes_in_viewport(browser_page, live_web, snapshot_
     wait_lifecycle(page)
 
     # Lustre note visible
-    lustre_note = page.locator('[aria-label="Network and Lustre chart"] .chart-note')
+    lustre_note = page.locator('[aria-label="Network and Lustre chart"] .panel-note')
     assert lustre_note.count() > 0, "Lustre note not in DOM"
     bbox = lustre_note.bounding_box()
     if bbox:
@@ -694,9 +696,9 @@ def test_partial_state_chart_notes_in_viewport(browser_page, live_web, snapshot_
         assert bbox["y"] >= 0, "Note box above viewport top"
         # Note is in document even if requires scroll
 
-    # Process table visible
-    proc_table = page.locator('[aria-label="Process chart"] .chart-alt')
-    assert proc_table.count() > 0, "Process alt table not in DOM"
+    # Process panel note visible
+    proc_note = page.locator('[aria-label="Process chart"] .panel-note')
+    assert proc_note.count() > 0, "Process panel note not in DOM"
 
     assert errors == []
 

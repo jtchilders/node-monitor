@@ -71,12 +71,12 @@ def test_semantic_state_stale_usage_current_counters(browser_page, live_web, sna
    page.goto(live_web.url + "/")
    wait_connected_and_charts(page)
    # Header connected
-   header = page.locator('.dashboard-header')
+   header = page.locator('.header-bar')
    cls_header = header.get_attribute('class') or ''
    assert 'is-connected' in cls_header
    # Counter card exact state-current
    counter_card = page.locator('[data-testid="counter-card"]')
-   expect(counter_card).to_have_class(r"state-current")
+   expect(counter_card).to_contain_class("state-current")
    # Usage card exact state-stale (not broad any)
    usage_card = page.locator('[data-testid="usage-card"]')
    cls_usage = usage_card.get_attribute('class') or ''
@@ -117,7 +117,7 @@ def test_disconnect_retains_stale_classes(browser_page, live_web, snapshot_compl
    assert lc_after.get("destroyCount", 0) == lc_before.get("destroyCount", 0), f"destroyCount changed: {lc_after}"
    assert page.locator('[data-testid="cpu-busy"]').inner_text() == before_cpu
    # Header exact disconnected; usage remains state-stale; retry NOT visible
-   header = page.locator('.dashboard-header')
+   header = page.locator('.header-bar')
    cls_header = header.get_attribute('class') or ''
    assert 'is-disconnected' in cls_header
    assert 'is-connected' not in cls_header
@@ -169,7 +169,7 @@ def test_partial_and_empty_states(browser_page, live_web, snapshot_complete):
      assert 'state-empty' in cls, f"expected state-empty on {card}, got {cls}"
    # CPU '-' and header connected
    assert page.locator('[data-testid="cpu-busy"]').inner_text() == "-"
-   header_cls = page.locator('.dashboard-header').get_attribute('class') or ''
+   header_cls = page.locator('.header-bar').get_attribute('class') or ''
    assert 'is-connected' in header_cls
    retry_btn = page.locator('[data-testid="retry-btn"]')
    assert not retry_btn.is_visible()
@@ -182,7 +182,7 @@ def test_first_load_failure_header_disconnected_and_retry_visible(browser_page, 
    # Wait exact connection failure text
    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connection failure", timeout=CONNECTED_TIMEOUT)
    # Header exact disconnected
-   header = page.locator('.dashboard-header')
+   header = page.locator('.header-bar')
    cls_header = header.get_attribute('class') or ''
    assert 'is-disconnected' in cls_header
    assert 'is-connected' not in cls_header
@@ -192,7 +192,7 @@ def test_first_load_failure_header_disconnected_and_retry_visible(browser_page, 
    # No card state class required before any snapshot
 
 
-def test_desktop_geometry_4_cards_and_2_metric_columns_and_chart_height(browser_page, live_web):
+def test_desktop_geometry_4_cards_and_stacked_panels_and_chart_height(browser_page, live_web):
    page, _, _ = open_dashboard(browser_page, live_web)
    wait_connected_and_charts(page)
    page.set_viewport_size({"width": 1440, "height": 1000})
@@ -209,21 +209,23 @@ def test_desktop_geometry_4_cards_and_2_metric_columns_and_chart_height(browser_
      tops.append(bb["y"])
    assert len(tops) == 4
    assert max(tops) - min(tops) < 4, f"status cards not aligned: {tops}"
-   panels = page.locator('.metric-panel').all()
-   xs = []
+   # Panels are single-column stacked (same x, increasing y)
+   panels = page.locator('.panel').all()
+   assert len(panels) == 4, f"expected 4 chart panels, got {len(panels)}"
+   ys = []
    for p in panels:
      expect(p).to_be_visible()
      bb = p.bounding_box()
-     assert bb is not None, "metric-panel bounding_box None"
-     xs.append(bb["x"])
-   distinct_x = len({round(x / 10) * 10 for x in xs})
-   assert distinct_x == 2, f"expected 2 metric x columns, got {distinct_x} at {xs}"
-   for w in page.locator('.chart-canvas-wrap').all():
+     assert bb is not None, "panel bounding_box None"
+     ys.append(bb["y"])
+   for i in range(1, len(ys)):
+     assert ys[i] > ys[i - 1], f"panels not stacked vertically: {ys}"
+   for w in page.locator('.chart-wrap').all():
      expect(w).to_be_visible()
      bb = w.bounding_box()
      assert bb is not None, "chart wrapper bounding_box None (geometry missing)"
      h = bb["height"]
-     assert 280 <= h <= 300, f"chart wrapper height {h} out of [280,300]"
+     assert 350 <= h <= 380, f"chart wrapper height {h} out of [350,380]"
 
 
 def test_narrow_400px_no_overflow_and_content_visible_and_focus_and_chart_height(browser_page, live_web):
@@ -233,14 +235,14 @@ def test_narrow_400px_no_overflow_and_content_visible_and_focus_and_chart_height
    scroll = page.evaluate("() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 2")
    assert scroll, "narrow layout overflows horizontally"
    # Required content assertions using expect visibility (not count>0)
-   expect(page.locator('.header-identity').first).to_be_visible()
-   expect(page.locator('.header-hero').first).to_be_visible()
+   expect(page.locator('.header-left').first).to_be_visible()
    expect(page.locator('.header-stats').first).to_be_visible()
+   expect(page.locator('.header-right').first).to_be_visible()
    expect(page.locator('.control-panel').first).to_be_visible()
-   expect(page.locator('.range-buttons button').first).to_be_visible()
+   expect(page.locator('.btn-group button').first).to_be_visible()
    expect(page.locator('#node-group').first).to_be_visible()
    expect(page.locator('#user-form').first).to_be_visible()
-   expect(page.locator('.metric-panel').first).to_be_visible()
+   expect(page.locator('.panel').first).to_be_visible()
    page.locator('[data-range="1h"]').focus()
    outline_style = page.locator('[data-range="1h"]').evaluate("el => getComputedStyle(el).outlineStyle")
    assert outline_style != 'none', f"focus outline missing (outlineStyle={outline_style})"
@@ -249,11 +251,11 @@ def test_narrow_400px_no_overflow_and_content_visible_and_focus_and_chart_height
    # Root mask absence checked implicitly by no overflow hidden/clip; keep existing check
    overflow_hidden = page.evaluate("() => { const s=getComputedStyle(document.documentElement); return s.overflow==='hidden'||s.overflow==='clip'; }")
    assert not overflow_hidden, "overflow hidden/clip must not be set on root"
-   for w in page.locator('.chart-canvas-wrap').all():
+   for w in page.locator('.chart-wrap').all():
      expect(w).to_be_visible()
      bb = w.bounding_box()
      assert bb is not None, "chart wrapper bounding_box None in narrow layout"
-     assert 280 <= bb["height"] <= 300
+     assert 350 <= bb["height"] <= 380
 
 
 def screenshot_dir(tmp_path):
@@ -283,7 +285,7 @@ def test_capture_visual_acceptance_matrix(browser_page, live_web, snapshot_compl
    wait_connected_and_charts(page)
    # Assert expected current state text/classes and visible chart wrappers before all-canvas wait and capture (desktop-current)
    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Connected")
-   expect(page.locator('.dashboard-header')).to_contain_class("is-connected")
+   expect(page.locator('.header-bar')).to_contain_class("is-connected")
    for wid in CANVAS_IDS:
      wrap = page.locator(f'[data-testid="{wid}"]')
      assert wrap.is_visible(), f"chart wrapper {wid} not visible before desktop screenshot"
@@ -374,9 +376,9 @@ def test_reduced_motion_disables_pulse(browser_page, live_web):
    page.locator('[data-range="3h"]').click()
    expect(page.locator('[data-testid="connectivity-status"]')).to_have_text("Web server disconnected", timeout=CONNECTED_TIMEOUT)
    # Retain disconnected class; do not require removal
-   header = page.locator('.dashboard-header')
+   header = page.locator('.header-bar')
    assert 'is-disconnected' in (header.get_attribute('class') or '')
-   dot = page.locator('.dashboard-header.is-disconnected .state-dot')
+   dot = page.locator('.header-bar.is-disconnected .dot')
    expect(dot).to_be_visible()
    anim = dot.evaluate("el => getComputedStyle(el).animationName")
    assert anim == "none", f"expected animation none under reduced motion, got {anim}"

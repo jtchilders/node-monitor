@@ -265,8 +265,9 @@ def test_process_cpu_one_entry_per_interval_is_sum(multi_grain_web):
     assert len(labels) == 2, (
         f"processLabels must have 2 entries (one per interval), got {len(labels)}: {labels}"
     )
-    assert "11:30" in labels[0], f"Interval A label must contain 11:30: {labels[0]}"
-    assert "11:45" in labels[1], f"Interval B label must contain 11:45: {labels[1]}"
+    # Labels are local-time HH:MM; minutes are timezone-invariant
+    assert labels[0].endswith(":30"), f"Interval A label must end with :30: {labels[0]}"
+    assert labels[1].endswith(":45"), f"Interval B label must end with :45: {labels[1]}"
     # Labels must NOT contain category/activity as if per-grain
     assert "interactive" not in labels[0] and "batch" not in labels[0], (
         f"Label must not contain per-grain category, got: {labels[0]}"
@@ -439,9 +440,11 @@ def test_labels_show_interval_not_category_activity(multi_grain_web):
         f"processLabels must have 2 entries (one per interval), got {len(labels)}: {labels}"
     )
 
-    # Labels must contain interval timestamps
+    # Labels must be HH:MM local-time strings matching the interval minutes
     for lbl in labels:
-        assert "11:" in lbl, f"Label should reference interval time, got: {lbl!r}"
+        assert len(lbl) == 5 and ':' in lbl, f"Label should be HH:MM format, got: {lbl!r}"
+    assert labels[0].endswith(":30"), f"First label should end with :30, got: {labels[0]!r}"
+    assert labels[1].endswith(":45"), f"Second label should end with :45, got: {labels[1]!r}"
 
     # Labels must NOT be polluted with individual grain categories/activities
     for lbl in labels:
@@ -547,7 +550,7 @@ def test_interactivity_max_semantics_per_interval(multi_grain_web):
 
     # The CPU/load chart must have an observation-weighted note in its accessible element
     # (this verifies D-state points are represented, not silently omitted)
-    obs_note = page.locator('[aria-label="CPU/load summary"]').inner_text()
+    obs_note = page.locator('[aria-label="CPU and load chart"]').inner_text()
     assert "observation-weighted" in obs_note.lower(), (
         f"CPU/load summary table must contain 'observation-weighted' note. "
         f"Got: {obs_note!r}"
@@ -698,8 +701,8 @@ def test_memory_percent_button_disabled_when_total_zero(browser_page, live_web):
 # Test 9: Control button clicks cause lifecycle chart replacement (not just state change)
 # ===========================================================================
 
-def test_proc_mode_button_click_causes_chart_redraw(browser_page, live_web):
-    """Controls: clicking proc-mode-max or proc-mode-rss must trigger a chart destroy+create."""
+def test_proc_mode_button_click_causes_chart_update(browser_page, live_web):
+    """Controls: clicking proc-mode-max updates charts in-place (no destroy+create)."""
     page, errors, _external = browser_page
     page.goto(live_web.url + "/")
     wait_connected(page)
@@ -710,18 +713,19 @@ def test_proc_mode_button_click_causes_chart_redraw(browser_page, live_web):
 
     # Click 'Process max' button
     page.locator('[data-testid="proc-mode-max"]').click()
+    # Wait for render count to increase (in-place update)
     page.wait_for_function(
-        "() => window.__nodeMonitorTest.getChartLifecycle().createCount >= 8",
+        "() => window.__nodeMonitorTest.getChartLifecycle().renders.process >= 2",
         timeout=CONNECTED_TIMEOUT,
     )
 
     lc_after = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
-    assert lc_after["createCount"] == 8, (
-        f"Clicking Process max should trigger 4 more creates (full re-render), "
+    assert lc_after["createCount"] == 4, (
+        f"Clicking Process max should not create new charts (in-place update), "
         f"got createCount={lc_after['createCount']}"
     )
-    assert lc_after["destroyCount"] == 4, (
-        f"Clicking Process max should trigger 4 destroys (destroy-before-replace), "
+    assert lc_after["destroyCount"] == 0, (
+        f"Clicking Process max should not destroy charts (in-place update), "
         f"got destroyCount={lc_after['destroyCount']}"
     )
 
@@ -736,8 +740,8 @@ def test_proc_mode_button_click_causes_chart_redraw(browser_page, live_web):
     assert errors == []
 
 
-def test_mem_mode_gib_click_causes_chart_redraw(browser_page, live_web):
-    """Controls: clicking mem-mode-gib or mem-mode-percent triggers chart redraw."""
+def test_mem_mode_gib_click_causes_chart_update(browser_page, live_web):
+    """Controls: clicking mem-mode-gib triggers in-place chart update."""
     page, errors, _external = browser_page
     page.goto(live_web.url + "/")
     wait_connected(page)
@@ -748,14 +752,15 @@ def test_mem_mode_gib_click_causes_chart_redraw(browser_page, live_web):
 
     # Click GiB button (already selected, but should still re-render to verify binding)
     page.locator('[data-testid="mem-mode-gib"]').click()
+    # Wait for render count to increase (in-place update)
     page.wait_for_function(
-        "() => window.__nodeMonitorTest.getChartLifecycle().createCount >= 8",
+        "() => window.__nodeMonitorTest.getChartLifecycle().renders.memory >= 2",
         timeout=CONNECTED_TIMEOUT,
     )
 
     lc_after = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
-    assert lc_after["createCount"] == 8, (
-        f"Clicking mem-mode-gib should trigger full re-render (4 more creates), "
+    assert lc_after["createCount"] == 4, (
+        f"Clicking mem-mode-gib should not create new charts (in-place update), "
         f"got createCount={lc_after['createCount']}"
     )
 
@@ -801,8 +806,8 @@ def test_d_state_points_exposed_in_chartdata(multi_grain_web):
 # Test 11: Network/Lustre control button clicks cause chart redraw
 # ===========================================================================
 
-def test_nl_lustre_p50_button_click_causes_chart_redraw(browser_page, live_web):
-    """Controls: clicking Lustre p50-sum button changes chart and updates aria-pressed."""
+def test_nl_lustre_p50_button_click_causes_chart_update(browser_page, live_web):
+    """Controls: clicking Lustre p50-sum button updates chart in-place and updates aria-pressed."""
     page, errors, _external = browser_page
     page.goto(live_web.url + "/")
     wait_connected(page)
@@ -812,14 +817,15 @@ def test_nl_lustre_p50_button_click_causes_chart_redraw(browser_page, live_web):
     assert lc_before["createCount"] == 4
 
     page.locator('[data-testid="nl-mode-lustre-p50"]').click()
+    # Wait for render count to increase (in-place update)
     page.wait_for_function(
-        "() => window.__nodeMonitorTest.getChartLifecycle().createCount >= 8",
+        "() => window.__nodeMonitorTest.getChartLifecycle().renders.networkLustre >= 2",
         timeout=CONNECTED_TIMEOUT,
     )
 
     lc_after = page.evaluate("() => window.__nodeMonitorTest.getChartLifecycle()")
-    assert lc_after["createCount"] == 8, (
-        f"Clicking Lustre p50-sum should trigger full re-render, "
+    assert lc_after["createCount"] == 4, (
+        f"Clicking Lustre p50-sum should not create new charts (in-place update), "
         f"got createCount={lc_after['createCount']}"
     )
 

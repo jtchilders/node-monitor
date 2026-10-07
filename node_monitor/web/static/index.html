@@ -7,13 +7,13 @@
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-<div class="dashboard-shell">
-<header class="dashboard-header">
-  <div class="header-identity">
+
+<header class="header-bar" data-testid="header-bar">
+  <div class="header-left">
     <h1><span data-testid="system-name">system</span> Node Monitor</h1>
     <div class="header-node" data-testid="node-name">node</div>
-    <div class="connection-line">
-      <span class="state-dot" aria-hidden="true"></span>
+    <div class="freshness-indicator">
+      <span class="dot" aria-hidden="true"></span>
       <span aria-live="polite" id="connectivity-status"
             data-testid="connectivity-status">Loading…</span>
       <span aria-hidden="true">·</span>
@@ -23,18 +23,20 @@
       </span>
     </div>
   </div>
-  <div class="header-hero">
-    <span class="metric-label">CPU busy p50</span>
-    <strong data-testid="cpu-busy">—</strong>
-  </div>
   <div class="header-stats">
-    <div class="header-stat">
-      <span class="metric-label">Running</span>
-      <strong data-testid="procs-running">—</strong>
+    <div class="stat-item">
+      <span class="label">CPU busy p50</span>
+      <span class="value" data-testid="cpu-busy">—</span>
     </div>
-    <div class="header-stat">
-      <span class="metric-label">Processes</span>
-      <strong data-testid="procs-total">—</strong>
+  </div>
+  <div class="header-right">
+    <div class="stat-item">
+      <span class="label">Running</span>
+      <span class="value" data-testid="procs-running">—</span>
+    </div>
+    <div class="stat-item">
+      <span class="label">Processes</span>
+      <span class="value" data-testid="procs-total">—</span>
     </div>
   </div>
 </header>
@@ -45,62 +47,72 @@
 </div>
 
 <section aria-label="Controls" class="control-panel">
-  <div class="range-buttons" role="group" aria-label="Time range">
-    <button type="button" data-testid="range-btn" data-range="1h">1h</button>
-    <button type="button" data-testid="range-btn" data-range="3h">3h</button>
-    <button type="button" data-testid="range-btn" data-range="6h">6h</button>
-    <button type="button" data-testid="range-btn" data-range="12h">12h</button>
-    <button type="button" data-testid="range-btn" data-range="24h">24h</button>
+  <div class="control-group">
+    <label>Range</label>
+    <div class="btn-group" role="group" aria-label="Time range">
+      <button type="button" data-testid="range-btn" data-range="1h">1h</button>
+      <button type="button" data-testid="range-btn" data-range="3h">3h</button>
+      <button type="button" data-testid="range-btn" data-range="6h">6h</button>
+      <button type="button" data-testid="range-btn" data-range="12h">12h</button>
+      <button type="button" data-testid="range-btn" data-range="24h">24h</button>
+    </div>
   </div>
-  <div id="node-group" class="node-group" role="group" aria-label="Select node"></div>
-  <div id="node-status" aria-live="polite"></div>
-  <form id="user-form" aria-label="Username filter">
-    <label for="user-input">Username</label>
-    <input id="user-input" type="text" data-testid="user-input" placeholder="alice" />
-    <button type="submit" data-testid="user-submit">Filter</button>
-  </form>
+  <div class="control-group">
+    <label>Node</label>
+    <div id="node-group" class="node-group" role="group" aria-label="Select node"></div>
+    <div id="node-status" aria-live="polite"></div>
+  </div>
+  <div class="control-group">
+    <form id="user-form" aria-label="Username filter">
+      <label for="user-input">Username</label>
+      <div style="display:flex;gap:0.4rem">
+        <input id="user-input" type="text" data-testid="user-input" placeholder="alice" />
+        <button type="submit" data-testid="user-submit">Filter</button>
+      </div>
+    </form>
+  </div>
 </section>
 
-<section aria-label="Status cards" class="status-grid">
-  <article data-testid="counter-card" aria-label="Counter status">
+<section aria-label="Status cards" class="stat-grid">
+  <article class="stat-card" data-testid="counter-card" aria-label="Counter status">
     <h2>Counter</h2>
-    <div data-testid="counter-status">—</div>
-    <div data-testid="counter-freshness">—</div>
-    <div data-testid="counter-age">Counter age —</div>
-    <div data-testid="counter-quality">No counter samples in range</div>
+    <div class="stat-value" data-testid="counter-status">—</div>
+    <div class="stat-detail" data-testid="counter-freshness">—</div>
+    <div class="stat-detail" data-testid="counter-age">Counter age —</div>
+    <div class="stat-detail" data-testid="counter-quality">No counter samples in range</div>
   </article>
-  <article data-testid="usage-card" aria-label="Usage status">
+  <article class="stat-card" data-testid="usage-card" aria-label="Usage status">
     <h2>Usage</h2>
-    <div data-testid="usage-status">—</div>
-    <div data-testid="usage-freshness">—</div>
-    <div data-testid="usage-age">Usage age —</div>
-    <div data-testid="username-result">All usernames</div>
+    <div class="stat-value" data-testid="usage-status">—</div>
+    <div class="stat-detail" data-testid="usage-freshness">—</div>
+    <div class="stat-detail" data-testid="usage-age">Usage age —</div>
+    <div class="stat-detail" data-testid="username-result">All usernames</div>
   </article>
-  <article data-testid="poll-card" aria-label="Poll failures">
+  <article class="stat-card" data-testid="poll-card" aria-label="Poll failures">
     <h2>Poll failures</h2>
-    <div data-testid="poll-failures">—</div>
-    <div data-testid="poll-breaker">—</div>
-    <div data-testid="poll-failures-text">—</div>
+    <div class="stat-value" data-testid="poll-failures">—</div>
+    <div class="stat-detail" data-testid="poll-breaker">—</div>
+    <div class="stat-detail" data-testid="poll-failures-text">—</div>
   </article>
-  <article data-testid="mem-card" aria-label="Physical memory">
+  <article class="stat-card" data-testid="mem-card" aria-label="Physical memory">
     <h3>Memory (physical used)</h3>
-    <div data-testid="mem-used">—</div>
-    <div data-testid="mem-note">MemTotal − MemAvailable (incl. kernel/cache)</div>
+    <div class="stat-value" data-testid="mem-used">—</div>
+    <div class="stat-detail" data-testid="mem-note">MemTotal − MemAvailable (incl. kernel/cache)</div>
   </article>
 </section>
 
-<section aria-label="Metric charts" class="metric-grid">
-  <article class="metric-panel" aria-label="CPU and load chart">
-    <div class="panel-header"><h2>CPU / Load</h2></div>
-    <div class="chart-canvas-wrap"><canvas id="chart-cpu" data-testid="chart-cpu" aria-label="CPU p50 p95 max and load1 load5 load15 time series, one minute cadence; separate axes for unlike units"></canvas></div>
-    <table aria-label="CPU/load summary" class="chart-alt">
-      <thead><tr><th>Metric</th><th>Aggregation</th><th>Cadence</th><th>Notes</th></tr></thead>
-      <tbody>
-        <tr><td>CPU busy %</td><td>p50 / p95 / max</td><td>1 min counter</td><td>Counter rows; gap = null not zero; observation-weighted, per-grain, closed interval</td></tr>
-        <tr><td>Load</td><td>load1 / load5 / load15</td><td>1 min counter</td><td>Separate scale (yLoad axis) from CPU %</td></tr>
-        <tr><td>D-state</td><td>per-grain max, contributor + own interval</td><td>15 min usage</td><td>Observation-weighted fraction; not node-wide/time-weighted</td></tr>
-      </tbody>
-    </table>
+<section aria-label="Metric charts" class="chart-grid">
+
+  <!-- CPU / Load -->
+  <article class="panel" aria-label="CPU and load chart">
+    <div class="panel-header">
+      <h2>CPU / Load</h2>
+      <span class="panel-meta" data-testid="cpu-logical-label"></span>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-cpu" data-testid="chart-cpu" aria-label="CPU p50 p95 max and load1 load5 load15 time series, one minute cadence; separate axes for unlike units"></canvas></div>
+    <div class="panel-note">
+      <p>CPU busy %: p50/p95/max from 1-min counter rows (observation-weighted, per-grain, closed interval). Load: separate yLoad axis. Gaps render as line breaks, never zero.</p>
+    </div>
     <details class="chart-note" open>
       <summary>D-state / Interactivity hotspots (15-min intervals)</summary>
       <table data-testid="dstate-hotspot-table" aria-label="D-state and interactivity hotspot table" class="chart-alt">
@@ -120,45 +132,68 @@
       </table>
     </details>
   </article>
-  <article class="metric-panel" aria-label="Memory chart">
-    <div class="panel-header"><h2>Memory (physical)</h2></div>
-    <div class="chart-canvas-wrap"><canvas id="chart-memory" data-testid="chart-memory" aria-label="System used, total memory, and category RSS p50; percent or GiB toggle"></canvas></div>
-    <div class="chart-note"><p>System used = MemTotal − MemAvailable and includes kernel/cache. Total memory is the dotted capacity reference. Category RSS p50 lines are 15-minute, non-additive hotspot grains: they may double-count shared pages and do not reconcile to system-used memory. Missing values remain null.</p></div>
+
+  <!-- Memory -->
+  <article class="panel" aria-label="Memory chart">
+    <div class="panel-header">
+      <h2>Memory (physical)</h2>
+      <div id="mem-controls" data-testid="mem-controls" class="btn-group">
+        <button type="button" data-testid="mem-mode-gib" aria-pressed="true">GiB</button>
+        <button type="button" data-testid="mem-mode-percent" aria-pressed="false">Percent</button>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-memory" data-testid="chart-memory" aria-label="System used, total memory, and category RSS p50; percent or GiB toggle"></canvas></div>
+    <div class="panel-note"><p>System used = MemTotal − MemAvailable and includes kernel/cache. Total memory is the dotted capacity reference. Category RSS p50 lines are 15-minute, non-additive hotspot grains: they may double-count shared pages and do not reconcile to system-used memory.</p></div>
   </article>
-  <article class="metric-panel" aria-label="Process chart">
-    <div class="panel-header"><h2>Process</h2></div>
-    <div class="chart-canvas-wrap"><canvas id="chart-process" data-testid="chart-process" aria-label="CPU sum (additive) or per-username-grain max process count / RSS with contributor"></canvas></div>
-    <table aria-label="Process summary" class="chart-alt">
-      <thead><tr><th>Mode</th><th>Metric</th><th>Contributor</th></tr></thead>
-      <tbody>
-        <tr><td>CPU sum</td><td>additive cpu_seconds, 15-min closed interval</td><td>sum across grains</td></tr>
-        <tr><td>Process max</td><td>process_count max per grain</td><td>independent username (process_count_max_username)</td></tr>
-        <tr><td>grain total RSS</td><td>rss_max_kb per grain</td><td>independent username (rss_max_username)</td></tr>
-      </tbody>
-    </table>
-    <div class="chart-note"><p>15-minute closed interval; process-sample observation denominator shown in tooltip.</p></div>
+
+  <!-- Process -->
+  <article class="panel" aria-label="Process chart">
+    <div class="panel-header">
+      <h2>Process</h2>
+      <div id="proc-controls" data-testid="proc-controls" class="btn-group">
+        <button type="button" data-testid="proc-mode-cpusum" aria-pressed="true">CPU sum</button>
+        <button type="button" data-testid="proc-mode-max" aria-pressed="false">Process max</button>
+        <button type="button" data-testid="proc-mode-rss" aria-pressed="false">Grain total RSS</button>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-process" data-testid="chart-process" aria-label="CPU sum (additive) or per-username-grain max process count / RSS with contributor"></canvas></div>
+    <div class="panel-note"><p>15-minute closed interval; process-sample observation denominator shown in tooltip.</p></div>
   </article>
-  <article class="metric-panel" aria-label="Network and Lustre chart">
-    <div class="panel-header"><h2>Network / Lustre</h2></div>
-    <div class="chart-canvas-wrap"><canvas id="chart-network-lustre" data-testid="chart-network-lustre" aria-label="Network RX/TX per interface (no loopback lo); Lustre p50-sum p95-sum peak-sum"></canvas></div>
-    <div class="chart-note"><p>Loopback (lo) excluded. Lustre p50-sum: sum of per-target p50 values. Lustre p95-sum: sum of per-target p95 values. Lustre peak-sum (max_sum): sum of per-target maxima — not instantaneous/global peak. Target count shown per operation. Statistic: p50-sum / p95-sum / peak-sum (max_sum).</p></div>
+
+  <!-- Network / Lustre -->
+  <article class="panel" aria-label="Network and Lustre chart">
+    <div class="panel-header">
+      <h2>Network / Lustre</h2>
+      <div id="nl-controls" data-testid="nl-controls" class="btn-group">
+        <button type="button" data-testid="nl-network-p50" aria-pressed="true">Net p50</button>
+        <button type="button" data-testid="nl-network-p95" aria-pressed="false">Net p95</button>
+        <button type="button" data-testid="nl-network-max" aria-pressed="false">Net max</button>
+        <button type="button" data-testid="nl-mode-lustre-p50" aria-pressed="false">Lustre p50</button>
+        <button type="button" data-testid="nl-mode-lustre-p95" aria-pressed="false">Lustre p95</button>
+        <button type="button" data-testid="nl-mode-lustre-peak" aria-pressed="false">Lustre peak</button>
+        <button type="button" data-testid="nl-mode-lustre-targets" aria-pressed="false">Lustre tgt</button>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-network-lustre" data-testid="chart-network-lustre" aria-label="Network RX/TX per interface (no loopback lo); Lustre p50-sum p95-sum peak-sum"></canvas></div>
+    <div class="panel-note"><p>Loopback (lo) excluded. Lustre p50-sum: sum of per-target p50 values. Lustre peak-sum (max_sum): sum of per-target maxima — not instantaneous/global peak. Target count shown per operation.</p></div>
   </article>
+
 </section>
 
 <section aria-label="Subordinate context" class="detail-panel">
-  <article data-testid="usage-hotspot-card" aria-label="Usage hotspot" class="current-context-panel">
-    <h3>D-state hotspot (15m)</h3>
-    <div data-testid="d-state">—</div>
-    <div data-testid="usage-timestamp">—</div>
-    <div data-testid="usage-username">—</div>
-    <div data-testid="newest-timestamp">—</div>
-    <div data-testid="current-node">—</div>
-    <div data-testid="current-range">—</div>
-    <div data-testid="current-username">—</div>
-    <div data-testid="hardware-context">—</div>
-    <div>load1 <span data-testid="load1">—</span></div>
-    <div>load5 <span data-testid="load5">—</span></div>
-    <div>load15 <span data-testid="load15">—</span></div>
+  <article data-testid="usage-hotspot-card" aria-label="Usage hotspot">
+    <h3 style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.04em;color:var(--text-dim);font-weight:600;margin-bottom:0.5rem">Context</h3>
+    <div class="stat-detail">D-state hotspot (15m): <span data-testid="d-state">—</span></div>
+    <div class="stat-detail" data-testid="usage-timestamp">—</div>
+    <div class="stat-detail" data-testid="usage-username">—</div>
+    <div class="stat-detail" data-testid="newest-timestamp">—</div>
+    <div class="stat-detail" data-testid="current-node">—</div>
+    <div class="stat-detail" data-testid="current-range">—</div>
+    <div class="stat-detail" data-testid="current-username">—</div>
+    <div class="stat-detail" data-testid="hardware-context">—</div>
+    <div class="stat-detail">load1 <span data-testid="load1">—</span></div>
+    <div class="stat-detail">load5 <span data-testid="load5">—</span></div>
+    <div class="stat-detail">load15 <span data-testid="load15">—</span></div>
   </article>
 </section>
 
@@ -166,7 +201,6 @@
   <button type="button" data-testid="retry-btn" id="retry-btn">Retry connection</button>
 </section>
 
-</div>
 <script src="/static/chart.umd.min.js"></script>
 <script src="/static/app.js"></script>
 </body>

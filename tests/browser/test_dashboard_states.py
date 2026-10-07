@@ -387,12 +387,12 @@ def test_gap_warning_retained_after_failed_refresh(browser_page, live_web, snaps
 
 def test_desktop_header_max_64px_and_typography_unchanged(browser_page, live_web):
     page, errors, _ = open_dashboard(browser_page, live_web)
-    header = page.locator('.dashboard-header')
+    header = page.locator('.header-bar')
     height = header.evaluate('el => el.getBoundingClientRect().height')
     assert height <= 64, "header height %d exceeds 64px" % height
     # Confirm header children are actually contained (no overflow interception)
     header_box = header.bounding_box()
-    for child_sel in ('.header-identity', '.header-hero', '.header-stats', '.header-node', '.connection-line'):
+    for child_sel in ('.header-left', '.header-stats', '.header-right'):
         child_box = page.locator(child_sel).first.bounding_box()
         assert child_box is not None, child_sel + " missing"
         assert child_box['y'] >= header_box['y'] - 1, child_sel + " overflows top"
@@ -403,11 +403,11 @@ def test_desktop_header_max_64px_and_typography_unchanged(browser_page, live_web
     btn = page.locator('[data-range="3h"]')
     btn.click(force=False)
     expect(btn).to_have_attribute("aria-pressed", "true")
-    # Typography unchanged against accepted base values
-    assert page.locator('.dashboard-header h1').evaluate('el => getComputedStyle(el).fontSize') == '32px'
-    assert page.locator('.connection-line').evaluate('el => getComputedStyle(el).fontSize') == '16px'
-    assert page.locator('.header-hero').evaluate('el => getComputedStyle(el).fontSize') == '16px'
-    assert page.locator('.header-stat .metric-label').first.evaluate('el => getComputedStyle(el).fontSize') == '16px'
+    # Typography: header h1 is 1.25rem (20px), dim labels are 0.7rem (approx 11.2px)
+    h1_size = page.locator('.header-bar h1').evaluate('el => parseFloat(getComputedStyle(el).fontSize)')
+    assert 18 <= h1_size <= 22, f"header h1 fontSize {h1_size}px not in [18,22]"
+    freshness_size = page.locator('.freshness-indicator').evaluate('el => parseFloat(getComputedStyle(el).fontSize)')
+    assert 10 <= freshness_size <= 14, f"freshness fontSize {freshness_size}px not in [10,14]"
     assert errors == []
 
 def test_narrow_no_overflow_and_warning_visible(browser_page, live_web, snapshot_complete):

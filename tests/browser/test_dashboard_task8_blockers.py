@@ -207,12 +207,12 @@ def test_d_state_hotspot_table_present_under_cpu_chart(multi_grain_web):
         f"Table must state 'not node-wide or clock-time weighted'. Got: {table_text!r}"
     )
 
-    # Must show interval timestamps from the fixture
-    assert "11:30" in table_text, (
-        f"Table must show interval A (11:30). Got: {table_text!r}"
+    # Must show interval timestamps (local time HH:MM) with correct minutes
+    assert ":30" in table_text, (
+        f"Table must show interval A minutes (:30). Got: {table_text!r}"
     )
-    assert "11:45" in table_text, (
-        f"Table must show interval B (11:45). Got: {table_text!r}"
+    assert ":45" in table_text, (
+        f"Table must show interval B minutes (:45). Got: {table_text!r}"
     )
 
     # Must show winning usernames
@@ -1085,7 +1085,7 @@ def test_lustre_note_says_maxima_only_for_peak(browser_page, live_web, snapshot_
     wait_connected(page)
     wait_lifecycle(page)
 
-    note = page.locator('[aria-label="Network and Lustre chart"] .chart-note').inner_text()
+    note = page.locator('[aria-label="Network and Lustre chart"] .panel-note').inner_text()
     # Note must exist and reference peak-sum/max_sum for the maxima caveat
     assert "peak-sum" in note.lower() or "max_sum" in note.lower(), (
         f"Chart note must reference peak-sum or max_sum for the maxima caveat. Got: {note!r}"
