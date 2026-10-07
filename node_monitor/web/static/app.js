@@ -1039,6 +1039,7 @@
                spanGaps: false,
                pointStyle: 'circle',
                pointRadius: 4,
+               yAxisID: 'y',
                fill: false,
             },
             {
@@ -1050,6 +1051,7 @@
                spanGaps: false,
                pointStyle: false,
                pointRadius: 0,
+               yAxisID: 'y',
                fill: false,
             },
          ];
@@ -1063,6 +1065,7 @@
                spanGaps: false,
                pointStyle: 'circle',
                pointRadius: 3,
+               yAxisID: 'yCategory',
                fill: false,
             });
          });
@@ -1079,7 +1082,17 @@
                scales: {
                   y: {
                      beginAtZero: true,
-                     title: { display: true, text: yLabel },
+                     position: 'left',
+                     title: { display: true, text: 'System memory (' + yLabel + ')' },
+                  },
+                  yCategory: {
+                     beginAtZero: true,
+                     position: 'right',
+                     grid: { drawOnChartArea: false },
+                     title: {
+                        display: true,
+                        text: 'Category RSS p50 (' + yLabel + ', non-additive)',
+                     },
                   },
                },
                plugins: {
@@ -1105,10 +1118,21 @@
                   borderDash: (ds.borderDash || []).slice(),
                   pointStyle: ds.pointStyle,
                   pointRadius: ds.pointRadius == null ? null : ds.pointRadius,
+                  yAxisID: ds.yAxisID,
                   fill: ds.fill,
                   spanGaps: ds.spanGaps,
                };
             }),
+            axes: {
+               y: {
+                  title: 'System memory (' + yLabel + ')',
+                  position: 'left',
+               },
+               yCategory: {
+                  title: 'Category RSS p50 (' + yLabel + ', non-additive)',
+                  position: 'right',
+               },
+            },
          };
 
          // Re-bind toggle handlers each time (buttons may be recreated)
@@ -1504,6 +1528,7 @@
                   mode: chartRenderState.memory.mode,
                   labels: chartRenderState.memory.labels,
                   datasets: chartRenderState.memory.datasets,
+                  axes: chartRenderState.memory.axes,
                },
                process: {
                   mode: chartRenderState.process.mode,

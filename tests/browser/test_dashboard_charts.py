@@ -266,8 +266,15 @@ def test_memory_category_rss_p50_groups_by_category_and_uses_max_activity(
     assert by_label["System used (GiB)"]["pointStyle"] == "circle"
     assert by_label["System used (GiB)"]["pointRadius"] == 4
     assert by_label["System used (GiB)"]["borderDash"] == []
+    assert by_label["System used (GiB)"]["yAxisID"] == "y"
     assert by_label["Total memory (GiB)"]["borderDash"] == [4, 4]
     assert by_label["Total memory (GiB)"]["pointRadius"] == 0
+    assert by_label["Total memory (GiB)"]["yAxisID"] == "y"
+    assert by_label["interactive RSS p50 (non-additive)"]["yAxisID"] == "yCategory"
+    assert by_label["batch RSS p50 (non-additive)"]["yAxisID"] == "yCategory"
+    assert state["axes"]["y"]["title"] == "System memory (GiB)"
+    assert state["axes"]["yCategory"]["title"] == "Category RSS p50 (GiB, non-additive)"
+    assert state["axes"]["yCategory"]["position"] == "right"
     assert by_label["interactive RSS p50 (non-additive)"]["data"] == [
         153600 / (1024 * 1024), *([None] * 14), 81920 / (1024 * 1024),
     ]
