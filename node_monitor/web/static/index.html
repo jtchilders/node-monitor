@@ -111,7 +111,7 @@
     </div>
     <div class="chart-wrap"><canvas id="chart-cpu" data-testid="chart-cpu" aria-label="CPU p50 p95 max and load1 load5 load15 time series, one minute cadence; separate axes for unlike units"></canvas></div>
     <div class="panel-note">
-      <p>CPU busy %: p50/p95/max from 1-min counter rows (observation-weighted, per-grain, closed interval). Load: separate yLoad axis. Gaps render as line breaks, never zero.</p>
+      <p>CPU busy %: p50/p95/max from 1-min counter rows (observation-weighted, per-grain, closed interval). Load: separate yLoad axis. Gaps render as line breaks, never zero. <strong>Click a data point</strong> to see the per-user usage breakdown for the nearest 15-minute interval.</p>
     </div>
     <details class="chart-note" open>
       <summary>D-state / Interactivity hotspots (15-min intervals)</summary>
@@ -131,6 +131,26 @@
         </tbody>
       </table>
     </details>
+    <div id="cpu-drill-panel" class="cpu-drill-panel" hidden>
+      <div class="drill-header">
+        <span id="drill-title">Usage breakdown</span>
+        <button type="button" id="drill-close" aria-label="Close">&times;</button>
+      </div>
+      <table class="chart-alt" data-testid="cpu-drill-table">
+        <thead>
+          <tr>
+            <th>Username</th>
+            <th>Category</th>
+            <th>Activity</th>
+            <th>CPU sec</th>
+            <th>Proc max</th>
+            <th>RSS max</th>
+            <th>D-state</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </article>
 
   <!-- Memory -->

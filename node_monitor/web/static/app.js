@@ -970,6 +970,12 @@
          lustreTargetCount: lustreTargetCount,
          counterGaps: counters.gaps || {},
          usageGaps: usage.gaps || {},
+         // Counter timeline mapping for click drill-down
+         _counterTimeline: {
+            rowIndices: rowIndices,
+            windowEnds: sortedRows.map(function(r) { return r.window_end; }),
+            intervalEnds: sortedIntervalEnds,
+         },
          // Lifecycle snapshot at build time (read-only copy)
          _lifecycle: {
             createCount: chartLifecycle.createCount,
@@ -1015,6 +1021,125 @@
       if (tbody) {
          tbody.innerHTML = rows;
       }
+   }
+
+   // ---- CPU click-to-drill-down ----
+   var lastChartInput = null;
+   var lastDrillIntervalEnd = null;
+
+   function closeDrillDown() {
+      var panel = qs('#cpu-drill-panel');
+      if (panel) panel.hidden = true;
+      lastDrillIntervalEnd = null;
+   }
+
+   function renderDrillDown(intervalEnd, grains) {
+      var panel = qs('#cpu-drill-panel');
+      if (!panel) return;
+
+      // Toggle off if clicking the same interval again
+      if (lastDrillIntervalEnd === intervalEnd) {
+         closeDrillDown();
+         return;
+      }
+      lastDrillIntervalEnd = intervalEnd;
+
+      // Title
+      qs('#drill-title').textContent =
+         'Usage breakdown — interval ending ' + formatTimeLabel(intervalEnd);
+
+      // Sort grains by cpu_seconds descending
+      var sorted = grains.slice().sort(function(a, b) {
+         var aVal = a.cpu_seconds != null ? a.cpu_seconds : 0;
+         var bVal = b.cpu_seconds != null ? b.cpu_seconds : 0;
+         return bVal - aVal;
+      });
+
+      var rows = '';
+      for (var i = 0; i < sorted.length; i++) {
+         var g = sorted[i];
+         var cpuSec = g.cpu_seconds != null ? g.cpu_seconds.toFixed(1) : '-';
+         var procMax = g.process_count_max != null ? String(g.process_count_max) : '-';
+         var rssMaxKb = g.rss_max_kb != null ? g.rss_max_kb : null;
+         var rssText = '-';
+         if (rssMaxKb != null) {
+            rssText = rssMaxKb >= 1048576
+               ? (rssMaxKb / 1048576).toFixed(2) + ' GiB'
+               : (rssMaxKb / 1024).toFixed(1) + ' MiB';
+         }
+         var dState = g.d_state_fraction != null
+            ? (g.d_state_fraction * 100).toFixed(1) + '%' : '-';
+         var user = g.process_count_max_username
+            || g.rss_max_username || g.d_state_username || '-';
+         rows += '<tr>'
+            + '<td>' + user + '</td>'
+            + '<td>' + (g.category || '-') + '</td>'
+            + '<td>' + (g.activity || '-') + '</td>'
+            + '<td>' + cpuSec + '</td>'
+            + '<td>' + procMax + '</td>'
+            + '<td>' + rssText + '</td>'
+            + '<td>' + dState + '</td>'
+            + '</tr>';
+      }
+      if (sorted.length === 0) {
+         rows = '<tr><td colspan="7">No usage grains for this interval</td></tr>';
+      }
+
+      var tbody = panel.querySelector('tbody');
+      if (tbody) tbody.innerHTML = rows;
+      panel.hidden = false;
+      panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+   }
+
+   function handleCpuClick(evt, elements) {
+      if (!elements || !elements.length || !lastChartInput) {
+         closeDrillDown();
+         return;
+      }
+      var idx = elements[0].index;
+      var timeline = lastChartInput._counterTimeline;
+
+      // Map clicked label index to a counter row
+      var rowIdx = timeline.rowIndices[idx];
+      if (rowIdx === null || rowIdx === undefined) {
+         closeDrillDown(); // clicked a gap
+         return;
+      }
+
+      // Get the full ISO timestamp of the clicked counter window
+      var windowEnd = timeline.windowEnds[rowIdx];
+      if (!windowEnd) { closeDrillDown(); return; }
+      var windowMs = new Date(windowEnd).getTime();
+      if (!Number.isFinite(windowMs)) { closeDrillDown(); return; }
+
+      // Find the nearest usage interval_end
+      var intervalEnds = timeline.intervalEnds;
+      if (!intervalEnds || intervalEnds.length === 0) {
+         closeDrillDown();
+         return;
+      }
+      var bestEnd = intervalEnds[0];
+      var bestDist = Math.abs(windowMs - new Date(intervalEnds[0]).getTime());
+      for (var i = 1; i < intervalEnds.length; i++) {
+         var dist = Math.abs(windowMs - new Date(intervalEnds[i]).getTime());
+         if (dist < bestDist) {
+            bestDist = dist;
+            bestEnd = intervalEnds[i];
+         }
+      }
+
+      // Filter grains to the matched interval
+      var grains = (lastChartInput.processGrains || []).filter(function(g) {
+         return g.interval_end === bestEnd;
+      });
+
+      renderDrillDown(bestEnd, grains);
+   }
+
+   // Bind close button once
+   var drillCloseBtn = qs('#drill-close');
+   if (drillCloseBtn) {
+      drillCloseBtn.addEventListener('click', closeDrillDown);
    }
 
    // ---- Chart rendering ----
@@ -1072,6 +1197,7 @@
    function renderCharts(snapshot) {
       const input = buildChartData(snapshot);
       const totalKb = input.memoryTotalKb;
+      lastChartInput = input;
 
       // Bind toggle handlers once
       ensureControlHandlers();
@@ -1191,39 +1317,42 @@
          ? 'Load avg (' + cpuLogical + ' CPUs = saturation)'
          : 'Load avg';
 
+      var cpuOptions = pbsChartOptions(
+         {
+            y: pbsScaleDefaults({
+               beginAtZero: true,
+               type: 'linear',
+               display: true,
+               position: 'left',
+               title: { display: true, text: 'CPU %', color: TICK_COLOR },
+            }),
+            yLoad: pbsScaleDefaults({
+               beginAtZero: true,
+               type: 'linear',
+               display: true,
+               position: 'right',
+               grid: { drawOnChartArea: false },
+               title: { display: true, text: loadAxisTitle, color: TICK_COLOR },
+            }),
+            x: pbsScaleDefaults({
+               ticks: { color: TICK_COLOR, maxRotation: 45 },
+            }),
+         },
+         function(c) {
+            if (c.raw === null) return c.dataset.label + ': (gap/null)';
+            const unit = c.dataset.yAxisID === 'yLoad' ? '' : '%';
+            return c.dataset.label + ': ' + c.raw + unit;
+         }
+      );
+      cpuOptions.onClick = handleCpuClick;
+
       renderOrUpdateChart('cpu', 'chart-cpu', {
          type: 'line',
          data: {
             labels: input.cpu.labels,
             datasets: cpuDatasets,
          },
-         options: pbsChartOptions(
-            {
-               y: pbsScaleDefaults({
-                  beginAtZero: true,
-                  type: 'linear',
-                  display: true,
-                  position: 'left',
-                  title: { display: true, text: 'CPU %', color: TICK_COLOR },
-               }),
-               yLoad: pbsScaleDefaults({
-                  beginAtZero: true,
-                  type: 'linear',
-                  display: true,
-                  position: 'right',
-                  grid: { drawOnChartArea: false },
-                  title: { display: true, text: loadAxisTitle, color: TICK_COLOR },
-               }),
-               x: pbsScaleDefaults({
-                  ticks: { color: TICK_COLOR, maxRotation: 45 },
-               }),
-            },
-            function(c) {
-               if (c.raw === null) return c.dataset.label + ': (gap/null)';
-               const unit = c.dataset.yAxisID === 'yLoad' ? '' : '%';
-               return c.dataset.label + ': ' + c.raw + unit;
-            }
-         ),
+         options: cpuOptions,
       });
       chartRenderState.cpu = {
          mode: 'cpu',

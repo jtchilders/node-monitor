@@ -503,6 +503,47 @@ details.chart-note summary {
 
 details.chart-note summary:hover { color: var(--text-color); }
 
+/* ── CPU drill-down panel ─────────────────────────────────────────────── */
+
+.cpu-drill-panel {
+    margin: 0 1rem 0.75rem;
+    padding: 0.6rem 0.8rem 0.5rem;
+    border-top: 1px solid var(--accent-border);
+    border-left: 3px solid var(--accent-blue);
+    background: rgba(59, 130, 246, 0.04);
+    border-radius: 0 0 6px 6px;
+}
+
+.cpu-drill-panel[hidden] { display: none; }
+
+.drill-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.4rem;
+}
+
+.drill-header span {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-color);
+}
+
+.drill-header button {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 1.1rem;
+    cursor: pointer;
+    padding: 0 0.3rem;
+    line-height: 1;
+    transition: color 0.15s;
+}
+
+.drill-header button:hover { color: var(--text-color); }
+
+#chart-cpu { cursor: pointer; }
+
 /* ── Retry ─────────────────────────────────────────────────────────────── */
 
 #retry-section {
