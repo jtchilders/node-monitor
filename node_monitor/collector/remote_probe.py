@@ -230,6 +230,37 @@ _ACTIVITY_RULES = [
       r"(^|/)(rsync|scp|sftp|globus|globus-url-copy|curl|wget)( |$)"), 10),
    ("filesystem-scan", re.compile(r"(^|/)(find|du|ncdu|updatedb)( |$)"), 10),
    ("pbs-query", re.compile(r"(^|/)(qstat|qsub|qdel|pbsnodes)( |$)"), 10),
+   # -- HPC workflow managers / middleware ------------------------------------
+   ("globus-compute", re.compile(
+      r"globus-compute-endpoint|globus.compute|gc_submit|gc-ctrl"), 10),
+   ("balsam", re.compile(r"(^|/)balsam( |$)|-m\s+balsam\."), 10),
+   ("parsl", re.compile(r"(^|/)parsl( |$)|-m\s+parsl\."), 10),
+   ("argo", re.compile(
+      r"argo-shim|argo-proxy|argo.bridge|ARGO_BRIDGE_SOCK"), 10),
+   # -- Services / daemons visible on login nodes ----------------------------
+   ("postgres", re.compile(r"(^|/)postgres( |$)|postmaster"), 10),
+   ("dbus", re.compile(r"dbus-daemon|dbus-launch|dbus-session"), 10),
+   ("fail2ban", re.compile(r"fail2ban-server|fail2ban"), 10),
+   ("ssh-agent", re.compile(r"(^|/)ssh-agent( |$)"), 10),
+   ("sleep", re.compile(r"(^|/)sleep( |$)"), 10),
+   # -- Python sub-categories: specific tools first, then heuristic ----------
+   ("pytest", re.compile(r"-m\s+pytest\b"), 10),
+   ("reuse-lint", re.compile(r"-m\s+reuse\b"), 10),
+   ("python-http-server", re.compile(
+      r"-m\s+http\.server|preview_server|serve_boards|"
+      r"helios_preview_server|nxserver"), 10),
+   ("starccm", re.compile(r"-m\s+starserver|STAR-CCM"), 10),
+   ("python-training", re.compile(
+      r"(^|[/ ])train\.py( |$)|train_.*\.py|"
+      r"finetune|fine.tune"), 10),
+   ("python-inference", re.compile(
+      r"(^|[/ ])infer\.py( |$)|infer_.*\.py|"
+      r"(^|[/ ])predict\.py( |$)|generat.*\.py|"
+      r"(^|[/ ])boltz( |$)"), 10),
+   # -- Catch-all for Python processes not matched above ----------------------
+   ("python-generic", re.compile(
+      r"(^|/)python[0-9.]*( |$)"), 5),
+   # -- Basic process types --------------------------------------------------
    ("shell", _SHELL_RE, 10),
    ("ssh-session", re.compile(r"(^|/)sshd( |:|$)"), 10),
    ("terminal-multiplexer", _MULTIPLEXER_RE, 10),
