@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 dependencies = ["click>=8.1", "pyyaml>=6.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
 
 [project.scripts]
 node-monitor = "node_monitor.cli.main:cli"
@@ -37,3 +37,5 @@ select = ["E", "F", "W", "I", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
