@@ -19,10 +19,17 @@ node-monitor = "node_monitor.cli.main:cli"
 [tool.setuptools.packages.find]
 include = ["node_monitor*"]
 
+[tool.setuptools.package-data]
+"node_monitor.probe" = ["probe.py"]
+
 [tool.ruff]
 indent-width = 3
 line-length = 100
 target-version = "py310"
+extend-exclude = ["docs"]
+
+[tool.ruff.format]
+docstring-code-format = false
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B"]
