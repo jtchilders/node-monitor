@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "node-monitor"
+version = "0.1.0"
+description = "Login-node monitor for ALCF systems"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["click>=8.1", "pyyaml>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+node-monitor = "node_monitor.cli.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["node_monitor*"]
+
+[tool.ruff]
+indent-width = 3
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

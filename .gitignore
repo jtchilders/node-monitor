@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+*.log
+config.yaml
+*.local.yaml
+.superpowers/

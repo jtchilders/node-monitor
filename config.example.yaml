@@ -1,0 +1,50 @@
+# node-monitor configuration. Search order: --config PATH, $NODE_MONITOR_CONFIG,
+# ~/.node_monitor.yaml, ~/.config/node_monitor/config.yaml
+system: polaris
+nodes:                               # host = node identity; ssh_target = how to reach it
+  - host: polaris-login-01.hsn.cm.polaris.alcf.anl.gov
+    label: login-01
+    ssh_target: polaris-login-01.head  # optional; defaults to host
+  - host: polaris-login-02.hsn.cm.polaris.alcf.anl.gov
+    label: login-02
+    ssh_target: polaris-login-02.head
+  - host: polaris-login-04.hsn.cm.polaris.alcf.anl.gov
+    label: login-04
+    ssh_target: polaris-login-04.head
+ssh:
+  identity_file: ~/.ssh/id_ed25519_polaris   # optional; written into the project ssh_config
+  connect_timeout_sec: 10
+probe_python: /usr/bin/python3.11
+working_dir: ~/node-monitor          # logs/ and state/ live here
+
+# The sections below take effect in M1+; M0 accepts and ignores them.
+database:
+  url: postgresql://node_monitor_owner@host:port/node_monitor
+web:
+  database_url: postgresql://node_monitor_reader@host:port/node_monitor
+  host: 127.0.0.1
+  port: 9998
+
+collection:
+  counter_interval_sec: 10
+  census_interval_sec: 60
+  summary_interval_sec: 300          # M1+
+  hourly_census: true                # M1+
+  session_silence_timeout_sec: 30
+  session_max_lifetime_sec: 21600
+  reconnect_backoff_sec: [5, 300]
+classification:
+  min_user_uid: 1000                 # M1+
+  active_cpu_seconds_per_min: 0.1
+  notable_cpu_seconds_per_min: 3.0   # M1+; about 5% of one core
+  notable_rss_mb: 1024               # M1+
+redaction:
+  extra_patterns: []                 # appended to built-in rules
+retention:
+  process_samples_days: 30
+  node_metrics_days: 730
+  usage_summary_days: 730
+  command_lines_days: 730            # measured from last_seen
+  collection_events_days: 180
+spool:
+  max_bytes: 1073741824
