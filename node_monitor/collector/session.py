@@ -44,7 +44,9 @@ class NodeSession:
 
    - ``spawn_failed``: the ssh binary could not be executed (OSError on spawn).
    - ``exit``: stdout reached EOF and the process exited within a short grace;
-     `exit_code` is its own status (255 is ssh failing to connect or authenticate).
+     `exit_code` is its own status (255 is ssh failing to connect or authenticate;
+     ssh passes on the probe's status, so 143, 129 or 130 after an `error` message
+     with where "signal" is the probe being killed on the node).
    - ``eof``: stdout reached EOF but the process was still running after the grace.
    - ``silence``: no line at all for `silence_timeout` seconds.
 
@@ -139,7 +141,9 @@ class NodeSession:
       started = time.monotonic()
       ended = started
       self._proc = proc
-      self._event("session_started", {"attempt": attempt})
+      # The pid lets an operator target this session's ssh client (not a shared
+      # ControlPersist master) when injecting faults.
+      self._event("session_started", {"attempt": attempt, "pid": proc.pid})
       stderr_log = _StderrLog(lambda detail: self._event("probe_stderr", detail))
       drainer = asyncio.create_task(_drain(proc.stderr, stderr_log))
       feeder = asyncio.create_task(self._feed(proc.stdin))

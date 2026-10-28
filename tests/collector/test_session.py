@@ -173,7 +173,7 @@ async def wait_gone(pid, timeout):
 async def test_streams_messages(tmp_path):
    msgs, events = await run_until(make_session(tmp_path), lambda m, e: count(m, "census") >= 2, 10)
    assert msgs[0]["type"] == "hello" and events[0][1] == "session_started"
-   assert events[0][2] == {"attempt": 1}
+   assert events[0][2]["attempt"] == 1
    assert count(msgs, "counters") >= 1
    assert not details(events, "session_lost")
 
@@ -188,8 +188,28 @@ async def test_reconnects_after_ssh_process_is_killed(tmp_path):
    events = rig.events
    assert reasons(events, "session_lost")[0] in ("eof", "exit")
    assert count_events(events, "session_started") >= 2
-   assert details(events, "session_started")[1] == {"attempt": 2}
+   assert details(events, "session_started")[1]["attempt"] == 2
    assert details(events, "reconnect_wait")[0]["failures"] == 1
+
+
+async def test_session_started_names_the_ssh_client_pid(tmp_path):
+   rig = make_session(tmp_path)
+   async with rig:
+      await rig.wait(lambda m, e: count(m, "hello") >= 1, 10)
+      started = details(rig.events, "session_started")[0]
+      assert started == {"attempt": 1, "pid": rig.session.current_pid}
+
+
+async def test_remote_probe_sigterm_is_attributed(tmp_path):
+   rig = make_session(tmp_path, backoff=(30, 30))
+   async with rig:
+      await rig.wait(lambda m, e: count(m, "census") >= 1, 10)
+      os.kill(hello_pids(rig.msgs)[0], signal.SIGTERM)
+      await rig.wait(lambda m, e: count_events(e, "session_lost") >= 1, 10)
+   errors = [m for m in rig.msgs if m["type"] == "error"]
+   assert errors and errors[-1]["where"] == "signal" and "SIGTERM" in errors[-1]["message"]
+   lost = first_lost(rig.events)
+   assert lost["reason"] == "exit" and lost["exit_code"] == 143
 
 
 async def test_silence_timeout_kills_and_reconnects(tmp_path):

@@ -8,13 +8,15 @@ from pathlib import Path
 
 import click
 
-from node_monitor.collector.soak import run_soak, summarize
+from node_monitor.collector.soak import make_private_dir, run_soak, summarize
 from node_monitor.config import ConfigError, load_config
 
 COLUMNS = (
    "node",
    "hours",
    "coverage%",
+   "census%",
+   "errors",
    "max_gap_s",
    "sessions",
    "losses",
@@ -49,8 +51,9 @@ def soak_run(config_path, duration_hours, full_census, out_dir) -> None:
       raise click.ClickException(str(exc)) from exc
    if out_dir is None:
       stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-      out_dir = config.working_dir / "logs" / "soak" / stamp
-   out_dir.mkdir(parents=True, exist_ok=True)
+      # The soak tree is ours alone, so it is made owner-only even if it already exists.
+      out_dir = make_private_dir(config.working_dir / "logs" / "soak") / stamp
+   make_private_dir(out_dir)
    click.echo(f"recording to {out_dir}")
    duration = None if duration_hours is None else duration_hours * 3600
    sys.exit(asyncio.run(run_soak(config, out_dir, duration, full_census=full_census)))
@@ -66,6 +69,8 @@ def _row(label: str, s: dict) -> list[str]:
       label,
       _fmt(s["hours"], ".2f"),
       _fmt(s["coverage_pct"], ".1f"),
+      _fmt(s["census_coverage_pct"], ".1f"),
+      str(sum(s["errors_by_where"].values())),
       _fmt(s["max_gap_sec"], ".0f"),
       str(s["sessions_started"]),
       str(losses),
