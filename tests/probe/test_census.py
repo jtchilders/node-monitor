@@ -1,3 +1,4 @@
+import json
 import time
 
 from tests.probe import fake_proc
@@ -166,7 +167,172 @@ def test_gpu_query_missing_binary_is_silent(probe, monkeypatch, tmp_path):
 
 def test_gpu_query_failure_returns_empty(probe, fake_bin):
    fake_bin("nvidia-smi", "echo boom >&2; exit 1")
-   assert probe.query_gpus() == ([], {}, "nvidia-smi exit 1")
+   assert probe.query_gpus() == ([], {}, "nvidia-smi exit 1: boom")
+
+
+def test_gpu_query_failure_message_carries_first_stderr_line(probe, fake_bin):
+   fake_bin(
+      "nvidia-smi",
+      "printf '\\nFailed to initialize NVML: Unknown Error\\nsecond line\\n' >&2; exit 255",
+   )
+   _, _, err = probe.query_gpus()
+   assert err == "nvidia-smi exit 255: Failed to initialize NVML: Unknown Error"
+
+
+def test_gpu_query_failure_falls_back_to_stdout_when_stderr_is_empty(probe, fake_bin):
+   # Real nvidia-smi prints the NVML init failure on stdout.
+   fake_bin("nvidia-smi", "echo 'Failed to initialize NVML: Unknown Error'; exit 255")
+   _, _, err = probe.query_gpus()
+   assert err == "nvidia-smi exit 255: Failed to initialize NVML: Unknown Error"
+
+
+def test_gpu_query_failure_detail_is_truncated(probe, fake_bin):
+   fake_bin("nvidia-smi", "printf '%0300d\\n' 0 >&2; exit 3")
+   _, _, err = probe.query_gpus()
+   assert err == "nvidia-smi exit 3: " + "0" * 200
+
+
+def test_gpu_query_failure_without_output_has_bare_message(probe, fake_bin):
+   fake_bin("nvidia-smi", "exit 4")
+   assert probe.query_gpus()[2] == "nvidia-smi exit 4"
+
+
+# --------------------------------------------------------------------------
+# Census GPU status and suspension (in-process, against a fake nvidia-smi)
+# --------------------------------------------------------------------------
+
+
+class _Lines(object):
+   """A text sink without a fileno, so the emitter writes through write()."""
+
+   def __init__(self):
+      self.text = ""
+
+   def write(self, data):
+      self.text += data
+
+   def flush(self):
+      pass
+
+   def messages(self):
+      return [json.loads(line) for line in self.text.splitlines()]
+
+
+def census_rig(probe, tmp_path, **overrides):
+   roots = fake_proc.write_tree(
+      tmp_path / "tree", pids=[{"pid": 10, "comm": "a", "cmdline": ["a"]}]
+   )
+   config = {"proc_root": roots["proc"], "sys_root": roots["sys"], "gpu": True}
+   config.update(overrides)
+   out = _Lines()
+   census = probe._Census(probe._resolve_config(config), roots, probe._Emitter(out))
+   return census, out
+
+
+def smi_calls(log):
+   return log.read_text().splitlines() if log.exists() else []
+
+
+def gpu_errors(msgs):
+   return [m for m in msgs if m["type"] == "error" and m["where"] == "gpu"]
+
+
+def statuses(msgs):
+   return [m["gpu_status"] for m in msgs if m["type"] == "census"]
+
+
+NVML_FAILURE = 'echo "$1" >> "%s"; echo "Failed to initialize NVML: Unknown Error"; exit 255'
+
+
+def test_identical_gpu_failures_suspend_queries(probe, tmp_path, fake_bin):
+   log = tmp_path / "smi.log"
+   fake_bin("nvidia-smi", NVML_FAILURE % log)
+   census, out = census_rig(probe, tmp_path)
+   for _ in range(6):
+      census.emit()
+   msgs = out.messages()
+   assert statuses(msgs) == ["error", "error", "error", "suspended", "suspended", "suspended"]
+   assert len(smi_calls(log)) == 3
+   errors = gpu_errors(msgs)
+   assert len(errors) == 3
+   assert all("Failed to initialize NVML" in e["message"] for e in errors)
+   assert "suspended for 600 s" in errors[2]["message"]
+   assert not any("suspended" in e["message"] for e in errors[:2])
+
+
+def test_gpu_failure_after_suspension_resuspends_at_once(probe, tmp_path, fake_bin):
+   log = tmp_path / "smi.log"
+   fake_bin("nvidia-smi", NVML_FAILURE % log)
+   census, out = census_rig(probe, tmp_path, gpu_suspend_sec=0.2)
+   for _ in range(3):
+      census.emit()
+   time.sleep(0.3)
+   census.emit()
+   census.emit()
+   msgs = out.messages()
+   assert statuses(msgs) == ["error", "error", "error", "error", "suspended"]
+   assert len(smi_calls(log)) == 4
+   errors = gpu_errors(msgs)
+   assert len(errors) == 4 and "suspended" in errors[3]["message"]
+
+
+def test_differing_gpu_failures_do_not_suspend(probe, tmp_path, fake_bin):
+   counter = tmp_path / "n"
+   fake_bin(
+      "nvidia-smi",
+      'echo x >> "%s"; echo "failure $(wc -l < "%s")" >&2; exit 1' % (counter, counter),
+   )
+   census, out = census_rig(probe, tmp_path)
+   for _ in range(5):
+      census.emit()
+   msgs = out.messages()
+   assert statuses(msgs) == ["error"] * 5
+   assert len(gpu_errors(msgs)) == 5
+   assert not any("suspended" in e["message"] for e in gpu_errors(msgs))
+
+
+def test_gpu_success_resets_failure_streak(probe, tmp_path, fake_bin):
+   # Fails, fails, succeeds, then fails twice more: never three identical in a row.
+   counter = tmp_path / "n"
+   fake_bin(
+      "nvidia-smi",
+      'case "$1" in --query-compute-apps*) exit 0;; esac\n'
+      'echo x >> "%s"\n'
+      'if [ "$(wc -l < "%s")" -eq 3 ]; then echo "0, 1, 2, 3"; exit 0; fi\n'
+      "echo nope >&2; exit 1" % (counter, counter),
+   )
+   census, out = census_rig(probe, tmp_path)
+   for _ in range(5):
+      census.emit()
+   assert statuses(out.messages()) == ["error", "error", "ok", "error", "error"]
+
+
+def test_gpu_status_ok_absent_and_disabled(probe, tmp_path, fake_bin, monkeypatch):
+   fake_bin(
+      "nvidia-smi",
+      'case "$1" in --query-gpu*) echo "0, 1, 2, 3";; --query-compute-apps*) echo "10, 5";; esac',
+   )
+   census, out = census_rig(probe, tmp_path)
+   census.emit()
+   ok = out.messages()[-1]
+   assert ok["gpu_status"] == "ok" and ok["processes"][0]["gpu_mem_mb"] == 5
+   disabled, out = census_rig(probe, tmp_path / "off", gpu=False)
+   disabled.emit()
+   assert out.messages()[-1]["gpu_status"] == "absent"
+   monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+   absent, out = census_rig(probe, tmp_path / "none")
+   absent.emit()
+   assert out.messages()[-1]["gpu_status"] == "absent"
+
+
+def test_gpu_timeout_census_status(probe, tmp_path, fake_bin):
+   fake_bin("nvidia-smi", "exec sleep 30")
+   census, out = census_rig(probe, tmp_path, gpu_timeout_sec=0.3)
+   census.emit()
+   census.emit()
+   msgs = out.messages()
+   assert statuses(msgs) == ["error", "suspended"]
+   assert len(gpu_errors(msgs)) == 1 and "timeout" in gpu_errors(msgs)[0]["message"]
 
 
 def test_gpu_query_unparseable_output_is_error(probe, fake_bin):

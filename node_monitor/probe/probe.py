@@ -667,7 +667,7 @@ def _run_nvidia_smi(binary, query_flag, deadline):
       start_new_session=True,
    )
    try:
-      out, _ = proc.communicate(timeout=remaining)
+      out, err = proc.communicate(timeout=remaining)
    except subprocess.TimeoutExpired:
       try:
          os.killpg(proc.pid, signal.SIGKILL)
@@ -687,11 +687,25 @@ def _run_nvidia_smi(binary, query_flag, deadline):
             pass
       raise
    if proc.returncode != 0:
-      raise RuntimeError("nvidia-smi exit %d" % proc.returncode)
+      message = "nvidia-smi exit %d" % proc.returncode
+      # An exit code alone does not say why. nvidia-smi puts some failures on stderr and
+      # others (NVML initialization) on stdout, so fall back to stdout.
+      detail = _first_line(err) or _first_line(out)
+      if detail:
+         message += ": " + detail[:GPU_ERROR_DETAIL_MAX]
+      raise RuntimeError(message)
    return [[cell.strip() for cell in line.split(",")] for line in out.split("\n") if line.strip()]
 
 
+def _first_line(text):
+   for line in (text or "").split("\n"):
+      if line.strip():
+         return line.strip()
+   return None
+
+
 GPU_TIMEOUT_ERROR = "nvidia-smi timeout"
+GPU_ERROR_DETAIL_MAX = 200
 
 
 def query_gpus(timeout=5.0):
@@ -732,8 +746,11 @@ def query_gpus(timeout=5.0):
 # --------------------------------------------------------------------------
 
 # After an nvidia-smi timeout GPU queries pause this long, so a wedged driver does not
-# collect a new hung nvidia-smi every census.
+# collect a new hung nvidia-smi every census. A failure that keeps repeating word for word
+# (NVML refusing a non-root user, say) pauses them too: retrying it every census would
+# only spawn a doomed nvidia-smi and an identical error each minute.
 GPU_SUSPEND_SEC = 600
+GPU_IDENTICAL_FAILURES_TO_SUSPEND = 3
 # Longest sleep between parent-liveness checks.
 PARENT_POLL_SEC = 1.0
 ERROR_MESSAGE_MAX = 500
@@ -890,12 +907,31 @@ def _write_all(fd, data):
       view = view[written:]
 
 
+_TERMINATING_SIGNALS = (
+   (signal.SIGTERM, "SIGTERM"),
+   (signal.SIGHUP, "SIGHUP"),
+   (signal.SIGINT, "SIGINT"),
+)
+# How long a pending signal waits for a line in progress to finish before the probe
+# exits unreported (its exit status still names the signal).
+SIGNAL_REPORT_GRACE_SEC = 5.0
+
+
 class _Emitter(object):
-   """Writes one JSON object per line, flushed, with a per-process seq from 0."""
+   """Writes one JSON object per line, flushed, with a per-process seq from 0.
+
+   Also the meeting point for a terminating signal. The handler only records it; the
+   next emit (main thread) or the watchdog reports it and exits. Lines are written
+   under a lock, so the report always follows whole lines: a census half written when
+   the signal lands is finished first, never split.
+   """
 
    def __init__(self, out):
       self._out = out
       self._seq = 0
+      self._lock = threading.Lock()
+      self._signum = None
+      self._signal_at = None
       try:
          out.flush()
          self._fd = out.fileno()
@@ -903,6 +939,56 @@ class _Emitter(object):
          self._fd = None
 
    def emit(self, kind, fields):
+      with self._lock:
+         if self._signum is not None:
+            self._report_signal_and_exit()
+         if not self._write(kind, fields):
+            # The reader is gone (BrokenPipeError: Python ignores SIGPIPE). Nobody is
+            # listening, so exit at once without unwinding.
+            os._exit(0)
+
+   def error(self, where, message):
+      self.emit("error", _error_fields(where, message))
+
+   def install_signal_handlers(self):
+      for signum, _ in _TERMINATING_SIGNALS:
+         try:
+            # A signal its launcher ignores (nohup, a background job) stays ignored.
+            if signal.getsignal(signum) != signal.SIG_IGN:
+               signal.signal(signum, self._on_signal)
+         except (ValueError, OSError, RuntimeError):
+            pass  # not the main thread: keep the default action
+
+   def _on_signal(self, signum, frame):
+      # Only a flag. Python runs this between bytecodes of the main thread, which may be
+      # in the middle of writing a line (and holding the lock), so emitting here could
+      # split that line or deadlock.
+      if self._signum is None:
+         self._signal_at = time.monotonic()
+         self._signum = signum
+
+   def check_signal(self, wait):
+      """Report a pending signal and exit, waiting up to `wait` s for a line in progress.
+
+      Returns if no signal is pending, or if the line in progress is still unfinished
+      (the caller polls again). Once the grace has passed, exits unreported.
+      """
+      if self._signum is None:
+         return
+      if self._lock.acquire(True, wait):
+         self._report_signal_and_exit()
+      if time.monotonic() - self._signal_at >= SIGNAL_REPORT_GRACE_SEC:
+         os._exit(128 + self._signum)
+
+   def _report_signal_and_exit(self):
+      # Called with the lock held, which is kept until exit so nothing follows the report.
+      signum = self._signum
+      name = dict(_TERMINATING_SIGNALS).get(signum, "signal")
+      self._write("error", _error_fields("signal", "terminated by %s (%d)" % (name, signum)))
+      os._exit(128 + signum)
+
+   def _write(self, kind, fields):
+      """Write one line; False if the reader is gone."""
       msg = {"type": kind, "seq": self._seq, "ts": _utc_timestamp(time.time())}
       msg.update(fields)
       # ensure_ascii keeps the line ASCII whatever the node's locale or the bytes in /proc.
@@ -914,13 +1000,13 @@ class _Emitter(object):
          else:
             _write_all(self._fd, line.encode("ascii"))
       except (IOError, OSError):
-         # The reader is gone (BrokenPipeError: Python ignores SIGPIPE). Nobody is
-         # listening, so exit at once without unwinding.
-         os._exit(0)
+         return False
       self._seq += 1
+      return True
 
-   def error(self, where, message):
-      self.emit("error", {"where": where, "message": message[:ERROR_MESSAGE_MAX]})
+
+def _error_fields(where, message):
+   return {"where": where, "message": message[:ERROR_MESSAGE_MAX]}
 
 
 def _emit_hello(emitter, cfg, roots):
@@ -977,6 +1063,11 @@ class _Census(object):
       self._gpu_timeout = float(cfg["gpu_timeout_sec"])
       self._gpu_suspend = float(cfg["gpu_suspend_sec"])
       self._gpu_resume_at = None
+      # The last non-timeout failure and how many censuses in a row it has repeated. The
+      # streak survives a suspension, so a failure that persists after one re-suspends at
+      # once instead of earning a fresh run of errors.
+      self._gpu_failure = None
+      self._gpu_failure_streak = 0
 
    def emit(self):
       try:
@@ -988,7 +1079,7 @@ class _Census(object):
       start = time.monotonic()
       reap_abandoned_gpu_queries()
       rows, coverage = scan_processes(self._roots, self._uid_names)
-      gpus, gpu_mem_by_pid = self._query_gpus()
+      gpus, gpu_mem_by_pid, gpu_status = self._query_gpus()
       interval = None if self._last_start is None else round(start - self._last_start, 3)
       self._tracker.update(rows, start, interval)
       # Only after a successful update, so the next delta spans exactly the ticks it covers.
@@ -1000,37 +1091,70 @@ class _Census(object):
          "scan_seconds": round(time.monotonic() - start, 3),
          "coverage": coverage,
          "gpus": gpus,
+         "gpu_status": gpu_status,
          "processes": rows,
       }
 
    def _query_gpus(self):
+      """Return (gpus, gpu_mem_by_pid, gpu_status).
+
+      gpu_status: "ok" (query succeeded), "absent" (no nvidia-smi, or GPU queries
+      disabled), "error" (this census's query failed) or "suspended" (no query this
+      census because of earlier failures).
+      """
       if not self._gpu:
-         return [], {}
+         return [], {}, "absent"
       if self._gpu_resume_at is not None and time.monotonic() < self._gpu_resume_at:
-         return [], {}
+         return [], {}, "suspended"
       self._gpu_resume_at = None
+      if shutil.which("nvidia-smi") is None:
+         return [], {}, "absent"
       gpus, gpu_mem_by_pid, error = query_gpus(timeout=self._gpu_timeout)
+      if error is None:
+         self._gpu_failure = None
+         self._gpu_failure_streak = 0
+         return gpus, gpu_mem_by_pid, "ok"
       if error == GPU_TIMEOUT_ERROR:
-         self._gpu_resume_at = time.monotonic() + self._gpu_suspend
-         self._emitter.error(
-            "gpu", "%s; GPU queries suspended for %g s" % (error, self._gpu_suspend)
-         )
-      elif error:
+         self._gpu_failure = None
+         self._gpu_failure_streak = 0
+         self._suspend_gpu(error)
+         return [], {}, "error"
+      if error == self._gpu_failure:
+         self._gpu_failure_streak += 1
+      else:
+         self._gpu_failure = error
+         self._gpu_failure_streak = 1
+      if self._gpu_failure_streak >= GPU_IDENTICAL_FAILURES_TO_SUSPEND:
+         self._suspend_gpu("%s; %d identical failures" % (error, self._gpu_failure_streak))
+      else:
          self._emitter.error("gpu", error)
-      return gpus, gpu_mem_by_pid
+      return [], {}, "error"
+
+   def _suspend_gpu(self, reason):
+      self._gpu_resume_at = time.monotonic() + self._gpu_suspend
+      self._emitter.error("gpu", "%s; GPU queries suspended for %g s" % (reason, self._gpu_suspend))
 
 
-def _watchdog(stdin, fd, parent):
-   """Exit the process on stdin EOF or a parent change, whatever the main loop is doing.
+def _watchdog(stdin, fd, parent, emitter):
+   """Exit the process on stdin EOF, a parent change or a terminating signal, whatever
+   the main loop is doing.
 
    The main loop can sit in write() for as long as the reader stalls, or in a slow
-   census, so its own parent check cannot be the only one. The raw fd is read, not the
+   census, so its own checks cannot be the only ones. The raw fd is read, not the
    buffered object: a thread parked inside BufferedReader.read holds its lock, which
    interpreter shutdown may then wait on. Bytes the bootstrap's buffer already pulled
    in do not matter; only EOF does.
    """
    try:
+      # Leave terminating signals to the main thread. Python runs handlers only there,
+      # and a main thread blocked in write() notices the flag only if the signal
+      # interrupts that write.
+      signal.pthread_sigmask(signal.SIG_BLOCK, [s for s, _ in _TERMINATING_SIGNALS])
+   except (AttributeError, ValueError, OSError):
+      pass
+   try:
       while os.getppid() == parent:
+         emitter.check_signal(PARENT_POLL_SEC)
          if fd is None:
             if stdin is None:
                time.sleep(PARENT_POLL_SEC)
@@ -1054,14 +1178,14 @@ def _watchdog(stdin, fd, parent):
    os._exit(0)
 
 
-def _start_watchdog(stdin, parent):
+def _start_watchdog(stdin, parent, emitter):
    fd = None
    if stdin is not None:
       try:
          fd = stdin.fileno()
       except (AttributeError, ValueError, IOError, OSError):
          fd = None
-   thread = threading.Thread(target=_watchdog, args=(stdin, fd, parent), name="watchdog")
+   thread = threading.Thread(target=_watchdog, args=(stdin, fd, parent, emitter), name="watchdog")
    thread.daemon = True
    thread.start()
 
@@ -1077,8 +1201,10 @@ def _next_due(due, interval, now):
 def stream(config, out=None, stdin=None):
    """Emit hello, then counters and census (both first at once) on their intervals.
 
-   Runs until stdin reaches EOF or stdout breaks (the process exits 0 on the spot), or
-   the parent changes (returns 0). Returns 3 if the lock cannot be taken.
+   Runs until stdin reaches EOF or stdout breaks (the process exits 0 on the spot), the
+   parent changes (returns 0), or SIGTERM, SIGHUP or SIGINT arrives (an `error` with
+   where "signal" is emitted and the process exits 128 + signum, so a kill on the node
+   is told apart from a transport failure). Returns 3 if the lock cannot be taken.
    """
    out = sys.stdout if out is None else out
    stdin = sys.stdin if stdin is None else stdin
@@ -1093,6 +1219,7 @@ def stream(config, out=None, stdin=None):
    # test is "parent changed", not "parent is 1".
    parent = os.getppid()
    emitter = _Emitter(out)
+   emitter.install_signal_handlers()
    # Held (fd open) for the life of the process; the kernel drops it when we exit.
    lock = ProbeLock(cfg["lock_path"])
    try:
@@ -1103,7 +1230,7 @@ def stream(config, out=None, stdin=None):
    except (IOError, OSError) as exc:
       emitter.error("lock", "%s: %s" % (cfg["lock_path"], _describe(exc)))
       return 3
-   _start_watchdog(stdin, parent)
+   _start_watchdog(stdin, parent, emitter)
    roots = _roots(cfg)
    _emit_hello(emitter, cfg, roots)
    census = _Census(cfg, roots, emitter)
@@ -1111,6 +1238,7 @@ def stream(config, out=None, stdin=None):
    census_interval = float(cfg["census_interval_sec"])
    next_counters = next_census = time.monotonic()
    while True:
+      emitter.check_signal(PARENT_POLL_SEC)
       if os.getppid() != parent:
          return 0
       if time.monotonic() >= next_counters:

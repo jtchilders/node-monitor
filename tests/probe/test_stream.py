@@ -298,6 +298,62 @@ def test_parent_death_terminates_probe_blocked_on_write(tmp_path, spawn):
    assert wait_for_pid_exit(probe_pid, timeout=5)
 
 
+def read_to_eof(p, timeout=8.0):
+   """Read everything until the probe closes stdout; a split line fails json parsing."""
+   deadline = time.monotonic() + timeout
+   fd = p.popen.stdout.fileno()
+   while True:
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+         raise AssertionError("no EOF; got %r" % [m["type"] for m in p.messages])
+      ready, _, _ = select.select([fd], [], [], remaining)
+      if not ready:
+         continue
+      chunk = os.read(fd, 1 << 20)
+      if not chunk:
+         break
+      p._buf += chunk
+      *lines, p._buf = p._buf.split(b"\n")
+      p.messages.extend(json.loads(line) for line in lines if line)
+   assert p._buf == b"", "partial trailing line %r" % p._buf[:80]
+   return p.messages
+
+
+def is_signal_error(msg):
+   return msg["type"] == "error" and msg["where"] == "signal"
+
+
+@pytest.mark.parametrize(
+   "sig, code", [(signal.SIGTERM, 143), (signal.SIGHUP, 129), (signal.SIGINT, 130)]
+)
+def test_terminating_signal_is_reported_then_probe_exits(tmp_path, run_stream, sig, code):
+   p = run_stream(cfg(tmp_path))
+   read_messages(p, until=lambda ms: len(of_type(ms, "census")) >= 1, timeout=5)
+   os.kill(p.pid, sig)
+   msgs = read_to_eof(p)
+   assert p.wait(timeout=5) == code
+   assert is_signal_error(msgs[-1]) and not any(is_signal_error(m) for m in msgs[:-1])
+   assert sig.name in msgs[-1]["message"] and str(int(sig)) in msgs[-1]["message"]
+   assert [m["seq"] for m in msgs] == list(range(len(msgs)))
+
+
+def test_signal_during_blocked_census_write_does_not_split_the_line(tmp_path, run_stream):
+   # Census lines far bigger than a pipe buffer and nobody reading: the main thread is
+   # inside the write when the signal lands, and that write must finish first.
+   big = [
+      {"pid": 100 + i, "comm": "python", "cmdline": ["python", "x" * 50000], "ppid": 1}
+      for i in range(6)
+   ]
+   p = run_stream(cfg(tmp_path, pids=big, counter_interval_sec=30, census_interval_sec=30))
+   time.sleep(0.7)
+   os.kill(p.pid, signal.SIGTERM)
+   time.sleep(0.7)
+   msgs = read_to_eof(p)
+   assert p.wait(timeout=5) == 143
+   assert [m["type"] for m in msgs] == ["hello", "counters", "census", "error"]
+   assert len(msgs[2]["processes"]) == 6 and is_signal_error(msgs[3])
+
+
 def test_probe_disables_core_dumps(tmp_path, run_stream):
    p = run_stream(cfg(tmp_path))
    read_messages(p, count=1, timeout=5)
@@ -318,6 +374,16 @@ def test_new_probe_takes_over_stale_probe(tmp_path, run_stream):
    assert read_messages(new, count=1, timeout=8)[0]["type"] == "hello"
    assert old.wait(timeout=8) is not None  # old one was signalled
    assert (tmp_path / "lock").read_text().strip() == str(new.pid)
+
+
+def test_takeover_is_reported_on_the_old_probes_stdout(tmp_path, run_stream):
+   old = run_stream(cfg(tmp_path))
+   read_messages(old, count=1, timeout=5)
+   new = run_stream(cfg(tmp_path))
+   msgs = read_to_eof(old)
+   assert old.wait(timeout=8) == 143
+   assert is_signal_error(msgs[-1]) and "SIGTERM" in msgs[-1]["message"]
+   assert read_messages(new, count=1, timeout=8)[0]["type"] == "hello"
 
 
 HOLD_LOCK_CODE = (
@@ -435,6 +501,25 @@ def test_gpu_queries_resume_after_suspension(tmp_path, run_stream, hanging_smi):
    gpu_error_seqs = [e["seq"] for e in of_type(msgs, "error") if e["where"] == "gpu"]
    # At least one census ran while suspended, between the two queries.
    assert any(gpu_error_seqs[0] < s < gpu_error_seqs[1] for s in censuses)
+
+
+def test_identical_gpu_failures_suspend_queries_in_stream(tmp_path, run_stream, fake_bin):
+   log = tmp_path / "smi.log"
+   fake_bin(
+      "nvidia-smi",
+      'echo "$1" >> "%s"\n'
+      'case "$1" in --query-gpu=name*) exit 255;; esac\n'
+      'echo "Failed to initialize NVML: Unknown Error"; exit 255' % log,
+   )
+   p = run_stream(cfg(tmp_path, gpu=True, census_interval_sec=0.2))
+   msgs = read_messages(p, until=lambda ms: len(of_type(ms, "census")) >= 6, timeout=10)
+   gpu_errors = [e for e in of_type(msgs, "error") if e["where"] == "gpu"]
+   assert len(gpu_errors) == 3 and "suspended" in gpu_errors[2]["message"]
+   assert "Failed to initialize NVML: Unknown Error" in gpu_errors[0]["message"]
+   assert [c["gpu_status"] for c in of_type(msgs, "census")][:6] == ["error"] * 3 + [
+      "suspended"
+   ] * 3
+   assert len(gpu_queries(log)) == 3
 
 
 def test_gpu_disabled_spawns_no_nvidia_smi(tmp_path, run_stream, hanging_smi):
