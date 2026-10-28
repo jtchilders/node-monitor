@@ -56,7 +56,9 @@ def _write_pid(proc, spec):
    _write(pid_dir / "stat", make_stat(pid, spec["comm"], **overrides))
    cmdline = spec.get("cmdline")
    if cmdline is not None:
-      _write(pid_dir / "cmdline", "\0".join(cmdline.split(" ")) + "\0" if cmdline else "")
+      if isinstance(cmdline, str):
+         cmdline = cmdline.split(" ") if cmdline else []
+      _write(pid_dir / "cmdline", "".join(arg + "\0" for arg in cmdline))
    uid = spec.get("uid", 1000)
    _write(
       pid_dir / "status",
