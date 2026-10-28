@@ -772,36 +772,78 @@ git add -A && git commit -m "feat(collector): soak recorder, runner, and report 
 
 This task is operational. It runs on polaris-login-04 as `parton`.
 
+**Matching probes precisely.** `pgrep -fa node-monitor-probe` also matches the collector's ssh clients, the ControlPersist masters and the very ssh command doing the check, so it over-counts. Everywhere in this task, list probes on a node with:
+
+```bash
+ssh polaris-login-0N.head "pgrep -u \$USER -fa '^/usr/bin/python3.11 -u -c #node-monitor-probe'"
+```
+
+or compare against the pid in `/dev/shm/node-monitor-$(id -u).lock` on that node.
+
+**One probe per account.** No other default-lock probe may run on this account during the soak: no second `node-monitor soak run`, and no Task 5-style live check. Any of them takes over the soak's lock on that node and shows up as a loss.
+
 - [ ] **Step 1: Start the soak detached**
+
+Before launch, confirm `git status --short` prints nothing: the code soaked must be the committed code.
 
 ```bash
 mkdir -p ~/node-monitor/logs
-screen -dmS node-monitor-soak bash -lc 'PATH=~/node-monitor/venv/bin:$PATH node-monitor soak run --duration-hours 26 >> ~/node-monitor/logs/soak-console.log 2>&1'
+screen -dmS node-monitor-soak bash -lc 'PATH=~/node-monitor/venv/bin:$PATH env -u LD_PRELOAD node-monitor soak run --duration-hours 26 >> ~/node-monitor/logs/soak-console.log 2>&1'
 ```
 
-Check that `tail ~/node-monitor/logs/soak-console.log` shows the out dir, and that `ssh polaris-login-0N.head pgrep -fa node-monitor-probe` shows exactly one probe on each node.
+`env -u LD_PRELOAD` is needed because login shells set the site's XALT LD_PRELOAD, which can abort the interpreter at exit.
+
+Then check:
+
+- `tail ~/node-monitor/logs/soak-console.log` shows the out dir (`OUT` below).
+- `grep -E '"git_(commit|describe)"|probe_sha256' $OUT/manifest.json`: `git_describe` matches `git describe --always --dirty` and has no `-dirty` suffix. If it does, stop the soak (`screen -S node-monitor-soak -X quit`), commit or revert, and relaunch.
+- `ls -ld $OUT; ls -l $OUT`: the dir is `drwx------` and the files are `-rw-------`.
+- The precise pgrep above shows exactly one probe on each node.
+
+Sample the collector's RSS hourly into a log, from a second window of the same screen session:
+
+```bash
+COLLECTOR=$(pgrep -u $USER -f '^[^ ]*python[^ ]* [^ ]*/node-monitor soak run')   # must be exactly one pid
+screen -S node-monitor-soak -X screen bash -c "while sleep 3600; do date -u; ps -o rss= -p $COLLECTOR; done >> ~/node-monitor/logs/soak-rss.log"
+```
 
 - [ ] **Step 2: Fault checks (in the first 2 h; record times in the results doc)**
 
-  a. **Local SSH kill:** `pkill -f 'ssh .*polaris-login-01.head'` → expect `session_lost` then `session_started` for login-01 within about 10 s.
-  b. **Remote probe kill:** `ssh polaris-login-02.head pkill -f node-monitor-probe` → expect `session_lost (eof|exit)` and a reconnect.
-  c. **Hung transport:** `kill -STOP <ssh pid for login-04>` → after about 30 s, expect `session_lost (silence)`. Then `pgrep -fa node-monitor-probe` on login-04 shows exactly one probe, the new one, because the stale probe was taken over or exited.
-  d. **Lock safety:** confirm `/dev/shm/node-monitor-31112.lock` holds the current probe's PID on each node.
+Target a node's ssh client by the pid in its latest `session_started` event, not by a pattern:
+
+```bash
+ssh_pid() { grep -h '"event": "session_started"' $OUT/$1-*.jsonl | tail -1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["detail"]["pid"])'; }
+```
+
+Cross-check with `pgrep -P $COLLECTOR -f polaris-login-0N`: the session's ssh clients are the collector's direct children. Never signal the ControlPersist master (`ssh: .../cm-... [mux]`, detached from the collector): it carries every session to that node.
+
+  a. **Local SSH kill:** `kill $(ssh_pid login-01)` → expect `session_lost` then `session_started` for login-01 within about 10 s.
+  b. **Remote probe kill:** `ssh polaris-login-02.head "pkill -u \$USER -f '^/usr/bin/python3.11 -u -c #node-monitor-probe'"` → expect an `error` message with `where` "signal" ("terminated by SIGTERM (15)"), then `session_lost` with reason `exit` and `exit_code` 143, and a reconnect. A probe killed with SIGKILL leaves no such message (`eof` or `exit` with a bare exit code) and is unattributable.
+  c. **Hung transport:** `P=$(ssh_pid login-04); kill -STOP $P` → after about 30 s, expect `session_lost (silence)`. Then make sure the stopped client is gone: the session's SIGKILL normally ends it; if `ps -o pid,stat -p $P` still lists it, run `kill -CONT $P` (the session's pending SIGTERM then ends it) or `kill -KILL $P`. Then the precise pgrep on login-04 shows exactly one probe, the new one, because the stale probe was taken over or exited.
+  d. **Lock safety:** confirm `/dev/shm/node-monitor-31112.lock` holds the current probe's PID on each node, and that it is the pid the precise pgrep shows.
 
 - [ ] **Step 3: After ≥ 24 h, generate the report**
 
 Run: `node-monitor soak report <out_dir>` and `node-monitor soak report <out_dir> --format json > <out_dir>/report.json`
 
+The JSON report carries what the table does not: census coverage, `errors_by_where`, `loss_timeline` (each loss with its exit code and stderr tail), session crash, malformed-line and probe-stderr counts, `gpu_status_counts`, and the per-process delta extremes (`cpu_seconds_min`/`max`, `idle_for_max_sec`). Also stop the RSS sampler (`screen -S node-monitor-soak -X quit` once the run has ended) and keep `~/node-monitor/logs/soak-rss.log`.
+
 - [ ] **Step 4: Write `docs/soak/2026-10-m0-results.md`**
 
 Sections:
-- Dates and hosts
+- Dates and hosts, plus the manifest's `git_describe` and `probe_sha256`
 - The report table, verbatim
 - Fault-check outcomes (expected vs observed)
-- Any session losses not caused by the fault checks, with their reasons and the `probe_stderr` lines
-- Probe overhead: CPU seconds per hour and max RSS per node, plus census scan p95
+- Any session losses not caused by the fault checks, with their reasons, exit codes and the `probe_stderr` lines
+- Probe overhead: CPU seconds per hour and max RSS per node, plus census scan p95; collector RSS over time from `soak-rss.log`
 - Node reboots or maintenance windows observed
 - **Decision:** GO (proceed to M1 with streaming) or NO-GO (fall back to per-poll probe, spec §14), with the reasons
+
+The results doc must also state:
+- GPU metrics are unavailable to non-root users on Polaris login nodes (NVML initialization fails, so `gpu_status` is `error` then `suspended`), so the overhead figures exclude successful nvidia-smi calls.
+- SIGKILL terminations are unattributable: only SIGTERM, SIGHUP and SIGINT leave an `error` with `where` "signal".
+- Simultaneous silence losses on every node point to a collector-side stall (for example /home I/O), not to the nodes.
+- `coverage.parent_unresolved` is always at least 1, because pid 1's parent is pid 0, which has no /proc entry.
 
 GO criteria (spec §13 M0):
 - coverage ≥ 99% outside the fault-check windows
