@@ -15,3 +15,11 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest -q
+  probe-py36:
+    runs-on: ubuntu-latest
+    container: python:3.6-slim
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m py_compile node_monitor/probe/probe.py
+      - run: python node_monitor/probe/probe.py --once > out.jsonl
+      - run: python -c "import json; ts=[json.loads(l)['type'] for l in open('out.jsonl')]; assert ts == ['hello','counters','census'], ts"

@@ -4,16 +4,30 @@ Single file, stdlib only, Python 3.6 compatible. It is shipped to nodes as
 source text, so importing it must have no side effects.
 """
 
+import argparse
 import errno
+import fcntl
+import json
 import os
 import pwd
 import re
+import resource
+import select
 import shutil
 import signal
+import socket
 import subprocess
+import sys
+import threading
 import time
 
 PROBE_VERSION = 1
+# Carried in the probe's cmdline (the bootstrap puts it there); lock takeover signals
+# only a holder whose cmdline contains it.
+MARKER = "node-monitor-probe"
+
+# Hardware detection runs once at hello; a wedged driver must not stall it for long.
+HARDWARE_GPU_TIMEOUT_SEC = 5.0
 
 # errnos that are routine on a busy node: another user's process, a process that
 # exited mid-walk, or /proc files that reject reads in some kernel states.
@@ -325,33 +339,27 @@ def _collect_gpus_nvidia_smi():
    binary = shutil.which("nvidia-smi")
    if binary is None:
       return []
+   deadline = time.monotonic() + HARDWARE_GPU_TIMEOUT_SEC
    try:
-      result = subprocess.run(
-         [binary, "--query-gpu=name", "--format=csv,noheader"],
-         stdout=subprocess.PIPE,
-         stderr=subprocess.PIPE,
-         universal_newlines=True,
-         timeout=5,
-      )
-   except Exception:
+      rows = _run_nvidia_smi(binary, "--query-gpu=name", deadline)
+   except (subprocess.TimeoutExpired, RuntimeError, OSError):
       return []
-   if result.returncode != 0:
-      return []
-   return [line.strip() for line in result.stdout.split("\n") if line.strip()]
+   return [cells[0] for cells in rows if cells and cells[0]]
 
 
-def _collect_gpus(roots):
+def _collect_gpus(roots, gpu=True):
    # Cheap /proc listing first so GPU-less nodes never spawn a subprocess.
    try:
       entries = sorted(os.listdir(_proc(roots, "driver", "nvidia", "gpus")))
    except (IOError, OSError):
       entries = []
-   if entries:
+   if entries or not gpu:
       return entries
    return _collect_gpus_nvidia_smi()
 
 
-def collect_hardware(roots):
+def collect_hardware(roots, gpu=True):
+   """Static node facts; gpu=False never spawns nvidia-smi."""
    cpuinfo = _collect_cpuinfo(roots)
    mem = _meminfo_fields(
       roots,
@@ -375,7 +383,7 @@ def collect_hardware(roots):
       "os_pretty_name": _collect_os_pretty_name(roots),
       "net_fs_mounts": _collect_net_fs_mounts(roots),
       "net_ifaces": _collect_net_ifaces(roots),
-      "gpus": _collect_gpus(roots),
+      "gpus": _collect_gpus(roots, gpu),
    }
 
 
@@ -623,6 +631,23 @@ class ProcessTracker(object):
       self._state = seen
 
 
+# nvidia-smi children that survived SIGKILL of their group; polled each census so they
+# do not linger as zombies once the driver lets them go.
+_ABANDONED_GPU_QUERIES = []
+
+
+def reap_abandoned_gpu_queries():
+   """Poll abandoned nvidia-smi children without blocking; drop the reaped ones."""
+   still_running = []
+   for proc in _ABANDONED_GPU_QUERIES:
+      try:
+         if proc.poll() is None:
+            still_running.append(proc)
+      except Exception:
+         pass
+   _ABANDONED_GPU_QUERIES[:] = still_running
+
+
 def _run_nvidia_smi(binary, query_flag, deadline):
    """Run one query against a shared monotonic deadline; never waits unboundedly.
 
@@ -652,6 +677,9 @@ def _run_nvidia_smi(binary, query_flag, deadline):
          proc.communicate(timeout=1)
       except Exception:
          pass
+      if proc.poll() is None:
+         # Unkillable for now (uninterruptible sleep in the driver); reaped later.
+         _ABANDONED_GPU_QUERIES.append(proc)
       for pipe in (proc.stdout, proc.stderr):
          try:
             pipe.close()
@@ -661,6 +689,9 @@ def _run_nvidia_smi(binary, query_flag, deadline):
    if proc.returncode != 0:
       raise RuntimeError("nvidia-smi exit %d" % proc.returncode)
    return [[cell.strip() for cell in line.split(",")] for line in out.split("\n") if line.strip()]
+
+
+GPU_TIMEOUT_ERROR = "nvidia-smi timeout"
 
 
 def query_gpus(timeout=5.0):
@@ -688,9 +719,449 @@ def query_gpus(timeout=5.0):
          pid, used = cells
          by_pid[int(pid)] = by_pid.get(int(pid), 0) + int(used)
    except subprocess.TimeoutExpired:
-      return [], {}, "nvidia-smi timeout"
+      return [], {}, GPU_TIMEOUT_ERROR
    except RuntimeError as exc:
       return [], {}, str(exc)
    except (ValueError, OSError):
       return [], {}, "nvidia-smi output unparseable"
    return gpus, by_pid, None
+
+
+# --------------------------------------------------------------------------
+# Streaming
+# --------------------------------------------------------------------------
+
+# After an nvidia-smi timeout GPU queries pause this long, so a wedged driver does not
+# collect a new hung nvidia-smi every census.
+GPU_SUSPEND_SEC = 600
+# Longest sleep between parent-liveness checks.
+PARENT_POLL_SEC = 1.0
+ERROR_MESSAGE_MAX = 500
+LOCK_TAKEOVER_WAIT_SEC = 5.0
+LOCK_POLL_SEC = 0.1
+# A holder writes its pid just after taking the lock; allow it that long to appear.
+LOCK_PID_WAIT_SEC = 1.0
+
+
+def default_config():
+   return {
+      "counter_interval_sec": 10,
+      "census_interval_sec": 60,
+      "active_cpu_seconds_per_min": 0.1,
+      "lock_path": "/dev/shm/node-monitor-%d.lock" % os.getuid(),
+      "proc_root": "/proc",
+      "sys_root": "/sys",
+      "gpu": True,
+      # Not part of the collector's config surface; tests shorten them.
+      "gpu_timeout_sec": 5.0,
+      "gpu_suspend_sec": GPU_SUSPEND_SEC,
+   }
+
+
+def _resolve_config(config):
+   merged = default_config()
+   for key, value in (config or {}).items():
+      if value is not None:
+         merged[key] = value
+   return merged
+
+
+def _roots(cfg):
+   return {"proc": cfg["proc_root"], "sys": cfg["sys_root"]}
+
+
+def _describe(exc):
+   return "%s: %s" % (type(exc).__name__, exc)
+
+
+class LockHeldByOther(Exception):
+   def __init__(self, pid, reason="lock is held"):
+      Exception.__init__(self, "%s (holder pid %s)" % (reason, pid))
+      self.pid = pid
+
+
+def _read_lock_pid(path):
+   try:
+      with open(path, "rb") as handle:
+         text = handle.read(64).decode("ascii", "replace").strip()
+   except (IOError, OSError):
+      return None
+   return int(text) if text.isdigit() else None
+
+
+def _cmdline_of(pid):
+   # Always the real /proc: the lock is a property of this host, not of a test tree.
+   try:
+      return read_text("/proc/%d/cmdline" % pid)
+   except (IOError, OSError):
+      return None
+
+
+class ProbeLock(object):
+   """One probe per user per node, via flock on a file holding the holder's pid.
+
+   The flock, not the file's pid, decides who holds it: a lock file left by a dead
+   probe names a pid that may now be someone else's process, but nobody holds its
+   flock, so it is simply taken. Only a live flock holder whose cmdline carries the
+   marker is ever signalled.
+   """
+
+   def __init__(self, path):
+      self.path = path
+      self._fd = None
+
+   def acquire(self):
+      # os.open fds are close-on-exec, so no nvidia-smi child inherits (and pins) the lock.
+      fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+      try:
+         self._acquire(fd)
+         os.ftruncate(fd, 0)
+         os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
+      except BaseException:
+         os.close(fd)
+         raise
+      self._fd = fd
+
+   def _try_lock(self, fd):
+      try:
+         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+         return True
+      except (IOError, OSError) as exc:
+         if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+            return False
+         raise
+
+   def _wait_for_lock(self, fd, timeout):
+      deadline = time.monotonic() + timeout
+      while True:
+         if self._try_lock(fd):
+            return True
+         if time.monotonic() >= deadline:
+            return False
+         time.sleep(LOCK_POLL_SEC)
+
+   def _acquire(self, fd):
+      deadline = time.monotonic() + LOCK_PID_WAIT_SEC
+      while True:
+         if self._try_lock(fd):
+            return
+         pid = _read_lock_pid(self.path)
+         if pid is not None:
+            break
+         if time.monotonic() >= deadline:
+            raise LockHeldByOther(None, "lock file names no pid")
+         time.sleep(LOCK_POLL_SEC)
+      for sig in (signal.SIGTERM, signal.SIGKILL):
+         self._signal_probe(pid, sig)
+         if self._wait_for_lock(fd, LOCK_TAKEOVER_WAIT_SEC):
+            return
+      raise LockHeldByOther(pid, "previous probe did not release the lock")
+
+   def _signal_probe(self, pid, sig):
+      if pid <= 1 or pid == os.getpid():
+         raise LockHeldByOther(pid, "refusing to signal this pid")
+      # Re-read before every signal: between SIGTERM and SIGKILL the pid may be recycled.
+      cmdline = _cmdline_of(pid)
+      if cmdline is None:
+         return  # exited, or hidden from us; the wait that follows decides
+      if MARKER not in cmdline:
+         raise LockHeldByOther(pid, "lock holder is not a node-monitor probe")
+      try:
+         os.kill(pid, sig)
+      except OSError:
+         pass
+
+
+def _utc_timestamp(now):
+   ms = int(now * 1000)
+   return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms // 1000)) + ".%03dZ" % (ms % 1000)
+
+
+def _write_all(fd, data):
+   # Raw fd writes: a census line can be ~600 KB, and a non-blocking stdout must
+   # wait for the reader rather than fail mid-line.
+   view = memoryview(data)
+   while view:
+      try:
+         written = os.write(fd, view)
+      except BlockingIOError:
+         select.select([], [fd], [])
+         continue
+      view = view[written:]
+
+
+class _Emitter(object):
+   """Writes one JSON object per line, flushed, with a per-process seq from 0."""
+
+   def __init__(self, out):
+      self._out = out
+      self._seq = 0
+      try:
+         out.flush()
+         self._fd = out.fileno()
+      except (AttributeError, ValueError, IOError, OSError):
+         self._fd = None
+
+   def emit(self, kind, fields):
+      msg = {"type": kind, "seq": self._seq, "ts": _utc_timestamp(time.time())}
+      msg.update(fields)
+      # ensure_ascii keeps the line ASCII whatever the node's locale or the bytes in /proc.
+      line = json.dumps(msg, separators=(",", ":")) + "\n"
+      try:
+         if self._fd is None:
+            self._out.write(line)
+            self._out.flush()
+         else:
+            _write_all(self._fd, line.encode("ascii"))
+      except (IOError, OSError):
+         # The reader is gone (BrokenPipeError: Python ignores SIGPIPE). Nobody is
+         # listening, so exit at once without unwinding.
+         os._exit(0)
+      self._seq += 1
+
+   def error(self, where, message):
+      self.emit("error", {"where": where, "message": message[:ERROR_MESSAGE_MAX]})
+
+
+def _emit_hello(emitter, cfg, roots):
+   problems = []
+   try:
+      boot_id, btime = boot_identity(roots)
+   except Exception as exc:
+      boot_id = btime = None
+      problems.append(_describe(exc))
+   try:
+      hardware = collect_hardware(roots, gpu=bool(cfg["gpu"]))
+   except Exception as exc:
+      hardware = None
+      problems.append(_describe(exc))
+   emitter.emit(
+      "hello",
+      {
+         "probe_version": PROBE_VERSION,
+         "python_version": "%d.%d.%d" % tuple(sys.version_info[:3]),
+         "hostname_fqdn": socket.getfqdn(),
+         "pid": os.getpid(),
+         "boot_id": boot_id,
+         "btime": btime,
+         "hardware": hardware,
+      },
+   )
+   for problem in problems:
+      emitter.error("hello", problem)
+
+
+def _emit_counters(emitter, roots):
+   try:
+      fields = collect_counters(roots)
+      own = resource.getrusage(resource.RUSAGE_SELF)
+      children = resource.getrusage(resource.RUSAGE_CHILDREN)
+      fields["probe_self"] = {
+         "cpu_seconds": round(own.ru_utime + own.ru_stime, 3),
+         "children_cpu_seconds": round(children.ru_utime + children.ru_stime, 3),
+         "maxrss_kb": own.ru_maxrss,
+      }
+      emitter.emit("counters", fields)
+   except Exception as exc:
+      emitter.error("counters", _describe(exc))
+
+
+class _Census(object):
+   def __init__(self, cfg, roots, emitter):
+      self._roots = roots
+      self._emitter = emitter
+      self._uid_names = {}
+      self._tracker = ProcessTracker(cfg["active_cpu_seconds_per_min"], os.sysconf("SC_CLK_TCK"))
+      self._last_start = None
+      self._gpu = bool(cfg["gpu"])
+      self._gpu_timeout = float(cfg["gpu_timeout_sec"])
+      self._gpu_suspend = float(cfg["gpu_suspend_sec"])
+      self._gpu_resume_at = None
+
+   def emit(self):
+      try:
+         self._emitter.emit("census", self._take())
+      except Exception as exc:
+         self._emitter.error("census", _describe(exc))
+
+   def _take(self):
+      start = time.monotonic()
+      reap_abandoned_gpu_queries()
+      rows, coverage = scan_processes(self._roots, self._uid_names)
+      gpus, gpu_mem_by_pid = self._query_gpus()
+      interval = None if self._last_start is None else round(start - self._last_start, 3)
+      self._tracker.update(rows, start, interval)
+      # Only after a successful update, so the next delta spans exactly the ticks it covers.
+      self._last_start = start
+      for row in rows:
+         row["gpu_mem_mb"] = gpu_mem_by_pid.get(row["pid"])
+      return {
+         "interval_sec": interval,
+         "scan_seconds": round(time.monotonic() - start, 3),
+         "coverage": coverage,
+         "gpus": gpus,
+         "processes": rows,
+      }
+
+   def _query_gpus(self):
+      if not self._gpu:
+         return [], {}
+      if self._gpu_resume_at is not None and time.monotonic() < self._gpu_resume_at:
+         return [], {}
+      self._gpu_resume_at = None
+      gpus, gpu_mem_by_pid, error = query_gpus(timeout=self._gpu_timeout)
+      if error == GPU_TIMEOUT_ERROR:
+         self._gpu_resume_at = time.monotonic() + self._gpu_suspend
+         self._emitter.error(
+            "gpu", "%s; GPU queries suspended for %g s" % (error, self._gpu_suspend)
+         )
+      elif error:
+         self._emitter.error("gpu", error)
+      return gpus, gpu_mem_by_pid
+
+
+def _watchdog(stdin, fd, parent):
+   """Exit the process on stdin EOF or a parent change, whatever the main loop is doing.
+
+   The main loop can sit in write() for as long as the reader stalls, or in a slow
+   census, so its own parent check cannot be the only one. The raw fd is read, not the
+   buffered object: a thread parked inside BufferedReader.read holds its lock, which
+   interpreter shutdown may then wait on. Bytes the bootstrap's buffer already pulled
+   in do not matter; only EOF does.
+   """
+   try:
+      while os.getppid() == parent:
+         if fd is None:
+            if stdin is None:
+               time.sleep(PARENT_POLL_SEC)
+               continue
+            data = stdin.buffer.read(1)  # no fd to poll; the main loop checks the parent
+         else:
+            readable, _, _ = select.select([fd], [], [], PARENT_POLL_SEC)
+            if not readable:
+               continue
+            try:
+               data = os.read(fd, 4096)
+            except BlockingIOError:
+               continue  # non-blocking stdin (shared with ssh, say): spurious wakeup
+         if data is None:
+            time.sleep(PARENT_POLL_SEC)
+            continue
+         if not data:
+            break
+   except Exception:
+      pass
+   os._exit(0)
+
+
+def _start_watchdog(stdin, parent):
+   fd = None
+   if stdin is not None:
+      try:
+         fd = stdin.fileno()
+      except (AttributeError, ValueError, IOError, OSError):
+         fd = None
+   thread = threading.Thread(target=_watchdog, args=(stdin, fd, parent), name="watchdog")
+   thread.daemon = True
+   thread.start()
+
+
+def _next_due(due, interval, now):
+   # Skip slots missed during a slow collection instead of bursting to catch up.
+   due += interval
+   if due <= now:
+      due += interval * (int((now - due) / interval) + 1) if interval > 0 else now - due
+   return due
+
+
+def stream(config, out=None, stdin=None):
+   """Emit hello, then counters and census (both first at once) on their intervals.
+
+   Runs until stdin reaches EOF or stdout breaks (the process exits 0 on the spot), or
+   the parent changes (returns 0). Returns 3 if the lock cannot be taken.
+   """
+   out = sys.stdout if out is None else out
+   stdin = sys.stdin if stdin is None else stdin
+   cfg = _resolve_config(config)
+   # Login nodes may write unlimited cores into the cwd (a user's home); a probe that
+   # crashes must not leave hundreds of MB behind.
+   try:
+      resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+   except (ValueError, OSError):
+      pass
+   # Orphans are re-parented to `systemd --user` (a subreaper), not pid 1, so the
+   # test is "parent changed", not "parent is 1".
+   parent = os.getppid()
+   emitter = _Emitter(out)
+   # Held (fd open) for the life of the process; the kernel drops it when we exit.
+   lock = ProbeLock(cfg["lock_path"])
+   try:
+      lock.acquire()
+   except LockHeldByOther as exc:
+      emitter.error("lock", str(exc))
+      return 3
+   except (IOError, OSError) as exc:
+      emitter.error("lock", "%s: %s" % (cfg["lock_path"], _describe(exc)))
+      return 3
+   _start_watchdog(stdin, parent)
+   roots = _roots(cfg)
+   _emit_hello(emitter, cfg, roots)
+   census = _Census(cfg, roots, emitter)
+   counter_interval = float(cfg["counter_interval_sec"])
+   census_interval = float(cfg["census_interval_sec"])
+   next_counters = next_census = time.monotonic()
+   while True:
+      if os.getppid() != parent:
+         return 0
+      if time.monotonic() >= next_counters:
+         _emit_counters(emitter, roots)
+         next_counters = _next_due(next_counters, counter_interval, time.monotonic())
+      if time.monotonic() >= next_census:
+         census.emit()
+         next_census = _next_due(next_census, census_interval, time.monotonic())
+      wait = min(next_counters, next_census) - time.monotonic()
+      if wait > 0:
+         time.sleep(min(wait, PARENT_POLL_SEC))
+
+
+def once(config, out=None):
+   """Emit hello, counters and census once; no lock, no stdin watcher."""
+   out = sys.stdout if out is None else out
+   cfg = _resolve_config(config)
+   roots = _roots(cfg)
+   emitter = _Emitter(out)
+   _emit_hello(emitter, cfg, roots)
+   _emit_counters(emitter, roots)
+   _Census(cfg, roots, emitter).emit()
+   return 0
+
+
+def main(argv=None):
+   parser = argparse.ArgumentParser(
+      description="node-monitor probe. Streaming is started by the collector's bootstrap; "
+      "from a shell only --once is supported."
+   )
+   parser.add_argument("--once", action="store_true", help="emit hello, counters, census")
+   parser.add_argument("--proc-root", default="/proc")
+   parser.add_argument("--sys-root", default="/sys")
+   args = parser.parse_args(argv)
+   if not args.once:
+      parser.error("--once is required")
+   return once({"proc_root": args.proc_root, "sys_root": args.sys_root})
+
+
+if __name__ == "__node_monitor_probe__":
+   # The bootstrap exec's this source with PROBE_CONFIG defined in its globals.
+   # os._exit like every other exit path: interpreter teardown and LD_PRELOAD exit
+   # hooks (site job trackers such as XALT, seen aborting in their fini on a login
+   # node) buy a probe nothing and can crash after the work is done.
+   _code = stream(PROBE_CONFIG)  # noqa: F821
+   for _stream in (sys.stdout, sys.stderr):
+      try:
+         _stream.flush()
+      except Exception:
+         pass
+   os._exit(_code)
+
+if __name__ == "__main__":
+   sys.exit(main())
