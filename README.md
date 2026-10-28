@@ -14,4 +14,18 @@ python3 -m venv ../venv && ../venv/bin/pip install -e '.[dev]' && ../venv/bin/py
 
 ## M0 soak
 
-Usage is documented here once the soak CLI lands.
+Record every configured node's probe stream, then summarize it:
+
+```bash
+node-monitor soak run --duration-hours 24    # omit the duration to run until Ctrl-C
+node-monitor soak report ~/node-monitor/logs/soak/<timestamp> [--format json]
+```
+
+`soak run` writes `manifest.json` and one `<label>-<YYYYMMDD>.jsonl` per node per UTC day
+into the out dir (default `<working_dir>/logs/soak/<UTC timestamp>`, or `--out-dir`).
+Censuses are stored as summaries unless `--full-census` is given. The config comes from
+`--config` or the usual search path (see `config.example.yaml`).
+
+`soak report` prints one row per node: coverage of expected counter messages, largest gap,
+sessions, losses, rotations, reboots, probe CPU per hour, peak RSS, census scan p95 and
+average process count.
