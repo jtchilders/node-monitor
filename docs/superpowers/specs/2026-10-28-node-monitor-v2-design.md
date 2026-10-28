@@ -100,13 +100,19 @@ error). `node-monitor config --create` writes a commented template.
 
 ```yaml
 system: polaris
-nodes:
+nodes:                               # host = node identity; ssh_target = how to reach it
   - host: polaris-login-01.hsn.cm.polaris.alcf.anl.gov
     label: login-01
+    ssh_target: polaris-login-01.head  # optional; defaults to host
   - host: polaris-login-02.hsn.cm.polaris.alcf.anl.gov
     label: login-02
+    ssh_target: polaris-login-02.head
   - host: polaris-login-04.hsn.cm.polaris.alcf.anl.gov
     label: login-04
+    ssh_target: polaris-login-04.head
+ssh:
+  identity_file: ~/.ssh/id_ed25519_polaris   # optional; written into the project ssh_config
+  connect_timeout_sec: 10
 probe_python: /usr/bin/python3.11
 working_dir: ~/node-monitor          # logs/ and state/ live here
 database:
@@ -165,11 +171,13 @@ collector runs:
 ```
 ssh -F <working_dir>/state/ssh_config -o BatchMode=yes \
     -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \
-    <host> env -u LD_PRELOAD <probe_python> -u -c '<bootstrap>'
+    <ssh_target> env -u LD_PRELOAD <probe_python> -u -c '<bootstrap>'
 ```
 
 The project-owned `ssh_config` uses ControlMaster with sockets under
-`state/`. The bootstrap (≈20 lines, Python 3.6) reads a length-prefixed probe
+`state/`, and `IdentityFile`/`IdentitiesOnly` when `ssh.identity_file` is
+set (on Polaris, login-node SSH only succeeds via the `.head` names with the
+user's Polaris key). The bootstrap (≈20 lines, Python 3.6) reads a length-prefixed probe
 source from stdin, compiles and runs it. stdin then stays open as the
 liveness channel. The probe source is sent on every connection, so the
 remote always runs the collector's version.
