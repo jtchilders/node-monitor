@@ -180,3 +180,20 @@ def test_gpu_query_timeout_is_bounded(probe, fake_bin):
    start = time.monotonic()
    gpus, by_pid, err = probe.query_gpus(timeout=1.0)
    assert gpus == [] and "timeout" in err and time.monotonic() - start < 3
+
+
+def test_gpu_query_timeout_bounded_with_pipe_holding_grandchild(probe, fake_bin):
+   fake_bin("nvidia-smi", "sleep 30 & wait")
+   start = time.monotonic()
+   gpus, by_pid, err = probe.query_gpus(timeout=1.0)
+   assert gpus == [] and "timeout" in err and time.monotonic() - start < 2.5
+
+
+def test_gpu_query_timeout_is_one_budget_for_both_queries(probe, fake_bin):
+   fake_bin(
+      "nvidia-smi",
+      'case "$1" in --query-gpu*) sleep 0.7; echo "0, 1, 2, 3";; *) sleep 30;; esac',
+   )
+   start = time.monotonic()
+   gpus, by_pid, err = probe.query_gpus(timeout=1.0)
+   assert "timeout" in err and time.monotonic() - start < 2.5

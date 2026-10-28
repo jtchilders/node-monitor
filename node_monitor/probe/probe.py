@@ -9,7 +9,9 @@ import os
 import pwd
 import re
 import shutil
+import signal
 import subprocess
+import time
 
 PROBE_VERSION = 1
 
@@ -621,21 +623,44 @@ class ProcessTracker(object):
       self._state = seen
 
 
-def _run_nvidia_smi(binary, query_flag, timeout):
-   result = subprocess.run(
+def _run_nvidia_smi(binary, query_flag, deadline):
+   """Run one query against a shared monotonic deadline; never waits unboundedly.
+
+   subprocess.run is avoided: on 3.6 its timeout path does an untimed second
+   communicate() that blocks while a descendant holds the pipe, and a child in
+   uninterruptible sleep ignores kill. So the whole process group is killed and,
+   if it still will not go, the process and pipes are abandoned.
+   """
+   remaining = deadline - time.monotonic()
+   if remaining <= 0:
+      raise subprocess.TimeoutExpired(binary, 0)
+   proc = subprocess.Popen(
       [binary, query_flag, "--format=csv,noheader,nounits"],
       stdout=subprocess.PIPE,
       stderr=subprocess.PIPE,
       universal_newlines=True,
-      timeout=timeout,
+      start_new_session=True,
    )
-   if result.returncode != 0:
-      raise RuntimeError("nvidia-smi exit %d" % result.returncode)
-   return [
-      [cell.strip() for cell in line.split(",")]
-      for line in result.stdout.split("\n")
-      if line.strip()
-   ]
+   try:
+      out, _ = proc.communicate(timeout=remaining)
+   except subprocess.TimeoutExpired:
+      try:
+         os.killpg(proc.pid, signal.SIGKILL)
+      except OSError:
+         pass
+      try:
+         proc.communicate(timeout=1)
+      except Exception:
+         pass
+      for pipe in (proc.stdout, proc.stderr):
+         try:
+            pipe.close()
+         except Exception:
+            pass
+      raise
+   if proc.returncode != 0:
+      raise RuntimeError("nvidia-smi exit %d" % proc.returncode)
+   return [[cell.strip() for cell in line.split(",")] for line in out.split("\n") if line.strip()]
 
 
 def query_gpus(timeout=5.0):
@@ -643,10 +668,11 @@ def query_gpus(timeout=5.0):
    binary = shutil.which("nvidia-smi")
    if binary is None:
       return [], {}, None
+   deadline = time.monotonic() + timeout
    try:
       gpus = []
       for cells in _run_nvidia_smi(
-         binary, "--query-gpu=index,utilization.gpu,memory.used,memory.total", timeout
+         binary, "--query-gpu=index,utilization.gpu,memory.used,memory.total", deadline
       ):
          index, util, used, total = cells
          gpus.append(
@@ -658,7 +684,7 @@ def query_gpus(timeout=5.0):
             }
          )
       by_pid = {}
-      for cells in _run_nvidia_smi(binary, "--query-compute-apps=pid,used_memory", timeout):
+      for cells in _run_nvidia_smi(binary, "--query-compute-apps=pid,used_memory", deadline):
          pid, used = cells
          by_pid[int(pid)] = by_pid.get(int(pid), 0) + int(used)
    except subprocess.TimeoutExpired:
