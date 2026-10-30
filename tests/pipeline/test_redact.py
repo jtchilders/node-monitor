@@ -22,6 +22,27 @@ MASKED = [
    ("mysql -pSecret db", "mysql -p*** db"),
    ("/usr/bin/mariadb -pSecret db", "/usr/bin/mariadb -p*** db"),
    ("echo Bearer abcdefghijklmnopqrstu", "echo Bearer ***"),
+   # Long keywords may end a glued or camelCase name.
+   ("PGPASSWORD=hunter2 psql", "PGPASSWORD=*** psql"),
+   ("tool --secret_key=abc", "tool --secret_key=***"),
+   ("tool --secretkey=def", "tool --secretkey=***"),
+   ("tool --clientSecret s4", "tool --clientSecret ***"),
+   # A single dash before an option name.
+   ("tool -password hunter2", "tool -password ***"),
+   ("tool -token=abc123", "tool -token=***"),
+   ("tool -api-key=XYZ", "tool -api-key=***"),
+   # Java -D<prop>=value, where the property may contain dots.
+   ("java -Dpassword=hunter2 X", "java -Dpassword=*** X"),
+   (
+      "java -Djavax.net.ssl.keyStorePassword=pw X",
+      "java -Djavax.net.ssl.keyStorePassword=*** X",
+   ),
+   ("java -Dmy.auth=pw X", "java -Dmy.auth=*** X"),
+   ("java -Dauth=pw X", "java -Dauth=*** X"),
+   ("tool --ssh-key k1", "tool --ssh-key ***"),
+   # The password runs to the last @ before the host.
+   ("curl https://bob:p@ss@host/x", "curl https://bob:***@host/x"),
+   ("curl https://bob:p@ss@host", "curl https://bob:***@host"),
 ]
 
 UNTOUCHED = [
@@ -43,6 +64,13 @@ UNTOUCHED = [
    "ssh -p22 host",
    "mysql -p db",
    "curl -u bob url",
+   "java -Dfile.encoding=UTF-8 X",
+   "tool --tokenizer bert",
+   "env TOKENIZERS_PARALLELISM=false python",
+   "tool -keyfile x",
+   "tool --keyfile x",
+   "make -j32 author=me",
+   "curl https://host:8080/a@b",
 ]
 
 
@@ -96,3 +124,18 @@ def test_long_and_non_ascii_cmdlines():
    out = R.redact(long)
    assert out == long and time.perf_counter() - t < 0.5
    assert R.redact("runé --password=pässwörd") == "runé --password=***"
+
+
+@pytest.mark.parametrize(
+   "cmdline",
+   [
+      "x " + "a." * 50000,  # dotted names: every segment could start a name
+      "x -" + "a-" * 50000 + " v",  # one long dashed option name with a value
+      "x " + "token" * 20000,  # a keyword repeated without an `=`
+      "x https://u:" + "p@" * 50000,  # a URL password full of `@` and no host end
+   ],
+)
+def test_pathological_inputs_stay_fast(cmdline):
+   t = time.perf_counter()
+   R.redact(cmdline)
+   assert time.perf_counter() - t < 0.5

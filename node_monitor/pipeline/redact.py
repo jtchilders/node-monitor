@@ -10,26 +10,48 @@ from collections.abc import Iterable
 
 MASK = "***"
 
-# A name carries a secret when its last `-`/`_` segment is a secret keyword (`--auth-type` is
-# not, `--oauth-token` is). `api-key` and `access_key` span two segments, so they are listed.
-_SECRET_SUFFIX = (
-   r"(?:passphrase|password|passwd|pwd|pass|pat|token|secret|auth|credentials?"
-   r"|(?:api|access)[-_]?key)"
+# Long keywords are unambiguous enough to end a glued or camelCase name (`PGPASSWORD`,
+# `keyStorePassword`, `clientSecret`). They must END the name: `--tokenizer`,
+# `TOKENIZERS_PARALLELISM` and `--max-tokens` are not secrets.
+_LONG_KEYWORD = r"(?:passphrase|password|passwd|secret|token|(?:api|access|secret)[-_]?key)"
+# Short keywords are common inside ordinary words (`--author`, `-keyfile`, `classpath`), so
+# they count only as the whole name or its last `-`/`_`/`.` segment (`--oauth-token` but not
+# `--auth-type`).
+_SHORT_KEYWORD = r"(?:pass|pat|pwd|auth|key|credentials?)"
+_NAME_CHAR = r"[A-Za-z0-9_.-]"
+# Names starting with `no-`/`no_` negate a feature (`--no-auth`) and are never secrets. A name
+# starts with a letter or digit, so `--no-auth` cannot be re-read as `-` + `-no-auth`.
+_SECRET_NAME = (
+   r"(?!no[-_])(?=[A-Za-z0-9])(?:"
+   + _NAME_CHAR
+   + "*"
+   + _LONG_KEYWORD
+   + "|(?:"
+   + _NAME_CHAR
+   + "*[-_.])?"
+   + _SHORT_KEYWORD
+   + ")"
 )
-# Names starting with `no-`/`no_` negate a feature (`--no-auth`) and are never secrets.
-_NOT_NEGATED = r"(?!no[-_])"
-_OPTION_NAME = _NOT_NEGATED + r"(?:[A-Za-z0-9_-]*[-_])?" + _SECRET_SUFFIX
-_ENV_NAME = _NOT_NEGATED + r"(?:[A-Za-z0-9][A-Za-z0-9_-]*[-_])?" + _SECRET_SUFFIX
+# A match may start only where no name character precedes it. Every name character is in
+# this set, so each run of name characters has a single start and matching stays linear.
+_NAME_START = r"(?<![\w.-])"
 # A quoted value is taken whole so that spaces inside it cannot leak the rest of it.
 _VALUE = r"""((?:"[^"]*"|'[^']*'|\S+))"""
 
-# `--opt=value` and `--opt value`. A value after a separate option must not itself be a flag.
-_OPTION_EQ = re.compile(r"(?<![\w-])--" + _OPTION_NAME + "=" + _VALUE, re.IGNORECASE)
-_OPTION_SPACE = re.compile(r"(?<![\w-])--" + _OPTION_NAME + r"[ \t]+(?!-)" + _VALUE, re.IGNORECASE)
-# `KEY=value` assignments. The lookbehind keeps `--opt=` out of this rule.
-_ASSIGNMENT = re.compile(r"(?<![\w-])" + _ENV_NAME + "=" + _VALUE, re.IGNORECASE)
-# The password in `scheme://user:password@host`.
-_URL_PASSWORD = re.compile(r"(?<=://)[^\s/:@]+:([^\s/@]+)(?=@)")
+# `--opt=value`, `-opt=value` and Java's `-D<prop>=value` (`-D` is tried as a prefix first so
+# that `-Dauth=x` is read as the property `auth`).
+_OPTION_EQ = re.compile(
+   _NAME_START + r"(?:(?-i:-D)|--?)" + _SECRET_NAME + "=" + _VALUE, re.IGNORECASE
+)
+# `--opt value` and `-opt value`. The value must not itself be a flag.
+_OPTION_SPACE = re.compile(
+   _NAME_START + r"--?" + _SECRET_NAME + r"[ \t]+(?!-)" + _VALUE, re.IGNORECASE
+)
+# `KEY=value` assignments. The name-start lookbehind keeps `--opt=` out of this rule.
+_ASSIGNMENT = re.compile(_NAME_START + _SECRET_NAME + "=" + _VALUE, re.IGNORECASE)
+# The password in `scheme://user:password@host`. It runs to the last `@` before the host,
+# since a password may itself contain `@`; the host part has no `@`, `/` or whitespace.
+_URL_PASSWORD = re.compile(r"(?<=://)[^\s/:@]+:([^\s/]+)(?=@[^\s/@]*(?:[/\s]|$))")
 # curl/wget style `-u user:pass` and `--user user:pass`. Without a colon there is no password.
 _BASIC_AUTH = re.compile(r"(?<![\w-])(?:-u[ \t]+|--user(?:[ \t]+|=))[^\s:/'\"]+:([^\s'\"]+)")
 # The whole header value, optionally with a scheme word, up to whitespace or a closing quote.
@@ -76,15 +98,18 @@ class Redactor:
       self._extra = tuple(re.compile(p) for p in extra_patterns)
 
    def redact(self, cmdline: str) -> str:
-      text = _sub(_OPTION_EQ, cmdline)
+      text = cmdline
+      # First, so that `-pSecret db` is not read as an option ending in `secret` whose
+      # value is `db`.
+      if _argv0_basename(cmdline) in _MYSQL_TOOLS:
+         text = _sub(_MYSQL_PASSWORD, text)
+      text = _sub(_OPTION_EQ, text)
       text = _sub(_OPTION_SPACE, text)
       text = _sub(_ASSIGNMENT, text)
       text = _sub(_URL_PASSWORD, text)
       text = _sub(_BASIC_AUTH, text)
       text = _sub(_AUTH_HEADER, text)
       text = _sub(_BEARER, text)
-      if _argv0_basename(cmdline) in _MYSQL_TOOLS:
-         text = _sub(_MYSQL_PASSWORD, text)
       for pattern in self._extra:
          text = _sub(pattern, text)
       for pattern in _KNOWN_KEYS:
