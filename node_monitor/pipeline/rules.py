@@ -1,7 +1,7 @@
 """Process classification rule tables, tuned against real login-node observations.
 
-Matching is highest-priority-wins (see classify.py), so only the priority numbers decide
-overlaps, never list position.
+Matching is highest-priority-wins (see classify.py): only priority decides overlaps; ties
+go to the earlier rule.
 """
 
 SPEC_CATEGORIES = frozenset(

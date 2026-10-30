@@ -1,4 +1,10 @@
-"""Storage record type and kinds produced by the per-node pipeline."""
+"""Storage record type and kinds produced by the per-node pipeline.
+
+`LIVE_NODE` rows are partial updates keyed by (system, node): a key missing from a row
+means "unchanged", so a writer must update only the columns present. When a session is lost
+the row carries just the identity, `label`, `updated_at` and `session_state`, and the last
+known gauges are kept rather than overwritten with nulls.
+"""
 
 from collections import namedtuple
 

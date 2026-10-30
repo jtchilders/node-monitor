@@ -3,6 +3,8 @@
 from datetime import datetime, timezone
 from statistics import median
 
+from node_monitor.pipeline.timestamps import require_aware
+
 NODE_METRICS_COLUMNS = (
    "minute",
    "cpu_pct",
@@ -21,16 +23,22 @@ NODE_METRICS_COLUMNS = (
    "network_rates",
    "lustre_md_rates",
    "gpus",
+   "gpu_status",
    "sample_latency_sec",
    "clock_offset_sec",
    "probe_cpu_seconds",
    "probe_maxrss_kb",
+   "probe_rss_kb",
    "sample_count",
    "expected_count",
 )
 
 # guest/guest_nice are already counted inside user/nice, so they are left out of the total.
 CPU_KEYS = ("user", "nice", "system", "iowait", "irq", "softirq", "steal", "idle")
+
+
+# Census minutes held while waiting for counters to open them.
+_MAX_PENDING_CENSUS_MINUTES = 10
 
 
 def _floor_minute(recv):
@@ -62,6 +70,7 @@ class _Minute:
       self.md = {}  # fs -> [delta, elapsed]
       self.probe_cpu = 0.0
       self.probe_pairs = 0
+      self.probe_rss = None
 
 
 class MinuteAggregator:
@@ -69,21 +78,30 @@ class MinuteAggregator:
       self._expected = round(60 / counter_interval_sec)
       self._open = None
       self._prev = None  # (msg, recv, session_id)
-      self._census = {}  # minute -> [gpus, max scan_seconds]
+      self._census = {}  # minute -> [gpus, max scan_seconds, gpu_status]
+      self._last_closed = None
 
    def add_census(self, msg, recv):
-      minute = _floor_minute(recv)
+      minute = _floor_minute(require_aware(recv))
       if self._open is not None and minute < self._open.minute:
          return
-      slot = self._census.setdefault(minute, [[], None])
+      if self._last_closed is not None and minute <= self._last_closed:
+         return
+      slot = self._census.setdefault(minute, [[], None, None])
       slot[0] = msg.get("gpus") or []
       scan = msg.get("scan_seconds")
       if scan is not None and (slot[1] is None or scan > slot[1]):
          slot[1] = scan
+      slot[2] = msg.get("gpu_status")
+      # Censuses only leave this map when their minute closes, which needs counters; a
+      # census-only stream would otherwise grow it forever. The newest minutes are kept
+      # because counters, when they come, are for the present.
+      while len(self._census) > _MAX_PENDING_CENSUS_MINUTES:
+         del self._census[min(self._census)]
 
    def add_counters(self, msg, recv, session_id):
       rows = []
-      minute = _floor_minute(recv)
+      minute = _floor_minute(require_aware(recv))
       if self._open is not None and minute > self._open.minute:
          rows.append(self._close())
       # A receive clock stepping backwards folds into the open minute rather than
@@ -93,6 +111,9 @@ class MinuteAggregator:
       cur = self._open
       cur.sample_count += 1
       cur.last = msg
+      rss = (msg.get("probe_self") or {}).get("rss_kb")
+      if rss is not None:
+         cur.probe_rss = rss
       try:
          cur.offsets.append((recv - _parse_ts(msg["ts"])).total_seconds())
       except (KeyError, TypeError, ValueError):
@@ -154,13 +175,14 @@ class MinuteAggregator:
 
    def _close(self):
       cur, self._open = self._open, None
+      self._last_closed = cur.minute
       last = cur.last
       mem = last.get("mem") or {}
       total = sum(cur.cpu.values())
       cpu_pct = None
       if cur.cpu_pairs and total > 0:
          cpu_pct = {k: round(100.0 * cur.cpu[k] / total, 2) for k in CPU_KEYS}
-      gpus, latency = self._census.pop(cur.minute, [[], None])
+      gpus, latency, gpu_status = self._census.pop(cur.minute, [[], None, None])
       for stale in [m for m in self._census if m < cur.minute]:
          del self._census[stale]
       probe = last.get("probe_self") or {}
@@ -183,16 +205,21 @@ class MinuteAggregator:
          "mem_shmem_kb": mem.get("shmem_kb"),
          "mem_used_kb": diff(mem.get("total_kb"), mem.get("available_kb")),
          "swap_used_kb": diff(mem.get("swap_total_kb"), mem.get("swap_free_kb")),
+         # Sorted so stored maps have a stable key order, whatever order sets iterate in.
          "network_rates": {
             iface: {"rx_bytes_per_sec": rx / el, "tx_bytes_per_sec": tx / el}
-            for iface, (rx, tx, el) in cur.net.items()
+            for iface, (rx, tx, el) in sorted(cur.net.items())
          },
-         "lustre_md_rates": {fs: n / el for fs, (n, el) in cur.md.items()},
+         "lustre_md_rates": {fs: n / el for fs, (n, el) in sorted(cur.md.items())},
          "gpus": gpus,
+         "gpu_status": gpu_status,
          "sample_latency_sec": latency,
          "clock_offset_sec": round(median(cur.offsets), 3) if cur.offsets else None,
          "probe_cpu_seconds": cur.probe_cpu if cur.probe_pairs else None,
+         # ru_maxrss drifts tens of MiB on many-core kernels; rss_kb (smaps_rollup Rss on
+         # kernels >= 4.14) is exact, so it is the one to judge probe memory by.
          "probe_maxrss_kb": probe.get("maxrss_kb"),
+         "probe_rss_kb": cur.probe_rss,
          "sample_count": cur.sample_count,
          "expected_count": self._expected,
       }

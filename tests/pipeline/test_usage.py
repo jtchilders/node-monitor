@@ -222,3 +222,8 @@ def test_intervals_are_epoch_aligned_and_close_on_later_census():
    assert starts == {at(0)}
    out = agg.flush()
    assert {r["interval_start"] for _, r in out} == {at(300)}
+
+
+def test_naive_recv_is_rejected():
+   with pytest.raises(ValueError):
+      UsageAggregator(300, 60).add_census([e()], at(0).replace(tzinfo=None))

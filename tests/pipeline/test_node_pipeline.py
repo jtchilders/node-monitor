@@ -1,5 +1,7 @@
 from collections import Counter
 
+import pytest
+
 from node_monitor.config import (
    ClassificationConfig,
    CollectionConfig,
@@ -189,7 +191,14 @@ def test_session_lost_marks_node_down():
    recs = p.on_event("session_lost", {"reason": "eof"}, at(5))
    assert [r.kind for r in recs] == [COLLECTION_EVENT, LIVE_NODE]
    assert recs[0].row["event_type"] == "session_lost"
-   assert recs[1].row["session_state"] == "down" and recs[1].row["boot_id"] == "b9"
+   # A partial update: gauges absent, not null, so the last known values are kept.
+   assert recs[1].row == {
+      "system": "polaris",
+      "node": "n1.example",
+      "label": "N1",
+      "updated_at": at(5),
+      "session_state": "down",
+   }
 
 
 def test_flush_emits_partial_intervals():
@@ -210,3 +219,24 @@ def test_census_gpu_status_decides_whether_gpu_memory_was_measured():
       assert proc["gpu_mem_mb"] == live
       for kind in (USER_USAGE_5M, NODE_USAGE_5M):
          assert next(r for r in recs if r.kind == kind).row["gpu_mem_mb_avg"] == avg
+
+
+def test_naive_recv_is_rejected():
+   p = make_pipeline()
+   naive = at(0).replace(tzinfo=None)
+   with pytest.raises(ValueError):
+      p.on_message(counters(0), naive)
+   with pytest.raises(ValueError):
+      p.on_message(hello(), naive)
+   with pytest.raises(ValueError):
+      p.on_event("session_started", {"attempt": 1}, naive)
+
+
+def test_node_metrics_carry_census_gpu_status_and_probe_rss():
+   p = make_pipeline()
+   msg = counters(0)
+   msg["probe_self"] = {"cpu_seconds": 0.0, "children_cpu_seconds": 0.0, "rss_kb": 4321}
+   p.on_message(msg, at(0))
+   p.on_message(census(None, gpu_status="error"), at(1))
+   (m,) = [r.row for r in p.flush() if r.kind == NODE_METRICS_1M]
+   assert m["gpu_status"] == "error" and m["probe_rss_kb"] == 4321

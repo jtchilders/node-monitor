@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from node_monitor.pipeline.timestamps import require_aware
+
 _MAPS = ("by_category", "by_activity", "by_dormancy")
 
 _COMMON_COLUMNS = (
@@ -200,7 +202,7 @@ class UsageAggregator:
    def add_census(
       self, rows: list[dict], recv: datetime, gpu_status: str | None = None
    ) -> list[tuple[str, dict]]:
-      start = self._floor(recv)
+      start = self._floor(require_aware(recv))
       out = []
       if self._open is not None and start > self._open.start:
          out = self.flush()

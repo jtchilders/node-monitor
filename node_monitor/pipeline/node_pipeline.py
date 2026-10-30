@@ -16,6 +16,7 @@ from node_monitor.pipeline.records import (
    Record,
 )
 from node_monitor.pipeline.redact import Redactor
+from node_monitor.pipeline.timestamps import require_aware
 from node_monitor.pipeline.usage import UsageAggregator
 
 
@@ -75,6 +76,7 @@ class NodePipeline:
       return out
 
    def on_message(self, msg: dict, recv: datetime) -> list[Record]:
+      require_aware(recv)
       kind = msg.get("type")
       if kind == "hello":
          return self._hello(msg, recv)
@@ -116,6 +118,8 @@ class NodePipeline:
          self._live_node(
             recv,
             "up",
+            boot_id=self._boot_id,
+            probe_version=self._probe_version,
             load1=msg.get("load1"),
             mem_used_kb=None if total is None or avail is None else total - avail,
             mem_total_kb=total,
@@ -128,14 +132,7 @@ class NodePipeline:
    def _live_node(self, recv, state, **extra):
       return Record(
          LIVE_NODE,
-         self._row(
-            label=self._node.label,
-            updated_at=recv,
-            session_state=state,
-            boot_id=self._boot_id,
-            probe_version=self._probe_version,
-            **extra,
-         ),
+         self._row(label=self._node.label, updated_at=recv, session_state=state, **extra),
       )
 
    def _census(self, msg, recv):
@@ -162,21 +159,13 @@ class NodePipeline:
       return out
 
    def on_event(self, kind: str, detail: dict, recv: datetime) -> list[Record]:
+      require_aware(recv)
       if kind == "session_started":
          self._session_id += 1
       out = [self._event(kind, dict(detail), recv)]
       if kind == "session_lost":
-         out.append(
-            self._live_node(
-               recv,
-               "down",
-               load1=None,
-               mem_used_kb=None,
-               mem_total_kb=None,
-               procs_total=None,
-               last_census_at=self._last_census_at,
-            )
-         )
+         # Only the state changes: the last known gauges stay as they were.
+         out.append(self._live_node(recv, "down"))
       return out
 
    def flush(self) -> list[Record]:

@@ -187,3 +187,69 @@ def test_zero_elapsed_pair_contributes_nothing_and_does_not_crash():
    assert row["network_rates"]["hsn0"]["rx_bytes_per_sec"] == 100.0
    assert row["lustre_md_rates"] == {"eagle": 5.0}
    assert row["cpu_pct"]["user"] == 25.0
+
+
+def test_probe_rss_kb_is_last_non_null_in_minute():
+   agg = MinuteAggregator(10)
+   for t, rss in ((0, 4000), (10, 4100), (20, None)):
+      msg = counters(t, {"user": t})
+      msg["probe_self"]["rss_kb"] = rss
+      agg.add_counters(msg, at(t), 1)
+   (row,) = agg.add_counters(counters(60, {"user": 60}), at(60), 1)
+   assert row["probe_rss_kb"] == 4100
+   msg = counters(120, {"user": 120})
+   del msg["probe_self"]
+   agg.add_counters(msg, at(120), 1)
+   rows = agg.flush()
+   assert rows[0]["probe_rss_kb"] is None
+
+
+def test_gpu_status_is_latest_census_in_minute():
+   agg = MinuteAggregator(10)
+   agg.add_counters(counters(0, {"user": 0}), at(0), 1)
+   agg.add_census({"gpus": [], "gpu_status": "ok"}, at(5))
+   agg.add_census({"gpus": [], "gpu_status": "suspended"}, at(35))
+   (row,) = agg.add_counters(counters(60, {"user": 0}), at(60), 1)
+   assert row["gpu_status"] == "suspended" and row["gpus"] == []
+   (row2,) = agg.flush()
+   assert row2["gpu_status"] is None and row2["gpus"] == []
+
+
+def test_rate_maps_have_sorted_keys():
+   ifaces = ("ib1", "hsn0", "eth0", "ib0", "bond0")
+   agg = MinuteAggregator(10)
+   for t in (0, 10):
+      msg = counters(t, {"user": t})
+      msg["net"] = {i: {"rx_bytes": t, "tx_bytes": t} for i in ifaces}
+      msg["md_ops"] = {f"{fs}-MDT0000-mdc-ffff": {"total": t} for fs in ("home", "eagle", "flare")}
+      agg.add_counters(msg, at(t), 1)
+   (row,) = agg.flush()
+   assert list(row["network_rates"]) == sorted(ifaces)
+   assert list(row["lustre_md_rates"]) == ["eagle", "flare", "home"]
+
+
+def test_census_without_counters_does_not_accumulate():
+   agg = MinuteAggregator(10)
+   for i in range(100):
+      agg.add_census({"gpus": [{"idx": i}], "gpu_status": "ok"}, at(60 * i))
+   assert len(agg._census) <= 10
+   (row,) = agg.add_counters(counters(0, {"user": 0}), at(60 * 99 + 1), 1) + agg.flush()
+   assert row["gpus"] == [{"idx": 99}]
+
+
+def test_census_for_a_closed_minute_is_not_kept():
+   agg = MinuteAggregator(10)
+   agg.add_counters(counters(0, {"user": 0}), at(0), 1)
+   agg.add_counters(counters(60, {"user": 0}), at(60), 1)
+   agg.flush()
+   agg.add_census({"gpus": [{"idx": 0}]}, at(30))
+   assert agg._census == {}
+
+
+def test_naive_recv_is_rejected():
+   agg = MinuteAggregator(10)
+   naive = at(0).replace(tzinfo=None)
+   with pytest.raises(ValueError):
+      agg.add_counters(counters(0, {"user": 0}), naive, 1)
+   with pytest.raises(ValueError):
+      agg.add_census({"gpus": []}, naive)
