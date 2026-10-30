@@ -152,9 +152,12 @@ class NodePipeline:
       if self._last_interval is not None and start <= self._last_interval:
          return self._late(msg, recv)
       self._last_census_at = recv
-      enriched = enrich_census(rows, redactor=self._redactor, min_user_uid=self._min_user_uid)
+      gpu_status = msg.get("gpu_status")
+      enriched = enrich_census(
+         rows, redactor=self._redactor, min_user_uid=self._min_user_uid, gpu_status=gpu_status
+      )
       out = [Record(LIVE_PROCESSES, self._row(ts=recv, processes=enriched))]
-      out += self._usage_records(self._usage.add_census(enriched, recv))
+      out += self._usage_records(self._usage.add_census(enriched, recv, gpu_status))
       self._minutes.add_census(msg, recv)
       return out
 

@@ -91,7 +91,7 @@ def row(**overrides):
    return base
 
 
-def census(rows):
+def census(rows, gpu_status="ok"):
    msg = {
       "type": "census",
       "seq": 1,
@@ -99,7 +99,7 @@ def census(rows):
       "gpus": [],
       "scan_seconds": 0.2,
       "coverage": {},
-      "gpu_status": "ok",
+      "gpu_status": gpu_status,
       "interval_sec": 60,
    }
    if rows is not None:
@@ -199,3 +199,14 @@ def test_flush_emits_partial_intervals():
    recs = p.flush()
    assert Counter(r.kind for r in recs) == {NODE_METRICS_1M: 1, USER_USAGE_5M: 1, NODE_USAGE_5M: 1}
    assert p.flush() == []
+
+
+def test_census_gpu_status_decides_whether_gpu_memory_was_measured():
+   for status, live, avg in (("ok", 0.0, 0.0), ("suspended", None, None)):
+      p = make_pipeline()
+      recs = p.on_message(census([row(gpu_mem_mb=None)], gpu_status=status), at(0))
+      recs += p.flush()
+      (proc,) = next(r for r in recs if r.kind == LIVE_PROCESSES).row["processes"]
+      assert proc["gpu_mem_mb"] == live
+      for kind in (USER_USAGE_5M, NODE_USAGE_5M):
+         assert next(r for r in recs if r.kind == kind).row["gpu_mem_mb_avg"] == avg

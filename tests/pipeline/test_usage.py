@@ -1,3 +1,5 @@
+import pytest
+
 from node_monitor.pipeline.usage import NODE_USAGE_COLUMNS, USER_USAGE_COLUMNS, UsageAggregator
 from tests.pipeline import at
 
@@ -122,20 +124,94 @@ def test_partial_interval_on_flush_has_reduced_sample_count():
    assert agg.flush() == []
 
 
-def test_unmeasured_gpu_and_null_username():
+def test_unmeasured_cpu_and_unresolved_owners_stay_apart():
    agg = UsageAggregator(300, 60)
    agg.add_census(
       [
-         e(username=None, cpu_seconds=None, gpu_mem_mb=None),
-         e(username=None, cpu_seconds=3.0, gpu_mem_mb=200, threads=4),
+         e(username="uid:5001", uid=5001, cpu_seconds=None, gpu_mem_mb=0.0),
+         e(username="uid:5001", uid=5001, cpu_seconds=3.0, gpu_mem_mb=200, threads=4),
+         e(username="uid:5002", uid=5002, cpu_seconds=1.0, gpu_mem_mb=0.0),
       ],
       at(10),
+      gpu_status="ok",
    )
-   user = by_kind(agg.flush())["user_usage_5m"][0]
-   assert user["username"] is None
+   users = {r["username"]: r for r in by_kind(agg.flush())["user_usage_5m"]}
+   assert set(users) == {"uid:5001", "uid:5002"}
+   user = users["uid:5001"]
    assert user["unmeasured_count"] == 1 and user["cpu_seconds"] == 3.0
    assert user["gpu_mem_mb_avg"] == 200 and user["gpu_mem_mb_max"] == 200
    assert user["threads_avg"] == 5.0
+   assert users["uid:5002"]["process_count_max"] == 1
+
+
+def test_gpu_memory_is_null_when_no_census_measured_it():
+   agg = UsageAggregator(300, 60)
+   agg.add_census([e(gpu_mem_mb=None)], at(0), gpu_status="error")
+   agg.add_census([e(gpu_mem_mb=None)], at(60), gpu_status="suspended")
+   agg.add_census([e(gpu_mem_mb=None)], at(120))
+   res = by_kind(agg.flush())
+   for row in (res["user_usage_5m"][0], res["node_usage_5m"][0]):
+      assert row["gpu_mem_mb_avg"] is None and row["gpu_mem_mb_max"] is None
+      assert row["sample_count"] == 3
+
+
+def test_gpu_memory_averages_over_measured_censuses_only():
+   agg = UsageAggregator(300, 60)
+   agg.add_census([e(gpu_mem_mb=100)], at(0), gpu_status="ok")
+   agg.add_census([e(gpu_mem_mb=None)], at(60), gpu_status="error")
+   agg.add_census([e(gpu_mem_mb=300)], at(120), gpu_status="ok")
+   # A user missing from a measured census counts as zero there.
+   agg.add_census([e(username="bob", gpu_mem_mb=0.0)], at(180), gpu_status="ok")
+   res = by_kind(agg.flush())
+   alice = next(r for r in res["user_usage_5m"] if r["username"] == "alice")
+   assert alice["gpu_mem_mb_avg"] == 400 / 3 and alice["gpu_mem_mb_max"] == 300
+   node = res["node_usage_5m"][0]
+   assert node["gpu_mem_mb_avg"] == 400 / 3 and node["gpu_mem_mb_max"] == 300
+
+
+def test_expected_count_is_an_int():
+   for census_sec, expected in ((60, 5), (70, 4)):
+      agg = UsageAggregator(300, census_sec)
+      agg.add_census([e()], at(0))
+      for _, row in agg.flush():
+         assert row["expected_count"] == expected and type(row["expected_count"]) is int
+
+
+def test_category_absent_from_some_censuses_divides_by_sample_count():
+   censuses = [
+      [
+         e(category="python", rss_kb=100, cpu_seconds=1.0, state="D", interactive=True),
+         e(category="python", rss_kb=200, cpu_seconds=2.0),
+         e(category="shell", rss_kb=50, cpu_seconds=0.5, state="D"),
+      ],
+      [e(category="python", rss_kb=300, cpu_seconds=3.0)],
+      [
+         e(category="shell", rss_kb=70, cpu_seconds=1.0, interactive=True),
+         e(category="build", rss_kb=40, cpu_seconds=4.0, state="D"),
+      ],
+   ]
+   agg = UsageAggregator(300, 60)
+   for i, rows in enumerate(censuses):
+      agg.add_census(rows, at(60 * i))
+   res = by_kind(agg.flush())
+   for row in (res["user_usage_5m"][0], res["node_usage_5m"][0]):
+      assert row["sample_count"] == 3
+      cats = row["by_category"]
+      assert cats["python"] == {"count": 1.0, "cpu_s": 6.0, "rss_kb": 200.0}
+      assert cats["shell"] == {
+         "count": pytest.approx(2 / 3),
+         "cpu_s": 1.5,
+         "rss_kb": pytest.approx(40.0),
+      }
+      assert cats["build"] == {
+         "count": pytest.approx(1 / 3),
+         "cpu_s": 4.0,
+         "rss_kb": pytest.approx(40 / 3),
+      }
+      # Weighted by process samples (3 of 6 in D, 2 of 6 interactive), not a per-census
+      # average of fractions (7/18 and 5/18).
+      assert row["d_state_fraction"] == 0.5
+      assert row["interactive_fraction"] == pytest.approx(1 / 3)
 
 
 def test_intervals_are_epoch_aligned_and_close_on_later_census():

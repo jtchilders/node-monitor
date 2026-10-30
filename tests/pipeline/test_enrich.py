@@ -100,3 +100,59 @@ def test_enrich_census_rows():
 def test_enrich_unresolvable_username_is_absent():
    out = enrich_census([r(username=None)], redactor=Redactor(), min_user_uid=1000)
    assert out[0]["owner_presence"] == "absent"
+
+
+def test_enrich_unresolved_username_keys_on_uid():
+   rows = [r(pid=1, uid=5001, username=None), r(pid=2, uid=5002, username=None), r(pid=3)]
+   out = {x["pid"]: x for x in enrich_census(rows, redactor=Redactor(), min_user_uid=1000)}
+   assert out[1]["username"] == "uid:5001" and out[2]["username"] == "uid:5002"
+   assert out[3]["username"] == "alice"
+   assert rows[0]["username"] is None
+
+
+def test_enrich_owner_presence_uses_the_uid_key():
+   # The user-side sshd process runs as the user, so its owner is the presence key.
+   rows = [
+      r(pid=1, uid=5001, username=None),
+      r(pid=2, uid=5001, username=None, cmdline="sshd: dave@pts/1"),
+      r(pid=3, uid=5002, username=None),
+   ]
+   out = {x["pid"]: x for x in enrich_census(rows, redactor=Redactor(), min_user_uid=1000)}
+   assert out[1]["owner_presence"] == "interactive"
+   assert out[3]["owner_presence"] == "absent"
+
+
+def test_owner_presence_accepts_sshd_session_titles():
+   rows = [
+      r(uid=0, cmdline="sshd-session: alice [priv]"),
+      r(uid=1001, username="alice", cmdline="sshd-session: alice@notty"),
+      r(uid=1002, username="bob", cmdline="sshd-session: bob@pts/4"),
+   ]
+   assert owner_presence_by_user(rows) == {"alice": "connected", "bob": "interactive"}
+
+
+@pytest.mark.parametrize(
+   "status,sent,stored",
+   [
+      ("ok", None, 0.0),
+      ("ok", 512, 512),
+      ("error", None, None),
+      ("suspended", None, None),
+      ("absent", None, None),
+      (None, None, None),
+      (None, 64, 64),
+   ],
+)
+def test_enrich_gpu_mem_is_zero_only_when_measured(status, sent, stored):
+   (out,) = enrich_census(
+      [r(gpu_mem_mb=sent)], redactor=Redactor(), min_user_uid=1000, gpu_status=status
+   )
+   assert out["gpu_mem_mb"] == stored
+
+
+def test_enrich_redacts_argv0_titles():
+   rows = [r(argv0="worker --token abc123", cmdline="worker --token abc123")]
+   (out,) = enrich_census(rows, redactor=Redactor(), min_user_uid=1000)
+   assert out["argv0"] == "worker --token ***" and out["cmdline"] == "worker --token ***"
+   (out,) = enrich_census([r(argv0=None)], redactor=Redactor(), min_user_uid=1000)
+   assert out["argv0"] is None
