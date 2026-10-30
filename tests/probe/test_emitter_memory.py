@@ -1,4 +1,4 @@
-"""Probe emitter: bounded memory per message, and byte-exact compact JSON output."""
+"""Probe memory: bounded emitter allocation, byte-exact compact JSON, own RSS reading."""
 
 import io
 import json
@@ -135,3 +135,37 @@ def test_encoding_failure_mid_line_ends_the_fragment_and_keeps_seq(probe):
 
 def test_rss_limit_default(probe):
    assert probe.default_config()["probe_rss_limit_mb"] == 128
+
+
+ROLLUP = "00400000-7fff00000000 ---p 00000000 00:00 0  [rollup]\nRss:   23456 kB\nPss:   20000 kB\n"
+STATUS = "Name:\tpython3\nVmHWM:\t   40000 kB\nVmRSS:\t   34567 kB\nThreads:\t2\n"
+
+
+def test_own_rss_prefers_exact_smaps_rollup(probe, tmp_path):
+   (tmp_path / "rollup").write_text(ROLLUP)
+   (tmp_path / "status").write_text(STATUS)
+   assert probe.own_rss_kb(str(tmp_path / "rollup"), str(tmp_path / "status")) == 23456
+
+
+def test_own_rss_falls_back_to_vmrss_without_smaps_rollup(probe, tmp_path):
+   (tmp_path / "status").write_text(STATUS)
+   assert probe.own_rss_kb(str(tmp_path / "missing"), str(tmp_path / "status")) == 34567
+
+
+def test_own_rss_falls_back_when_smaps_rollup_lacks_rss(probe, tmp_path):
+   (tmp_path / "rollup").write_text("garbage\n")
+   (tmp_path / "status").write_text(STATUS)
+   assert probe.own_rss_kb(str(tmp_path / "rollup"), str(tmp_path / "status")) == 34567
+
+
+def test_own_rss_is_none_when_nothing_is_readable(probe, tmp_path):
+   unreadable = tmp_path / "unreadable"
+   unreadable.write_text(STATUS)
+   unreadable.chmod(0)
+   # A directory raises EISDIR, which read_text does not treat as routine.
+   assert probe.own_rss_kb(str(tmp_path), str(unreadable)) is None
+   assert probe.own_rss_kb(str(tmp_path / "a"), str(tmp_path / "b")) is None
+
+
+def test_own_rss_default_reads_this_process(probe):
+   assert probe.own_rss_kb() > 1024

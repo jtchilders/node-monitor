@@ -191,7 +191,8 @@ def test_message_envelope_and_hello_fields(tmp_path, run_stream):
    assert hello["python_version"].startswith("%d." % sys.version_info[0])
    assert hello["hostname_fqdn"]
    probe_self = msgs[1]["probe_self"]
-   assert set(probe_self) == {"cpu_seconds", "children_cpu_seconds", "maxrss_kb"}
+   assert set(probe_self) == {"cpu_seconds", "children_cpu_seconds", "maxrss_kb", "rss_kb"}
+   assert probe_self["rss_kb"] > 1024
    assert msgs[1]["load1"] == 53.92
 
 
@@ -386,6 +387,20 @@ def test_rss_limit_emits_bye_and_exits(tmp_path, run_stream):
    assert [m["type"] for m in msgs][-2:] == ["census", "bye"]
    assert [m["seq"] for m in msgs] == list(range(len(msgs)))
    assert p.wait(timeout=5) == 0
+
+
+def test_unreadable_rss_keeps_streaming_without_bye(tmp_path, run_stream):
+   # smaps_rollup a directory (EISDIR), status missing: no reading, so no limit to apply.
+   config = cfg(
+      tmp_path,
+      probe_rss_limit_mb=1,
+      self_smaps_rollup_path=str(tmp_path),
+      self_status_path=str(tmp_path / "missing"),
+   )
+   p = run_stream(config)
+   msgs = read_messages(p, until=lambda ms: len(of_type(ms, "census")) >= 3, timeout=10)
+   assert of_type(msgs, "bye") == [] and of_type(msgs, "error") == [] and p.poll() is None
+   assert all(c["probe_self"]["rss_kb"] is None for c in of_type(msgs, "counters"))
 
 
 def test_rss_under_limit_keeps_streaming(tmp_path, run_stream):

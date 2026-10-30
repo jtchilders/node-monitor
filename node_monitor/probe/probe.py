@@ -761,10 +761,14 @@ LOCK_POLL_SEC = 0.1
 # A holder writes its pid just after taking the lock; allow it that long to appear.
 LOCK_PID_WAIT_SEC = 1.0
 # The most bytes of one message held as encoded output at once. A census line runs to
-# megabytes; building it whole (and copying it to add the newline and encode it) leaves a
-# differently sized multi-megabyte allocation every census, and glibc's heap high-water
-# mark climbs with them for the life of the process.
+# megabytes; building it whole (and copying it to add the newline and encode it) made
+# several differently sized multi-megabyte allocations and releases every census, and on
+# a login node the probe's reported resident size (VmRSS) climbed with them all session.
 EMIT_CHUNK_BYTES = 65536
+# Always the real /proc/self: the size being measured is the probe's own, not anything
+# in a test tree.
+SELF_SMAPS_ROLLUP = "/proc/self/smaps_rollup"
+SELF_STATUS = "/proc/self/status"
 
 
 def default_config():
@@ -779,9 +783,11 @@ def default_config():
       # Above this resident size the probe says `bye` and exits so the collector starts a
       # fresh one, whatever the cause of the growth.
       "probe_rss_limit_mb": 128,
-      # Not part of the collector's config surface; tests shorten them.
+      # Not part of the collector's config surface; tests shorten or redirect them.
       "gpu_timeout_sec": 5.0,
       "gpu_suspend_sec": GPU_SUSPEND_SEC,
+      "self_smaps_rollup_path": SELF_SMAPS_ROLLUP,
+      "self_status_path": SELF_STATUS,
    }
 
 
@@ -795,6 +801,10 @@ def _resolve_config(config):
 
 def _roots(cfg):
    return {"proc": cfg["proc_root"], "sys": cfg["sys_root"]}
+
+
+def _rss_sources(cfg):
+   return cfg["self_smaps_rollup_path"], cfg["self_status_path"]
 
 
 def _describe(exc):
@@ -1111,7 +1121,7 @@ def _emit_hello(emitter, cfg, roots):
       emitter.error("hello", problem)
 
 
-def _emit_counters(emitter, roots):
+def _emit_counters(emitter, roots, rss_sources):
    try:
       fields = collect_counters(roots)
       own = resource.getrusage(resource.RUSAGE_SELF)
@@ -1120,6 +1130,7 @@ def _emit_counters(emitter, roots):
          "cpu_seconds": round(own.ru_utime + own.ru_stime, 3),
          "children_cpu_seconds": round(children.ru_utime + children.ru_stime, 3),
          "maxrss_kb": own.ru_maxrss,
+         "rss_kb": own_rss_kb(*rss_sources),
       }
       emitter.emit("counters", fields)
    except Exception as exc:
@@ -1264,19 +1275,30 @@ def _start_watchdog(stdin, parent, emitter):
    thread.start()
 
 
-def own_rss_kb():
-   """This process's VmRSS in KiB, or None if unreadable.
-
-   Always the real /proc/self: the size being limited is the probe's own, not
-   anything in a test tree.
-   """
-   text = read_text("/proc/self/status")
+def _kb_field(path, name):
+   """The kB value on the `name:` line of a /proc file, or None on any read failure."""
+   try:
+      text = read_text(path)
+   except (IOError, OSError):
+      return None
    for line in (text or "").split("\n"):
-      if line.startswith("VmRSS:"):
+      if line.startswith(name + ":"):
          fields = line.split()
          if len(fields) > 1 and fields[1].isdigit():
             return int(fields[1])
    return None
+
+
+def own_rss_kb(smaps_rollup_path=SELF_SMAPS_ROLLUP, status_path=SELF_STATUS):
+   """This process's resident size in KiB, or None if it cannot be read.
+
+   smaps_rollup's Rss walks the page tables and is exact. VmRSS (the fallback, for
+   kernels before 4.14) comes from per-CPU counters that the kernel reads approximately;
+   on a many-core node it can drift tens of MiB above the real figure after heavy
+   allocate/free churn.
+   """
+   rss = _kb_field(smaps_rollup_path, "Rss")
+   return rss if rss is not None else _kb_field(status_path, "VmRSS")
 
 
 def _next_due(due, interval, now):
@@ -1329,18 +1351,19 @@ def stream(config, out=None, stdin=None):
    counter_interval = float(cfg["counter_interval_sec"])
    census_interval = float(cfg["census_interval_sec"])
    rss_limit_kb = float(cfg["probe_rss_limit_mb"]) * 1024
+   rss_sources = _rss_sources(cfg)
    next_counters = next_census = time.monotonic()
    while True:
       emitter.check_signal(PARENT_POLL_SEC)
       if os.getppid() != parent:
          return 0
       if time.monotonic() >= next_counters:
-         _emit_counters(emitter, roots)
+         _emit_counters(emitter, roots, rss_sources)
          next_counters = _next_due(next_counters, counter_interval, time.monotonic())
       if time.monotonic() >= next_census:
          census.emit()
          # Checked after a census because that is when the process is at its largest.
-         rss_kb = own_rss_kb()
+         rss_kb = own_rss_kb(*rss_sources)
          if rss_kb is not None and rss_kb > rss_limit_kb:
             emitter.emit("bye", {"reason": "rss_limit", "rss_kb": rss_kb})
             return 0
@@ -1357,7 +1380,7 @@ def once(config, out=None):
    roots = _roots(cfg)
    emitter = _Emitter(out)
    _emit_hello(emitter, cfg, roots)
-   _emit_counters(emitter, roots)
+   _emit_counters(emitter, roots, _rss_sources(cfg))
    _Census(cfg, roots, emitter).emit()
    return 0
 
