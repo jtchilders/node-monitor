@@ -108,7 +108,7 @@ class NodeSession:
          delay = min(self._backoff[1], base) * (0.5 + random.random() / 2)
          self._event("reconnect_wait", {"delay_sec": round(delay, 3), "failures": failures})
          try:
-            await asyncio.wait_for(self._stop.wait(), delay)
+            await _within(self._stop.wait(), delay)
          except asyncio.TimeoutError:
             pass
 
@@ -156,7 +156,7 @@ class NodeSession:
             await self._pump(proc.stdout, time.monotonic() + ROTATE_EOF_WAIT_SEC, None)
          elif outcome == "eof":
             try:
-               await asyncio.wait_for(proc.wait(), EXIT_GRACE_SEC)
+               await _within(proc.wait(), EXIT_GRACE_SEC)
                outcome = "exit"
             except asyncio.TimeoutError:
                pass
@@ -217,7 +217,7 @@ class NodeSession:
             return "deadline"
          by_deadline = silence is None or remaining < silence
          try:
-            line = await asyncio.wait_for(stdout.readline(), remaining if by_deadline else silence)
+            line = await _within(stdout.readline(), remaining if by_deadline else silence)
          except asyncio.TimeoutError:
             return "deadline" if by_deadline else "silence"
          except ValueError:
@@ -302,6 +302,28 @@ class _StderrLog:
          self._suppressed += 1
 
 
+async def _within(awaitable, timeout: float):
+   """Await `awaitable` for at most `timeout` seconds, raising asyncio.TimeoutError.
+
+   Stands in for asyncio.wait_for, which before Python 3.12 can swallow a cancellation
+   of the caller when the awaited operation completes in the same loop iteration; a
+   session would then ignore stop() for as long as the probe kept sending lines.
+   asyncio.wait never consumes the caller's cancellation.
+   """
+   inner = asyncio.ensure_future(awaitable)
+   try:
+      await asyncio.wait({inner}, timeout=timeout)
+   finally:
+      if not inner.done():
+         inner.cancel()
+         # Let the cancellation land so a later readline on the same stream does not
+         # find this one still waiting.
+         await asyncio.wait({inner})
+   if inner.cancelled():
+      raise asyncio.TimeoutError()
+   return inner.result()
+
+
 async def _drain(stream: asyncio.StreamReader, log: _StderrLog) -> None:
    while True:
       chunk = await stream.read(STDERR_CHUNK)
@@ -344,7 +366,7 @@ async def _group_gone(proc, timeout: float) -> bool:
    """Wait up to `timeout` for the leader to be reaped and the whole group to vanish."""
    deadline = time.monotonic() + timeout
    try:
-      await asyncio.wait_for(proc.wait(), timeout)
+      await _within(proc.wait(), timeout)
    except asyncio.TimeoutError:
       return False
    while _group_exists(proc.pid):
