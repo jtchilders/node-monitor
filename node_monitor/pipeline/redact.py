@@ -10,23 +10,38 @@ from collections.abc import Iterable
 
 MASK = "***"
 
-# Keywords must be whole name segments, so `author` does not match `auth` and `oauth` does not
-# match `auth`. Segments are separated by `-` or `_`.
-_KEY = r"(?:password|passwd|pwd|token|secret|api[-_]?key|auth|credential)"
-_NAME = r"(?:[A-Za-z0-9]+[-_])*" + _KEY + r"(?:[-_][A-Za-z0-9]+)*"
+# A name carries a secret when its last `-`/`_` segment is a secret keyword (`--auth-type` is
+# not, `--oauth-token` is). `api-key` and `access_key` span two segments, so they are listed.
+_SECRET_SUFFIX = (
+   r"(?:passphrase|password|passwd|pwd|pass|pat|token|secret|auth|credentials?"
+   r"|(?:api|access)[-_]?key)"
+)
+# Names starting with `no-`/`no_` negate a feature (`--no-auth`) and are never secrets.
+_NOT_NEGATED = r"(?!no[-_])"
+_OPTION_NAME = _NOT_NEGATED + r"(?:[A-Za-z0-9_-]*[-_])?" + _SECRET_SUFFIX
+_ENV_NAME = _NOT_NEGATED + r"(?:[A-Za-z0-9][A-Za-z0-9_-]*[-_])?" + _SECRET_SUFFIX
 # A quoted value is taken whole so that spaces inside it cannot leak the rest of it.
 _VALUE = r"""((?:"[^"]*"|'[^']*'|\S+))"""
 
 # `--opt=value` and `--opt value`. A value after a separate option must not itself be a flag.
-_OPTION_EQ = re.compile(r"(?<![\w-])--" + _NAME + "=" + _VALUE, re.IGNORECASE)
-_OPTION_SPACE = re.compile(r"(?<![\w-])--" + _NAME + r"[ \t]+(?!-)" + _VALUE, re.IGNORECASE)
+_OPTION_EQ = re.compile(r"(?<![\w-])--" + _OPTION_NAME + "=" + _VALUE, re.IGNORECASE)
+_OPTION_SPACE = re.compile(r"(?<![\w-])--" + _OPTION_NAME + r"[ \t]+(?!-)" + _VALUE, re.IGNORECASE)
 # `KEY=value` assignments. The lookbehind keeps `--opt=` out of this rule.
-_ASSIGNMENT = re.compile(r"(?<![\w-])" + _NAME + "=" + _VALUE, re.IGNORECASE)
+_ASSIGNMENT = re.compile(r"(?<![\w-])" + _ENV_NAME + "=" + _VALUE, re.IGNORECASE)
 # The password in `scheme://user:password@host`.
 _URL_PASSWORD = re.compile(r"(?<=://)[^\s/:@]+:([^\s/@]+)(?=@)")
+# curl/wget style `-u user:pass` and `--user user:pass`. Without a colon there is no password.
+_BASIC_AUTH = re.compile(r"(?<![\w-])(?:-u[ \t]+|--user(?:[ \t]+|=))[^\s:/'\"]+:([^\s'\"]+)")
 # The whole header value, optionally with a scheme word, up to whitespace or a closing quote.
 _AUTH_HEADER = re.compile(r"\bAuthorization:[ \t]*((?:[A-Za-z]+[ \t]+)?[^\s'\"]+)", re.IGNORECASE)
-_BEARER = re.compile(r"\bBearer[ \t]+([^\s'\"]+)", re.IGNORECASE)
+# Outside an Authorization header a bearer token is only recognised by its length, so prose
+# such as `Bearer is good` is left alone.
+_BEARER = re.compile(r"\bBearer[ \t]+([^\s'\"]{16,})", re.IGNORECASE)
+
+# Only these take a password attached to `-p` (`mysql -pSecret`); elsewhere `-p` is a flag
+# such as `mkdir -p` or `ssh -p 22`.
+_MYSQL_TOOLS = frozenset({"mysql", "mariadb", "mysqldump", "mysqladmin"})
+_MYSQL_PASSWORD = re.compile(r"(?<!\S)-p(\S+)")
 
 # Applied last, so they never fire inside text another rule has already masked.
 _KNOWN_KEYS = (
@@ -51,6 +66,11 @@ def _sub(pattern: re.Pattern, text: str) -> str:
    return pattern.sub(repl, text)
 
 
+def _argv0_basename(cmdline: str) -> str:
+   parts = cmdline.split(None, 1)
+   return parts[0].rsplit("/", 1)[-1] if parts else ""
+
+
 class Redactor:
    def __init__(self, extra_patterns: Iterable[str] = ()) -> None:
       self._extra = tuple(re.compile(p) for p in extra_patterns)
@@ -60,8 +80,11 @@ class Redactor:
       text = _sub(_OPTION_SPACE, text)
       text = _sub(_ASSIGNMENT, text)
       text = _sub(_URL_PASSWORD, text)
+      text = _sub(_BASIC_AUTH, text)
       text = _sub(_AUTH_HEADER, text)
       text = _sub(_BEARER, text)
+      if _argv0_basename(cmdline) in _MYSQL_TOOLS:
+         text = _sub(_MYSQL_PASSWORD, text)
       for pattern in self._extra:
          text = _sub(pattern, text)
       for pattern in _KNOWN_KEYS:
