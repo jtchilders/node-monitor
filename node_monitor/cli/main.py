@@ -25,6 +25,7 @@ COLUMNS = (
    "rotations",
    "reboots",
    "cpu_s/h",
+   "rss_MB",
    "maxrss_MB",
    "scan_p95_s",
    "procs",
@@ -79,6 +80,8 @@ def _row(label: str, s: dict) -> list[str]:
       str(s["rotations"]),
       str(s["reboots"]),
       _fmt(s["probe_cpu_sec_per_hour"], ".1f"),
+      # Exact RSS first; ru_maxrss drifts and is only a secondary check.
+      _fmt(None if s["probe_rss_kb_max"] is None else s["probe_rss_kb_max"] / 1024, ".1f"),
       _fmt(s["probe_maxrss_kb"] / 1024, ".1f"),
       _fmt(s["census_scan_p95"], ".2f"),
       _fmt(s["process_count_avg"], ".0f"),

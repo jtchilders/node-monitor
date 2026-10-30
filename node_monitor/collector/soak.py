@@ -299,6 +299,16 @@ class _NodeSummary:
       self.cpu_total = 0.0
       self._session_cpu_first = self._session_cpu_last = None
       self.maxrss = 0
+      # ru_maxrss drifts tens of MiB on many-core kernels; probe_self.rss_kb is exact, so
+      # probe memory is judged on it and kept as a sparse per-session series.
+      self.rss_max = None
+      self.rss_series: list[list[tuple[float, int]]] = []
+      self._session_start = None
+      self._rss_points: list[tuple[float, int]] = []
+      self._rss_next_hour = 0
+      self._rss_unsampled = None
+      self.rotation_reasons: dict[str, int] = defaultdict(int)
+      self.byes = 0
       self.scans: list[float] = []
       self.census = 0
       self._size_total = self._proc_total = 0
@@ -318,6 +328,29 @@ class _NodeSummary:
       if self._session_cpu_first is not None and self._session_cpu_last is not None:
          self.cpu_total += self._session_cpu_last - self._session_cpu_first
       self._session_cpu_first = self._session_cpu_last = None
+      if self._rss_unsampled is not None:
+         self._rss_points.append(self._rss_unsampled)
+      # Sessions whose probe sent no rss_kb (older probes) have no series.
+      if self._rss_points:
+         self.rss_series.append(self._rss_points)
+      self._session_start = self._rss_unsampled = None
+      self._rss_points = []
+      self._rss_next_hour = 0
+
+   def _add_rss(self, at: datetime, rss_kb: int) -> None:
+      """Keep the session's first value, the first at or after each whole hour since the
+      session started, and (on close) its last."""
+      self.rss_max = _max(self.rss_max, rss_kb)
+      if self._session_start is None:
+         self._session_start = at
+      hours = (at - self._session_start).total_seconds() / 3600
+      point = (round(hours, 1), rss_kb)
+      if not self._rss_points or hours >= self._rss_next_hour:
+         self._rss_points.append(point)
+         self._rss_next_hour = int(hours) + 1
+         self._rss_unsampled = None
+      else:
+         self._rss_unsampled = point
 
    def _add_event(self, ln: dict) -> None:
       ev = ln.get("event")
@@ -325,6 +358,7 @@ class _NodeSummary:
       if ev == "session_started":
          self.started += 1
          self._close_session()
+         self._session_start = _parse_ts(ln["recv"])
       elif ev == "session_lost":
          self.losses[detail.get("reason", "unknown")] += 1
          self.loss_timeline.append(
@@ -337,6 +371,8 @@ class _NodeSummary:
          )
       elif ev == "session_rotated":
          self.rotations += 1
+         # Rotations from before the probe could say `bye` carry no reason.
+         self.rotation_reasons[detail.get("reason") or "max_lifetime"] += 1
       elif ev == "node_rebooted":
          self.reboots += 1
       elif ev == "session_crashed":
@@ -355,6 +391,8 @@ class _NodeSummary:
          self._add_census(msg)
       elif kind == "error":
          self.errors_by_where[msg.get("where", "unknown")] += 1
+      elif kind == "bye":
+         self.byes += 1
 
    def _add_counters(self, at: datetime, msg: dict) -> None:
       self.counters += 1
@@ -368,6 +406,8 @@ class _NodeSummary:
             self._session_cpu_first = cpu
          self._session_cpu_last = cpu
          self.maxrss = max(self.maxrss, ps.get("maxrss_kb", 0))
+         if ps.get("rss_kb") is not None:
+            self._add_rss(at, ps["rss_kb"])
 
    def _add_census(self, msg: dict) -> None:
       self.census += 1
@@ -412,6 +452,8 @@ class _NodeSummary:
          "losses_by_reason": dict(self.losses),
          "loss_timeline": self.loss_timeline,
          "rotations": self.rotations,
+         "rotations_by_reason": dict(self.rotation_reasons),
+         "bye_count": self.byes,
          "reboots": self.reboots,
          "errors_by_where": dict(self.errors_by_where),
          "session_crashed_count": self.crashed,
@@ -419,6 +461,8 @@ class _NodeSummary:
          "probe_stderr_count": self.stderr,
          "probe_cpu_sec_per_hour": self.cpu_total / hours if hours > 0 else None,
          "probe_maxrss_kb": self.maxrss,
+         "probe_rss_kb_max": self.rss_max,
+         "probe_rss_series": self.rss_series,
          "census_scan_p50": _percentile(self.scans, 50),
          "census_scan_p95": _percentile(self.scans, 95),
          "census_scan_max": max(self.scans) if self.scans else None,

@@ -448,3 +448,78 @@ def test_cli_report_table_shows_census_coverage_and_errors(tmp_path):
    assert row[header.index("census%")] == "100.0" and row[header.index("errors")] == "1"
    as_json = CliRunner().invoke(cli, ["soak", "report", str(tmp_path), "--format", "json"])
    assert json.loads(as_json.output)["n1"]["errors_by_where"] == {"gpu": 1}
+
+
+def counters_rss(t, rss_kb, maxrss_kb=1000):
+   t, body = counters_at(t, cpu=0.0)
+   body["msg"]["probe_self"].update(rss_kb=rss_kb, maxrss_kb=maxrss_kb)
+   return t, body
+
+
+def bye_at(t, reason):
+   return t, {"kind": "msg", "msg": {"type": "bye", "seq": 9, "reason": reason}}
+
+
+def exact_rss_capture(tmp_path):
+   hour = 3600
+   s2 = 2 * hour + 1003
+   write_manifest_full(tmp_path)
+   write_lines(
+      tmp_path,
+      "n1",
+      [
+         event_at(0, "session_started", {"attempt": 1}),
+         counters_rss(10, 20000),
+         counters_rss(1800, 21000),
+         counters_rss(hour + 10, 22000),
+         counters_rss(hour + 600, None),
+         counters_rss(2 * hour + 5, 23000),
+         counters_rss(2 * hour + 1000, 23500),
+         bye_at(2 * hour + 1001, "rss_limit"),
+         event_at(2 * hour + 1002, "session_rotated", {"uptime_sec": 1, "reason": "rss_limit"}),
+         event_at(s2, "session_started", {"attempt": 1}),
+         counters_rss(s2 + 7, 18000, maxrss_kb=90000),
+         event_at(s2 + 8, "session_rotated", {"uptime_sec": 1}),
+         event_at(s2 + 9, "session_started", {"attempt": 1}),
+         counters_at(s2 + 10, cpu=0.0),
+      ],
+   )
+
+
+def test_summarize_exact_rss_series_rotations_and_byes(tmp_path):
+   exact_rss_capture(tmp_path)
+   s = summarize(tmp_path)["n1"]
+   assert s["probe_rss_kb_max"] == 23500 and s["probe_maxrss_kb"] == 90000
+   # Per session: the first value, the first at or after each whole hour, and the last.
+   # The last session's probe predates rss_kb, so it has no series.
+   assert s["probe_rss_series"] == [
+      [(0.0, 20000), (1.0, 22000), (2.0, 23000), (2.3, 23500)],
+      [(0.0, 18000)],
+   ]
+   assert s["rotations"] == 2
+   assert s["rotations_by_reason"] == {"rss_limit": 1, "max_lifetime": 1}
+   assert s["bye_count"] == 1
+
+
+def test_summarize_without_exact_rss(tmp_path):
+   write_manifest_full(tmp_path)
+   write_lines(tmp_path, "n1", [counters_at(0, 1.0), counters_at(10, 1.1)])
+   s = summarize(tmp_path)["n1"]
+   assert s["probe_rss_kb_max"] is None and s["probe_rss_series"] == []
+   assert s["rotations_by_reason"] == {} and s["bye_count"] == 0
+
+
+def test_cli_report_table_shows_exact_and_max_rss(tmp_path):
+   exact_rss_capture(tmp_path)
+   result = CliRunner().invoke(cli, ["soak", "report", str(tmp_path)])
+   assert result.exit_code == 0, result.output
+   header, row = (line.split() for line in result.output.splitlines()[:2])
+   assert row[header.index("rss_MB")] == "22.9" and row[header.index("maxrss_MB")] == "87.9"
+   assert header.index("rss_MB") < header.index("maxrss_MB")
+   other = tmp_path / "old"
+   other.mkdir()
+   write_manifest_full(other)
+   write_lines(other, "n1", [counters_at(0, 1.0)])
+   result = CliRunner().invoke(cli, ["soak", "report", str(other)])
+   header, row = (line.split() for line in result.output.splitlines()[:2])
+   assert row[header.index("rss_MB")] == "-"
