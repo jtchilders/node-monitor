@@ -128,6 +128,7 @@ collection:
   hourly_census: true
   session_silence_timeout_sec: 30
   session_max_lifetime_sec: 21600
+  probe_rss_limit_mb: 128
   reconnect_backoff_sec: [5, 300]
 classification:
   min_user_uid: 1000
@@ -193,6 +194,9 @@ clock, UTC):
 | `counters` | every 10 s | node-level counters: CPU jiffies, loadavg, meminfo, process counts, network, Lustre metadata ops, sockets, per-GPU utilization/memory |
 | `census` | every 60 s | full process list (below) with per-process CPU deltas and dormancy fields |
 | `error` | as needed | bounded, non-fatal probe-side errors (e.g. `nvidia-smi` failed) |
+| `bye` | once, before a planned exit | `reason` (e.g. `rss_limit`); the session treats the following EOF as a rotation, not a loss |
+
+The probe writes each message with a streaming encoder in bounded chunks and never builds a whole census line in memory (the M0 soak traced steady RSS growth to glibc retaining 1–5 MB transient line buffers). As a safety net it exits with `bye` when its own RSS exceeds `collection.probe_rss_limit_mb`.
 
 Per-process census fields: pid, start time, uid/username, comm, exe, argv0,
 full cmdline, ppid and parent comm/exe, parent kind, state, threads, RSS,
@@ -465,7 +469,7 @@ before the next begins.
 | Milestone | Delivers | Exit criterion |
 |---|---|---|
 | M0 Soak | Streaming probe, bootstrap, minimal collector logging lines to a file | ≥ 24 h on login-01/02/04: tolerated by login-node policy, overhead measured, drop/reconnect behaves |
-| M1 Collector + DB | Full collector, migrations, live and long-term tables (`live_*`, `node_metrics_1m`, `*_usage_5m`, inventory, events, heartbeat), classification, redaction, dormancy, spool, maintenance, systemd units; CLI `status`, `nodes`, `top`, `users`, `user`, `idle`, `daemon`, `database`, `config` | One week unattended under systemd, including a deliberate PostgreSQL restart and a node reboot |
+| M1 Collector + DB | Full collector, migrations, live and long-term tables (`live_*`, `node_metrics_1m`, `*_usage_5m`, inventory, events, heartbeat), classification, redaction, dormancy, spool, maintenance, systemd units; CLI `status`, `nodes`, `top`, `users`, `user`, `idle`, `daemon`, `database`, `config`. Delivered as three plans: **M1a** probe memory fix + in-memory data pipeline (classification, redaction, dormancy, aggregation); **M1b** database (schema, migrations, writer, spool, maintenance); **M1c** daemon, systemd and CLI | One week unattended under systemd, including a deliberate PostgreSQL restart and a node reboot (M1c); M1a: probe RSS flat over a 12 h re-soak |
 | M2 Live web | `/`, `/node/{node}`, `/user/{username}`, process modal | Used for day-to-day triage |
 | M3 History and research | `process_samples` + hourly census, `command_lines`, tags, `/analytics`, `/commands`, `history`, `commands search`, `reclassify` | Dormancy and agent-option questions answerable from the UI and SQL |
 | M4 Alerts + Aurora | Slack rules; Aurora configuration and deployment | Running on both systems |
