@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ import click
 
 from node_monitor.collector.soak import make_private_dir, run_soak, summarize
 from node_monitor.config import ConfigError, load_config
+from node_monitor.pipeline.replay import replay
 
 COLUMNS = (
    "node",
@@ -102,3 +104,46 @@ def soak_report(directory, fmt) -> None:
             c.rjust(w) if i else c.ljust(w) for i, (c, w) in enumerate(zip(r, widths, strict=True))
          )
       )
+
+
+def _json_default(value):
+   if isinstance(value, datetime):
+      return value.isoformat()
+   raise TypeError(f"not JSON serializable: {type(value).__name__}")
+
+
+@soak.command("replay")
+@click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--config", "config_path", type=click.Path(), default=None)
+@click.option("--write-records", type=click.Path(path_type=Path), default=None)
+def soak_replay(directory, config_path, write_records) -> None:
+   """Replay a soak capture through the pipeline and count the records."""
+   try:
+      config = load_config(config_path)
+   except ConfigError as exc:
+      raise click.ClickException(str(exc)) from exc
+   sink = None
+   if write_records is not None:
+      # Rows hold redacted but still sensitive command lines.
+      fd = os.open(write_records, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+      os.fchmod(fd, 0o600)
+      sink = os.fdopen(fd, "w", encoding="utf-8")
+   try:
+
+      def write(record):
+         line = json.dumps({"kind": record.kind, "row": record.row}, default=_json_default)
+         sink.write(line + "\n")
+
+      def skip(label):
+         click.echo(f"{label}: not in config, skipped")
+
+      try:
+         result = replay(directory, config, on_record=write if sink else None, on_skip=skip)
+      except (OSError, ValueError, KeyError) as exc:
+         raise click.ClickException(f"cannot replay {directory}: {exc}") from exc
+   finally:
+      if sink:
+         sink.close()
+   for label, counts in result.items():
+      detail = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+      click.echo(f"{label}: {detail}")
