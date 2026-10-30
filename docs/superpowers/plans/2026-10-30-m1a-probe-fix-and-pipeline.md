@@ -628,12 +628,15 @@ Expected: per node, about 15 `node_metrics_1m`, 3 `node_usage_5m` and 15 `live_p
 Delete the full-census out dir afterwards. It holds unredacted command lines.
 
 - [ ] **Step 7: 12-hour re-soak** with the procedure from M0 Task 8 Steps 1 and 3 (default summary mode, `--duration-hours 12`, `env -u LD_PRELOAD`, a clean tree, and one probe per account). Use the remote-probe `kill -STOP` check (c′) if any fault check is run.
-  - **Pass:** every node's per-session `probe_maxrss_kb` plateaus. The last hour of each full 6-hour session is within 10 MiB of its second hour, with max RSS < 64 MiB.
-  - There are no `rss_limit` rotations, and coverage is at least 99%.
+  - **Pass:** every node's per-session exact RSS (`probe_self.rss_kb`, from smaps_rollup; `probe_rss_series` in `soak report --format json`) plateaus. The last hour of each full 6-hour session is within 10 MiB of its second hour, and the max exact RSS (`probe_rss_kb_max`, the `rss_MB` column) is < 64 MiB.
+  - `probe_maxrss_kb` (`ru_maxrss`, the `maxrss_MB` column) is reported as a secondary figure only. Like VmRSS it is an approximate per-CPU counter that drifts tens of MiB on this 256-CPU kernel, so it does not decide the verdict.
+  - `rotations_by_reason` has no `rss_limit`, and coverage is at least 99%.
 - [ ] **Step 8: Write `docs/soak/2026-11-m1a-resoak.md`:**
   - the replay spot-checks;
-  - a per-session RSS table (start, hourly, end) per node, compared with the M0 numbers;
+  - a per-session exact-RSS table (start, hourly, end, from `probe_rss_series`) per node, compared with the M0 numbers;
   - the coverage and loss table;
   - the verdict on the M0 GO condition "fix probe memory growth".
+
+  Note: the chunked streaming encoder raises probe CPU by roughly 25–30% compared with M0. That rise is expected, not a regression.
 
   Commit: `docs: M1a re-soak and pipeline replay results`.
