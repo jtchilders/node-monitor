@@ -28,18 +28,19 @@ web:
 collection:
   counter_interval_sec: 10
   census_interval_sec: 60
-  summary_interval_sec: 300          # M1+
+  summary_interval_sec: 300          # multiple of census_interval_sec; divides 3600
   hourly_census: true                # M1+
   session_silence_timeout_sec: 30
   session_max_lifetime_sec: 21600
   reconnect_backoff_sec: [5, 300]
+  probe_rss_limit_mb: 128            # probe says bye and is restarted above this RSS
 classification:
-  min_user_uid: 1000                 # M1+
+  min_user_uid: 1000                 # a user process has uid >= this
   active_cpu_seconds_per_min: 0.1
   notable_cpu_seconds_per_min: 3.0   # M1+; about 5% of one core
   notable_rss_mb: 1024               # M1+
 redaction:
-  extra_patterns: []                 # appended to built-in rules
+  extra_patterns: []                 # regexes, appended to built-in rules
 retention:
   process_samples_days: 30
   node_metrics_days: 730

@@ -51,8 +51,9 @@ class NodeSession:
    - ``silence``: no line at all for `silence_timeout` seconds.
 
    For ``eof`` and ``silence``, `exit_code` is the status after we signalled the
-   process group. Rotation (`max_lifetime`) and stop() are not losses: rotation emits
-   `session_rotated` and reconnects at once, stop() emits nothing.
+   process group. Rotation and stop() are not losses: rotation emits `session_rotated`
+   (reason ``max_lifetime``, or the reason of a `bye` the probe sent before leaving) and
+   reconnects at once, stop() emits nothing.
 
    stop() must be called from the event loop's thread. A stopped session stays stopped.
    """
@@ -82,6 +83,8 @@ class NodeSession:
       self._stop = asyncio.Event()
       self._proc = None
       self._boot_id = None
+      # Reason from the probe's `bye` in the current session, None until one arrives.
+      self._bye_reason = None
 
    @property
    def current_pid(self) -> int | None:
@@ -138,6 +141,7 @@ class NodeSession:
          )
          return "spawn_failed", 0.0
 
+      self._bye_reason = None
       started = time.monotonic()
       ended = started
       self._proc = proc
@@ -170,7 +174,8 @@ class NodeSession:
       stderr_log.finish()
       uptime = ended - started
       if outcome == "rotate":
-         self._event("session_rotated", {"uptime_sec": round(uptime, 3)})
+         reason = self._bye_reason if self._bye_reason is not None else "max_lifetime"
+         self._event("session_rotated", {"uptime_sec": round(uptime, 3), "reason": reason})
       elif outcome != "stop":
          self._event(
             "session_lost",
@@ -206,7 +211,11 @@ class NodeSession:
       if reader.cancelled():
          return "stop"
       outcome = reader.result()
-      return "rotate" if outcome == "deadline" else outcome
+      # After a `bye` the probe is leaving on purpose, so whatever follows (a signal
+      # error line, a nonzero exit, silence) is not a loss.
+      if self._bye_reason is not None or outcome == "deadline":
+         return "rotate"
+      return outcome
 
    async def _pump(self, stdout: asyncio.StreamReader, deadline: float, silence) -> str:
       """Deliver lines until EOF ("eof"), `deadline` ("deadline"), or a gap of more than
@@ -244,6 +253,9 @@ class NodeSession:
          return
       if msg.get("type") == "hello":
          self._note_boot_id(msg.get("boot_id"))
+      elif msg.get("type") == "bye":
+         reason = msg.get("reason")
+         self._bye_reason = reason if isinstance(reason, str) and reason else "bye"
       self._on_message(self._label, msg)
 
    def _note_boot_id(self, boot_id) -> None:

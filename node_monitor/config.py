@@ -1,6 +1,7 @@
 """Configuration loading and validation."""
 
 import os
+import re
 from dataclasses import dataclass, fields
 from pathlib import Path
 
@@ -28,14 +29,22 @@ class SshConfig:
 class CollectionConfig:
    counter_interval_sec: float = 10
    census_interval_sec: float = 60
+   summary_interval_sec: float = 300
    session_silence_timeout_sec: float = 30
    session_max_lifetime_sec: float = 21600
    reconnect_backoff_sec: tuple[float, float] = (5, 300)
+   probe_rss_limit_mb: float = 128
 
 
 @dataclass(frozen=True)
 class ClassificationConfig:
    active_cpu_seconds_per_min: float = 0.1
+   min_user_uid: int = 1000
+
+
+@dataclass(frozen=True)
+class RedactionConfig:
+   extra_patterns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -48,6 +57,7 @@ class Config:
    collection: CollectionConfig
    classification: ClassificationConfig
    source_path: Path
+   redaction: RedactionConfig = RedactionConfig()
 
 
 TOP_LEVEL_KEYS = {
@@ -65,8 +75,8 @@ TOP_LEVEL_KEYS = {
    "spool",
 }
 # Spec keys that M1+ consumes; accepted so one config file serves every milestone.
-_COLLECTION_FUTURE = {"summary_interval_sec", "hourly_census"}
-_CLASSIFICATION_FUTURE = {"min_user_uid", "notable_cpu_seconds_per_min", "notable_rss_mb"}
+_COLLECTION_FUTURE = {"hourly_census"}
+_CLASSIFICATION_FUTURE = {"notable_cpu_seconds_per_min", "notable_rss_mb"}
 _NODE_KEYS = {"host", "label", "ssh_target"}
 
 
@@ -107,6 +117,43 @@ def _build(cls, where: str, data: dict, extra_allowed=frozenset()):
    names = {f.name for f in fields(cls)}
    _check_keys(where, data, names | set(extra_allowed))
    return cls(**{k: v for k, v in data.items() if k in names})
+
+
+def _positive(where: str, key: str, value) -> None:
+   # bool is an int subclass; `true` is never a sensible interval.
+   if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+      raise ConfigError(f"{where}.{key} must be a positive number, got {value!r}")
+
+
+def _near_integer(x: float) -> bool:
+   return abs(x - round(x)) < 1e-9
+
+
+def _validate_collection(c: CollectionConfig) -> None:
+   for key in (
+      "counter_interval_sec",
+      "census_interval_sec",
+      "summary_interval_sec",
+      "session_silence_timeout_sec",
+      "session_max_lifetime_sec",
+      "probe_rss_limit_mb",
+   ):
+      _positive("collection", key, getattr(c, key))
+   if not c.session_silence_timeout_sec > c.counter_interval_sec:
+      raise ConfigError(
+         "collection.session_silence_timeout_sec must exceed counter_interval_sec, "
+         "or a healthy session would be declared silent"
+      )
+   ratio = c.summary_interval_sec / c.census_interval_sec
+   if (
+      round(ratio) < 1
+      or not _near_integer(ratio)
+      or not _near_integer(3600 / c.summary_interval_sec)
+   ):
+      raise ConfigError(
+         "collection.summary_interval_sec must be a multiple of census_interval_sec "
+         "and divide 3600 so intervals align to the clock"
+      )
 
 
 def _parse_nodes(raw_nodes) -> tuple[NodeConfig, ...]:
@@ -154,6 +201,7 @@ def load_config(path: str | None = None) -> Config:
          raise ConfigError("reconnect_backoff_sec must be [min, max] with 0 < min < max")
       coll_data["reconnect_backoff_sec"] = (pair[0], pair[1])
    collection = _build(CollectionConfig, "collection", coll_data, _COLLECTION_FUTURE)
+   _validate_collection(collection)
 
    classification = _build(
       ClassificationConfig,
@@ -161,6 +209,30 @@ def load_config(path: str | None = None) -> Config:
       _section(raw, "classification"),
       _CLASSIFICATION_FUTURE,
    )
+
+   _positive("ssh", "connect_timeout_sec", ssh.connect_timeout_sec)
+   _positive(
+      "classification", "active_cpu_seconds_per_min", classification.active_cpu_seconds_per_min
+   )
+   uid = classification.min_user_uid
+   if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
+      raise ConfigError(f"classification.min_user_uid must be a non-negative integer, got {uid!r}")
+
+   redaction_data = dict(_section(raw, "redaction"))
+   patterns = redaction_data.get("extra_patterns") or []
+   if not isinstance(patterns, (list, tuple)):
+      raise ConfigError("redaction.extra_patterns must be a list of regular expressions")
+   for pattern in patterns:
+      if not isinstance(pattern, str):
+         raise ConfigError(f"redaction.extra_patterns entries must be strings, got {pattern!r}")
+      try:
+         re.compile(pattern)
+      except re.error as exc:
+         raise ConfigError(
+            f"redaction.extra_patterns: {pattern!r} is not a valid regex: {exc}"
+         ) from exc
+   redaction_data["extra_patterns"] = tuple(patterns)
+   redaction = _build(RedactionConfig, "redaction", redaction_data)
 
    return Config(
       system=raw["system"],
@@ -171,4 +243,5 @@ def load_config(path: str | None = None) -> Config:
       collection=collection,
       classification=classification,
       source_path=source,
+      redaction=redaction,
    )

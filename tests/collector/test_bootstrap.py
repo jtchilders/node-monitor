@@ -81,6 +81,7 @@ def test_probe_config_takes_intervals_from_config():
       "census_interval_sec": 7,
       "active_cpu_seconds_per_min": 0.5,
       "gpu": True,
+      "probe_rss_limit_mb": 128,
    }
 
 

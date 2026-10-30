@@ -134,3 +134,52 @@ def test_missing_config_lists_paths_tried(tmp_path, monkeypatch):
       find_config_path()
    assert str(tmp_path / ".node_monitor.yaml") in str(exc.value)
    assert str(tmp_path / ".config/node_monitor/config.yaml") in str(exc.value)
+
+
+def test_m1a_config_defaults(tmp_path):
+   cfg = load_config(str(write_yaml(tmp_path, MINIMAL)))
+   assert cfg.collection.summary_interval_sec == 300
+   assert cfg.collection.probe_rss_limit_mb == 128
+   assert cfg.classification.min_user_uid == 1000
+   assert cfg.redaction.extra_patterns == ()
+
+
+def test_m1a_config_values_are_read(tmp_path):
+   data = {
+      **MINIMAL,
+      "collection": {"summary_interval_sec": 600, "probe_rss_limit_mb": 64},
+      "classification": {"min_user_uid": 500},
+      "redaction": {"extra_patterns": ["tok_[a-z]+"]},
+   }
+   cfg = load_config(str(write_yaml(tmp_path, data)))
+   assert cfg.collection.summary_interval_sec == 600
+   assert cfg.collection.probe_rss_limit_mb == 64
+   assert cfg.classification.min_user_uid == 500
+   assert cfg.redaction.extra_patterns == ("tok_[a-z]+",)
+
+
+@pytest.mark.parametrize(
+   "section,key,value,match",
+   [
+      ("collection", "counter_interval_sec", 0, "counter_interval_sec"),
+      ("collection", "census_interval_sec", "abc", "census_interval_sec"),
+      ("collection", "census_interval_sec", True, "census_interval_sec"),
+      ("collection", "session_silence_timeout_sec", 5, "session_silence_timeout_sec"),
+      ("collection", "session_max_lifetime_sec", -1, "session_max_lifetime_sec"),
+      ("collection", "summary_interval_sec", 90, "summary_interval_sec"),
+      ("collection", "summary_interval_sec", 420, "summary_interval_sec"),
+      ("collection", "probe_rss_limit_mb", 0, "probe_rss_limit_mb"),
+      ("collection", "probe_rss_limit_mb", -5, "probe_rss_limit_mb"),
+      ("classification", "active_cpu_seconds_per_min", 0, "active_cpu_seconds_per_min"),
+      ("classification", "min_user_uid", -1, "min_user_uid"),
+      ("classification", "min_user_uid", 1.5, "min_user_uid"),
+      ("ssh", "connect_timeout_sec", 0, "connect_timeout_sec"),
+      ("redaction", "extra_patterns", ["(unclosed"], "extra_patterns"),
+      ("redaction", "extra_patterns", "notalist", "extra_patterns"),
+      ("redaction", "extra_patterns", [3], "extra_patterns"),
+   ],
+)
+def test_invalid_values_are_rejected(tmp_path, section, key, value, match):
+   data = {**MINIMAL, section: {key: value}}
+   with pytest.raises(ConfigError, match=match):
+      load_config(str(write_yaml(tmp_path, data)))

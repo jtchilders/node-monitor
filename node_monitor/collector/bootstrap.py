@@ -28,6 +28,7 @@ def probe_config(config: Config) -> dict:
       "census_interval_sec": config.collection.census_interval_sec,
       "active_cpu_seconds_per_min": config.classification.active_cpu_seconds_per_min,
       "gpu": True,
+      "probe_rss_limit_mb": config.collection.probe_rss_limit_mb,
    }
 
 

@@ -263,10 +263,35 @@ async def test_rotation_reconnects_without_backoff(tmp_path):
    )
    assert count_events(events, "session_rotated") >= 1
    assert details(events, "session_rotated")[0]["uptime_sec"] >= 1.0
+   assert details(events, "session_rotated")[0]["reason"] == "max_lifetime"
    assert not [e for e in events if e[1] == "reconnect_wait"]
    assert not details(events, "session_lost")
    pids = hello_pids(msgs)
    assert pids[0] != pids[1]
+
+
+async def test_bye_ends_session_as_rotation(tmp_path):
+   rig = make_session(tmp_path, probe_cfg={"probe_rss_limit_mb": 1})
+   async with rig:
+      await rig.wait(lambda m, e: count_events(e, "session_rotated") >= 1, 15)
+   rotated = details(rig.events, "session_rotated")[0]
+   assert rotated["reason"] == "rss_limit"
+   assert not [e for e in rig.events if e[1] in ("session_lost", "reconnect_wait")]
+   assert count(rig.msgs, "bye") >= 1
+
+
+BYE_THEN_SIGNAL = (
+   'echo \'{"type":"bye","reason":"rss_limit","rss_kb":1}\'; '
+   'echo \'{"type":"error","where":"signal"}\'; exit 143'
+)
+
+
+async def test_bye_followed_by_error_and_nonzero_exit_is_still_rotation(tmp_path):
+   rig = make_session(tmp_path, command=BYE_THEN_SIGNAL, backoff=(30, 30))
+   async with rig:
+      await rig.wait(lambda m, e: count_events(e, "session_rotated") >= 1, 15)
+   assert details(rig.events, "session_rotated")[0]["reason"] == "rss_limit"
+   assert not [e for e in rig.events if e[1] in ("session_lost", "reconnect_wait")]
 
 
 async def test_node_reboot_detected_on_boot_id_change(tmp_path):
