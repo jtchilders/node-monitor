@@ -126,3 +126,64 @@ def test_clock_offset_is_median_recv_minus_ts():
 
 def test_flush_empty_returns_nothing():
    assert MinuteAggregator(10).flush() == []
+
+
+def test_session_change_skips_all_families_even_when_counters_increase():
+   agg = MinuteAggregator(10)
+   agg.add_counters(counters(0, {"user": 0, "idle": 0}, rx=0, md=0, cpu=0.0), at(0), 1)
+   agg.add_counters(counters(10, {"user": 100, "idle": 300}, rx=1000, md=50, cpu=1.0), at(10), 2)
+   (row,) = agg.flush()
+   assert row["cpu_pct"] is None
+   assert row["network_rates"] == {} and row["lustre_md_rates"] == {}
+   assert row["probe_cpu_seconds"] is None
+
+
+def test_cpu_only_decrease_keeps_net_and_lustre():
+   agg = MinuteAggregator(10)
+   agg.add_counters(counters(0, {"user": 100, "idle": 100}, rx=0, md=0), at(0), 1)
+   agg.add_counters(counters(10, {"user": 50, "idle": 50}, rx=1000, md=50), at(10), 1)
+   (row,) = agg.flush()
+   assert row["cpu_pct"] is None
+   assert row["network_rates"]["hsn0"]["rx_bytes_per_sec"] == 100.0
+   assert row["lustre_md_rates"] == {"eagle": 5.0}
+
+
+def test_lustre_only_decrease_skips_that_filesystem_only():
+   agg = MinuteAggregator(10)
+   agg.add_counters(counters(0, {"user": 0, "idle": 0}, rx=0, md=100), at(0), 1)
+   agg.add_counters(counters(10, {"user": 100, "idle": 300}, rx=1000, md=50), at(10), 1)
+   (row,) = agg.flush()
+   assert row["lustre_md_rates"] == {}
+   assert row["cpu_pct"]["user"] == 25.0
+   assert row["network_rates"]["hsn0"]["rx_bytes_per_sec"] == 100.0
+
+
+def test_probe_cpu_only_decrease_excludes_that_pair():
+   agg = MinuteAggregator(10)
+   for t, cpu in ((0, 0.0), (10, 1.0), (20, 0.2), (30, 0.7)):
+      agg.add_counters(counters(t, {"user": t * 10, "idle": t * 30}, rx=t * 100, cpu=cpu), at(t), 1)
+   (row,) = agg.flush()
+   assert row["probe_cpu_seconds"] == pytest.approx(1.5)
+   assert row["cpu_pct"]["user"] == 25.0
+   assert row["network_rates"]["hsn0"]["rx_bytes_per_sec"] == 100.0
+
+
+def test_pair_spanning_minutes_counts_toward_later_minute():
+   agg = MinuteAggregator(10)
+   agg.add_counters(counters(0, {"user": 0, "idle": 0}), at(0), 1)
+   agg.add_counters(counters(55, {"user": 100, "idle": 100}), at(55), 1)
+   (first,) = agg.add_counters(counters(65, {"user": 400, "idle": 100}), at(65), 1)
+   (second,) = agg.flush()
+   assert first["minute"] == at(0) and first["cpu_pct"]["user"] == 50.0
+   assert second["minute"] == at(60) and second["cpu_pct"]["user"] == 100.0
+
+
+def test_zero_elapsed_pair_contributes_nothing_and_does_not_crash():
+   agg = MinuteAggregator(10)
+   agg.add_counters(counters(0, {"user": 0, "idle": 0}, rx=0, md=0), at(0), 1)
+   agg.add_counters(counters(0, {"user": 10, "idle": 10}, rx=5000, md=500), at(0), 1)
+   agg.add_counters(counters(10, {"user": 110, "idle": 310}, rx=6000, md=550), at(10), 1)
+   (row,) = agg.flush()
+   assert row["network_rates"]["hsn0"]["rx_bytes_per_sec"] == 100.0
+   assert row["lustre_md_rates"] == {"eagle": 5.0}
+   assert row["cpu_pct"]["user"] == 25.0
