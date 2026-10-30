@@ -7,6 +7,8 @@ source text, so importing it must have no side effects.
 import argparse
 import errno
 import fcntl
+import io
+import itertools
 import json
 import os
 import pwd
@@ -758,6 +760,11 @@ LOCK_TAKEOVER_WAIT_SEC = 5.0
 LOCK_POLL_SEC = 0.1
 # A holder writes its pid just after taking the lock; allow it that long to appear.
 LOCK_PID_WAIT_SEC = 1.0
+# The most bytes of one message held as encoded output at once. A census line runs to
+# megabytes; building it whole (and copying it to add the newline and encode it) leaves a
+# differently sized multi-megabyte allocation every census, and glibc's heap high-water
+# mark climbs with them for the life of the process.
+EMIT_CHUNK_BYTES = 65536
 
 
 def default_config():
@@ -769,6 +776,9 @@ def default_config():
       "proc_root": "/proc",
       "sys_root": "/sys",
       "gpu": True,
+      # Above this resident size the probe says `bye` and exits so the collector starts a
+      # fresh one, whatever the cause of the growth.
+      "probe_rss_limit_mb": 128,
       # Not part of the collector's config surface; tests shorten them.
       "gpu_timeout_sec": 5.0,
       "gpu_suspend_sec": GPU_SUSPEND_SEC,
@@ -895,8 +905,8 @@ def _utc_timestamp(now):
 
 
 def _write_all(fd, data):
-   # Raw fd writes: a census line can be ~600 KB, and a non-blocking stdout must
-   # wait for the reader rather than fail mid-line.
+   # Raw fd writes: a non-blocking stdout must wait for the reader rather than fail
+   # partway through a line.
    view = memoryview(data)
    while view:
       try:
@@ -915,6 +925,28 @@ _TERMINATING_SIGNALS = (
 # How long a pending signal waits for a line in progress to finish before the probe
 # exits unreported (its exit status still names the signal).
 SIGNAL_REPORT_GRACE_SEC = 5.0
+# ensure_ascii (the default) keeps every line ASCII whatever the node's locale or the
+# bytes in /proc, so a character is a byte and chunks can be sized in characters.
+_COMPACT_ENCODER = json.JSONEncoder(separators=(",", ":"))
+
+
+def _encoded_chunks(msg):
+   """Yield msg as one compact JSON line, newline included, in strings of at most
+   EMIT_CHUNK_BYTES; a single larger piece (a huge command line) comes out on its own.
+
+   iterencode is the pure-Python encoder, which yields small pieces instead of building
+   the line whole; json.dumps would use the C encoder and return one string.
+   """
+   pending = []
+   size = 0
+   for piece in itertools.chain(_COMPACT_ENCODER.iterencode(msg), ("\n",)):
+      if pending and size + len(piece) > EMIT_CHUNK_BYTES:
+         yield "".join(pending)
+         pending = []
+         size = 0
+      pending.append(piece)
+      size += len(piece)
+   yield "".join(pending)
 
 
 class _Emitter(object):
@@ -937,15 +969,34 @@ class _Emitter(object):
          self._fd = out.fileno()
       except (AttributeError, ValueError, IOError, OSError):
          self._fd = None
+      self._binary = isinstance(out, (io.RawIOBase, io.BufferedIOBase))
 
    def emit(self, kind, fields):
-      with self._lock:
+      self._acquire_or_exit()
+      try:
          if self._signum is not None:
             self._report_signal_and_exit()
          if not self._write(kind, fields):
             # The reader is gone (BrokenPipeError: Python ignores SIGPIPE). Nobody is
             # listening, so exit at once without unwinding.
             os._exit(0)
+      finally:
+         self._lock.release()
+
+   def _acquire_or_exit(self):
+      # The only other holder is the watchdog reporting a signal, which exits as soon as
+      # its line is out. If that line is stuck behind a stalled reader, waiting longer
+      # than the grace would wedge both threads, so exit unreported instead.
+      while True:
+         signum = self._signum
+         if signum is None:
+            if self._lock.acquire(True, PARENT_POLL_SEC):
+               return
+            continue
+         remaining = SIGNAL_REPORT_GRACE_SEC - (time.monotonic() - self._signal_at)
+         if remaining > 0 and self._lock.acquire(True, remaining):
+            return
+         os._exit(128 + signum)
 
    def error(self, where, message):
       self.emit("error", _error_fields(where, message))
@@ -988,21 +1039,44 @@ class _Emitter(object):
       os._exit(128 + signum)
 
    def _write(self, kind, fields):
-      """Write one line; False if the reader is gone."""
+      """Write one line in chunks of at most EMIT_CHUNK_BYTES; False if the reader is gone.
+
+      An encoding error raises after ending any fragment already written with a newline,
+      so the next line starts clean and the fragment does not consume a seq.
+      """
       msg = {"type": kind, "seq": self._seq, "ts": _utc_timestamp(time.time())}
       msg.update(fields)
-      # ensure_ascii keeps the line ASCII whatever the node's locale or the bytes in /proc.
-      line = json.dumps(msg, separators=(",", ":")) + "\n"
+      started = False
       try:
-         if self._fd is None:
-            self._out.write(line)
-            self._out.flush()
-         else:
-            _write_all(self._fd, line.encode("ascii"))
+         for chunk in _encoded_chunks(msg):
+            self._put(chunk)
+            started = True
+         self._flush()
       except (IOError, OSError):
          return False
+      except Exception:
+         # Only the encoder raises anything else (a value JSON cannot represent).
+         if started:
+            try:
+               self._put("\n")
+               self._flush()
+            except (IOError, OSError):
+               return False
+         raise
       self._seq += 1
       return True
+
+   def _put(self, text):
+      if self._fd is not None:
+         _write_all(self._fd, text.encode("ascii"))
+      elif self._binary:
+         self._out.write(text.encode("ascii"))
+      else:
+         self._out.write(text)
+
+   def _flush(self):
+      if self._fd is None:
+         self._out.flush()
 
 
 def _error_fields(where, message):
@@ -1190,6 +1264,21 @@ def _start_watchdog(stdin, parent, emitter):
    thread.start()
 
 
+def own_rss_kb():
+   """This process's VmRSS in KiB, or None if unreadable.
+
+   Always the real /proc/self: the size being limited is the probe's own, not
+   anything in a test tree.
+   """
+   text = read_text("/proc/self/status")
+   for line in (text or "").split("\n"):
+      if line.startswith("VmRSS:"):
+         fields = line.split()
+         if len(fields) > 1 and fields[1].isdigit():
+            return int(fields[1])
+   return None
+
+
 def _next_due(due, interval, now):
    # Skip slots missed during a slow collection instead of bursting to catch up.
    due += interval
@@ -1202,9 +1291,12 @@ def stream(config, out=None, stdin=None):
    """Emit hello, then counters and census (both first at once) on their intervals.
 
    Runs until stdin reaches EOF or stdout breaks (the process exits 0 on the spot), the
-   parent changes (returns 0), or SIGTERM, SIGHUP or SIGINT arrives (an `error` with
-   where "signal" is emitted and the process exits 128 + signum, so a kill on the node
-   is told apart from a transport failure). Returns 3 if the lock cannot be taken.
+   parent changes (returns 0), its resident size after a census exceeds
+   probe_rss_limit_mb (a `bye` with reason "rss_limit" is emitted and it returns 0, so
+   the collector can start a fresh probe), or SIGTERM, SIGHUP or SIGINT arrives (an
+   `error` with where "signal" is emitted and the process exits 128 + signum, so a kill
+   on the node is told apart from a transport failure). Returns 3 if the lock cannot be
+   taken.
    """
    out = sys.stdout if out is None else out
    stdin = sys.stdin if stdin is None else stdin
@@ -1236,6 +1328,7 @@ def stream(config, out=None, stdin=None):
    census = _Census(cfg, roots, emitter)
    counter_interval = float(cfg["counter_interval_sec"])
    census_interval = float(cfg["census_interval_sec"])
+   rss_limit_kb = float(cfg["probe_rss_limit_mb"]) * 1024
    next_counters = next_census = time.monotonic()
    while True:
       emitter.check_signal(PARENT_POLL_SEC)
@@ -1246,6 +1339,11 @@ def stream(config, out=None, stdin=None):
          next_counters = _next_due(next_counters, counter_interval, time.monotonic())
       if time.monotonic() >= next_census:
          census.emit()
+         # Checked after a census because that is when the process is at its largest.
+         rss_kb = own_rss_kb()
+         if rss_kb is not None and rss_kb > rss_limit_kb:
+            emitter.emit("bye", {"reason": "rss_limit", "rss_kb": rss_kb})
+            return 0
          next_census = _next_due(next_census, census_interval, time.monotonic())
       wait = min(next_counters, next_census) - time.monotonic()
       if wait > 0:

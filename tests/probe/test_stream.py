@@ -354,6 +354,46 @@ def test_signal_during_blocked_census_write_does_not_split_the_line(tmp_path, ru
    assert len(msgs[2]["processes"]) == 6 and is_signal_error(msgs[3])
 
 
+# Stands in for a watchdog stuck holding the lock while writing a signal report to a
+# stalled reader: emit() must give up after the grace and exit with the signal's status.
+STUCK_REPORT_CODE = (
+   "import importlib.util,signal,sys,threading\n"
+   "spec=importlib.util.spec_from_file_location('probe', sys.argv[1])\n"
+   "probe=importlib.util.module_from_spec(spec); spec.loader.exec_module(probe)\n"
+   "probe.SIGNAL_REPORT_GRACE_SEC=0.5\n"
+   "em=probe._Emitter(sys.stdout)\n"
+   "em._lock.acquire()\n"
+   "if sys.argv[2]=='before':\n"
+   "   em._on_signal(signal.SIGTERM, None)\n"
+   "else:\n"
+   "   threading.Timer(0.3, em._on_signal, (signal.SIGTERM, None)).start()\n"
+   "em.emit('census', {})\n"
+)
+
+
+@pytest.mark.parametrize("when", ["before", "while_waiting"])
+def test_emit_waits_at_most_the_grace_for_a_stuck_signal_report(spawn, when):
+   p = spawn([PROBE_PYTHON, "-c", STUCK_REPORT_CODE, PROBE, when])
+   assert p.wait(timeout=10) == 143
+   assert p.stdout.read() == b""  # exited unreported
+
+
+def test_rss_limit_emits_bye_and_exits(tmp_path, run_stream):
+   p = run_stream(cfg(tmp_path, probe_rss_limit_mb=1))
+   msgs = read_messages(p, until=lambda ms: any(m["type"] == "bye" for m in ms), timeout=10)
+   bye = [m for m in msgs if m["type"] == "bye"][0]
+   assert bye["reason"] == "rss_limit" and bye["rss_kb"] > 1024
+   assert [m["type"] for m in msgs][-2:] == ["census", "bye"]
+   assert [m["seq"] for m in msgs] == list(range(len(msgs)))
+   assert p.wait(timeout=5) == 0
+
+
+def test_rss_under_limit_keeps_streaming(tmp_path, run_stream):
+   p = run_stream(cfg(tmp_path, probe_rss_limit_mb=4096))
+   msgs = read_messages(p, until=lambda ms: len(of_type(ms, "census")) >= 3, timeout=10)
+   assert of_type(msgs, "bye") == [] and p.poll() is None
+
+
 def test_probe_disables_core_dumps(tmp_path, run_stream):
    p = run_stream(cfg(tmp_path))
    read_messages(p, count=1, timeout=5)
