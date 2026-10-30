@@ -408,3 +408,17 @@ async def test_stop_during_backoff_returns_promptly(tmp_path, monkeypatch):
       await rig.wait(lambda m, e: count_events(e, "reconnect_wait") >= 1, 10)
       stopped_at = loop.time()
    assert loop.time() - stopped_at < 2
+
+
+async def test_pump_honours_cancel_when_a_line_lands_in_the_same_iteration(tmp_path):
+   # asyncio.wait_for on Python < 3.12 swallows a cancellation that arrives as the
+   # awaited readline completes; stop() then hung for as long as the probe kept talking.
+   rig = make_session(tmp_path)
+   reader = asyncio.StreamReader()
+   loop = asyncio.get_running_loop()
+   pump = asyncio.create_task(rig.session._pump(reader, loop.time() + 60, 30))
+   await asyncio.sleep(0)  # pump is now blocked in its readline
+   reader.feed_data(b'{"type": "counters", "seq": 0}\n')
+   pump.cancel()
+   await asyncio.wait({pump}, timeout=1)
+   assert pump.cancelled()
