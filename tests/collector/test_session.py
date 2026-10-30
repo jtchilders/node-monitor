@@ -271,7 +271,8 @@ async def test_rotation_reconnects_without_backoff(tmp_path):
 
 
 async def test_bye_ends_session_as_rotation(tmp_path):
-   rig = make_session(tmp_path, probe_cfg={"probe_rss_limit_mb": 1})
+   # healthy_after=0: any uptime is healthy, so the reconnect is immediate.
+   rig = make_session(tmp_path, probe_cfg={"probe_rss_limit_mb": 1}, healthy_after=0)
    async with rig:
       await rig.wait(lambda m, e: count_events(e, "session_rotated") >= 1, 15)
    rotated = details(rig.events, "session_rotated")[0]
@@ -287,11 +288,41 @@ BYE_THEN_SIGNAL = (
 
 
 async def test_bye_followed_by_error_and_nonzero_exit_is_still_rotation(tmp_path):
-   rig = make_session(tmp_path, command=BYE_THEN_SIGNAL, backoff=(30, 30))
+   rig = make_session(tmp_path, command=BYE_THEN_SIGNAL, backoff=(30, 30), healthy_after=0)
    async with rig:
       await rig.wait(lambda m, e: count_events(e, "session_rotated") >= 1, 15)
    assert details(rig.events, "session_rotated")[0]["reason"] == "rss_limit"
    assert not [e for e in rig.events if e[1] in ("session_lost", "reconnect_wait")]
+
+
+async def test_immediate_bye_backs_off_with_growing_delay(tmp_path):
+   rig = make_session(
+      tmp_path,
+      probe_cfg={"probe_rss_limit_mb": 1},
+      healthy_after=3600,
+      backoff=(0.05, 0.4),
+   )
+   async with rig:
+      await rig.wait(lambda m, e: count_events(e, "reconnect_wait") >= 3, 30)
+   waits = details(rig.events, "reconnect_wait")
+   failures = [w["failures"] for w in waits]
+   assert failures[:3] == [1, 2, 3]
+   assert count_events(rig.events, "session_rotated") >= 3
+   assert not details(rig.events, "session_lost")
+
+
+async def test_bye_state_resets_for_the_next_session(tmp_path):
+   flag = tmp_path / "second"
+   command = (
+      f"if [ -e {flag} ]; then exit 3; fi; touch {flag}; "
+      'echo \'{"type":"bye","reason":"rss_limit"}\''
+   )
+   rig = make_session(tmp_path, command=command, healthy_after=0, backoff=(0.05, 0.4))
+   async with rig:
+      await rig.wait(lambda m, e: count_events(e, "session_lost") >= 1, 15)
+   kinds = [e[1] for e in rig.events]
+   assert kinds.index("session_rotated") < kinds.index("session_lost")
+   assert first_lost(rig.events)["reason"] == "exit"
 
 
 async def test_node_reboot_detected_on_boot_id_change(tmp_path):

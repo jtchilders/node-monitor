@@ -53,7 +53,8 @@ class NodeSession:
    For ``eof`` and ``silence``, `exit_code` is the status after we signalled the
    process group. Rotation and stop() are not losses: rotation emits `session_rotated`
    (reason ``max_lifetime``, or the reason of a `bye` the probe sent before leaving) and
-   reconnects at once, stop() emits nothing.
+   reconnects at once, stop() emits nothing. A `bye` session shorter than `healthy_after`
+   still counts as a failure for backoff (`reconnect_wait`), but is reported as a rotation.
 
    stop() must be called from the event loop's thread. A stopped session stays stopped.
    """
@@ -104,8 +105,10 @@ class NodeSession:
             failures = 0
          if self._stop.is_set():
             break
-         if outcome == "rotate":
+         if outcome == "rotate" and (self._bye_reason is None or uptime >= self._healthy_after):
             continue
+         # A probe that says bye right after starting (its baseline RSS is over the limit)
+         # would otherwise reconnect in a tight loop; back off as for a loss.
          failures += 1
          base = self._backoff[0] * 2 ** min(failures - 1, MAX_BACKOFF_DOUBLINGS)
          delay = min(self._backoff[1], base) * (0.5 + random.random() / 2)
