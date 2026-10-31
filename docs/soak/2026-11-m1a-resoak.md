@@ -2,7 +2,7 @@
 
 ## Verdict: PASS - M0 GO condition "fix probe memory growth" is met
 
-- Exact probe RSS (`probe_self.rss_kb`) plateaus in all 6 full sessions. The last hour is 0.0-4.6 MiB above the second hour (limit 10 MiB).
+- Exact probe RSS (`probe_self.rss_kb`) plateaus in all 6 full sessions. The last hour is 0.0-4.65 MiB above the second hour (limit 10 MiB).
 - Max exact RSS is 25.8 MiB (limit 64 MiB). M0's `maxrss` peaked at 164.5 MiB.
 - `rotations_by_reason` is `{"max_lifetime": 1}` per node. There is no `rss_limit`, and `bye_count` is 0.
 - Coverage is 100.0% on all nodes, with 0 losses.
@@ -47,8 +47,8 @@ Shape of the curve:
 
 - Every session starts at 16.1-16.6 MiB, steps to 19.6-21.1 MiB in the first hour, and then is flat or nearly so.
 - login-01 and login-02 add only 0.07-0.4 MiB between 1 h and 6 h.
-- login-04 has one or two step rises of about 5 MiB (S1 at about 1-2 h, S2 at about 2-3 h), then is flat. It adds no more after the step. These look like one-off allocations (such as a first large census) rather than growth. Not diagnosed.
-- Total growth from 1 h to the end of a session is 0.1-0.4 MiB on login-01/-02 and 4.7-5.4 MiB on login-04. M0's `maxrss` grew 50-100+ MiB over the same span.
+- login-04 has one or two step rises of about 5 MiB (S1 at about 1-2 h, S2 at about 2-3 h), then is flat. It adds no more after the step. login-04 S2 passes with 4.65 of the 10 MiB allowance only because its step falls in hour 3, so the criterion is sensitive to when a step lands. These look like one-off allocations (such as a first large census) rather than growth. Not diagnosed.
+- Total growth from 1 h to the end of a session is 0.1-0.4 MiB on login-01/-02 and 4.7-5.4 MiB on login-04. M0's `maxrss` grew about 60-110 MiB (login-01/-02) and about 10-60 MiB (login-04) from 1 h to session end.
 
 ## Secondary: `maxrss_kb` (`ru_maxrss`) against M0
 
@@ -63,10 +63,10 @@ Shape of the curve:
 
 Counter drift, in plain terms:
 
-- M0 recorded only `maxrss`. It has no exact RSS, so M0's growth cannot be split into real growth and drift number by number.
-- In this run the two counters disagree by at most 6 MiB. On login-01 and -02 `maxrss` sits at its 14.0 MiB start value while exact RSS is 20-21 MiB, so it under-reads by 6 MiB. On login-04 it matches the exact value to within 1 MiB once it moves.
-- That disagreement is small beside M0's 80-150 MiB of apparent growth per session. On this evidence drift explains at most a few MiB of M0's growth. The rest was real growth, and it is gone in the fixed probe.
-- This is an inference from different code. Nothing here measured M0's drift directly.
+- M0 recorded only `maxrss`. It has no exact RSS, so M0's growth cannot be split between real growth and counter drift. The plan notes these counters can drift tens of MiB on this 256-CPU kernel.
+- In this run the two counters disagree by up to 6 MiB. On login-01 and -02 `maxrss` sits at its 14.0 MiB start value while exact RSS is 20-21 MiB, so it under-reads by about 6 MiB. On login-04 it matches the exact value to within 1 MiB at session end (it differed more mid-session, for example 23.4 against 20.4 MiB at 1 h in S1).
+- That gap comes from the fixed probe, whose footprint is flat, so it does not bound drift in M0's growing-footprint probe.
+- The evidence that the fix works is the exact-RSS plateau of the fixed probe above, not a comparison of the two counters.
 
 ## Rotations, coverage and losses
 
