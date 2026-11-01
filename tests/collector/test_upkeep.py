@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
+import psycopg
 import pytest
 
 from node_monitor.collector.upkeep import Upkeep
@@ -154,6 +155,16 @@ def test_tick_reconnects_after_the_connection_is_lost(migrated_db):
       assert heartbeat(migrated_db)[2] == NOW + timedelta(seconds=122)
    finally:
       upkeep.close(NOW + timedelta(seconds=123), {})
+
+
+def test_close_marks_stopped_after_the_server_ended_the_idle_session(migrated_db, pg_admin_url):
+   upkeep = make(migrated_db)
+   upkeep.tick(NOW, {"state": "running"})
+   # A database restart between heartbeats ends the session without the client noticing.
+   with psycopg.connect(pg_admin_url, autocommit=True) as admin:
+      admin.execute("SELECT pg_terminate_backend(%s, 5000)", (upkeep._conn.info.backend_pid,))
+   upkeep.close(NOW + timedelta(seconds=30), {"state": "running"})
+   assert heartbeat(migrated_db)[2:] == (NOW + timedelta(seconds=30), {"state": "stopped"})
 
 
 def test_close_never_raises_when_database_is_down():

@@ -67,10 +67,19 @@ class Upkeep:
 
    def close(self, now: datetime, status: dict) -> None:
       """Write a last heartbeat marked stopped, then close. Never raises."""
-      try:
-         self._heartbeat(now, {**status, "state": "stopped"})
-      except Exception as exc:  # noqa: BLE001
-         log.warning("final heartbeat failed: %s", _describe(exc))
+      status = {**status, "state": "stopped"}
+      # Idle since the last heartbeat, an open connection may have died with a database
+      # restart; that deserves one retry on a fresh one. No connection means the database
+      # was already failing, and a second attempt would only delay shutdown.
+      attempts = 2 if self._conn is not None else 1
+      for attempt in range(attempts):
+         try:
+            self._heartbeat(now, status)
+            break
+         except Exception as exc:  # noqa: BLE001
+            self._drop_connection()
+            if attempt == attempts - 1:
+               log.warning("final heartbeat failed: %s", _describe(exc))
       self._drop_connection()
 
    # --- work ---------------------------------------------------------------------------
