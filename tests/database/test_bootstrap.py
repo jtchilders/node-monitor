@@ -8,7 +8,7 @@ from psycopg import sql
 from node_monitor.database.bootstrap import bootstrap
 from node_monitor.database.connect import connect
 from node_monitor.database.migrate import migrate
-from tests.database.conftest import _admin_connect, _drop_test_db, with_dbname
+from tests.database.conftest import _admin_connect, _drop_test_db, with_dbname, with_user
 
 _ROLE = re.compile(r"^nm_test_(owner|reader)_[0-9a-f]{8}$")
 
@@ -38,7 +38,7 @@ def names(pg_admin_url):
 
 
 def _url(admin_url, names, role):
-   return with_dbname(admin_url, names["database"]).replace("://", f"://{names[role]}@", 1)
+   return with_user(with_dbname(admin_url, names["database"]), names[role])
 
 
 def test_bootstrap_is_idempotent(pg_admin_url, names):

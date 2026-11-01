@@ -30,6 +30,18 @@ def with_dbname(url: str, dbname: str) -> str:
    return make_conninfo(**params)
 
 
+def with_user(url: str, user: str) -> str:
+   """`url` connecting as `user`, replacing any user and password it already names."""
+   parts = urlsplit(url)
+   if parts.scheme in ("postgresql", "postgres"):
+      host = parts.netloc.rpartition("@")[2]
+      return urlunsplit(parts._replace(netloc=f"{user}@{host}"))
+   params = conninfo_to_dict(url)
+   params.pop("password", None)
+   params["user"] = user
+   return make_conninfo(**params)
+
+
 def _admin_connect(admin_url):
    return psycopg.connect(admin_url, autocommit=True, connect_timeout=10)
 
