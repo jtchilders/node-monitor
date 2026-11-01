@@ -295,7 +295,7 @@ def _run_database(action, *args, **kwargs):
 
 
 @database.command("bootstrap")
-@click.option("--admin-url", required=True, help="Superuser or CREATEROLE/CREATEDB role URL.")
+@click.option("--admin-url", required=True, help="Superuser connection URL.")
 @click.option("--database", "db_name", default="node_monitor", show_default=True)
 @click.option("--owner", default="node_monitor_owner", show_default=True)
 @click.option("--reader", default="node_monitor_reader", show_default=True)
