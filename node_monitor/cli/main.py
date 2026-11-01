@@ -8,9 +8,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import click
+import psycopg
 
 from node_monitor.collector.soak import make_private_dir, run_soak, summarize
 from node_monitor.config import ConfigError, load_config
+from node_monitor.database.bootstrap import bootstrap
+from node_monitor.database.connect import connect, is_unavailable
+from node_monitor.database.migrate import MIGRATIONS, REQUIRED_VERSION, current_version, migrate
 from node_monitor.pipeline.replay import replay
 
 COLUMNS = (
@@ -150,3 +154,89 @@ def soak_replay(directory, config_path, write_records) -> None:
    for label, counts in result.items():
       detail = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
       click.echo(f"{label}: {detail}")
+
+
+@cli.group()
+def database() -> None:
+   """Create, migrate and inspect the PostgreSQL database."""
+
+
+def _database_url(config_path) -> tuple[str, float]:
+   try:
+      config = load_config(config_path)
+   except ConfigError as exc:
+      raise click.ClickException(str(exc)) from exc
+   if not config.database.url:
+      raise click.ClickException("database.url is not configured")
+   return config.database.url, config.database.connect_timeout_sec
+
+
+def _run_database(action, *args, **kwargs):
+   try:
+      return action(*args, **kwargs)
+   except (psycopg.Error, ValueError) as exc:
+      if isinstance(exc, psycopg.Error) and is_unavailable(exc):
+         raise click.ClickException(f"database unavailable: {exc}") from exc
+      raise click.ClickException(f"database error: {exc}") from exc
+
+
+@database.command("bootstrap")
+@click.option("--admin-url", required=True, help="Superuser or CREATEROLE/CREATEDB role URL.")
+@click.option("--database", "db_name", default="node_monitor", show_default=True)
+@click.option("--owner", default="node_monitor_owner", show_default=True)
+@click.option("--reader", default="node_monitor_reader", show_default=True)
+def database_bootstrap(admin_url, db_name, owner, reader) -> None:
+   actions = _run_database(bootstrap, admin_url, database=db_name, owner=owner, reader=reader)
+   for action in actions:
+      click.echo(action)
+   if not actions:
+      click.echo("nothing to do")
+
+
+@database.command("migrate")
+@click.option("--config", "config_path", type=click.Path(), default=None)
+def database_migrate(config_path) -> None:
+   """Apply pending migrations. Use the owner-role URL so new tables get reader access."""
+   url, timeout = _database_url(config_path)
+
+   def run():
+      with connect(url, connect_timeout_sec=timeout, autocommit=True) as conn:
+         return migrate(conn)
+
+   applied = _run_database(run)
+   if applied:
+      click.echo("applied: " + ", ".join(f"{v:04d}" for v in applied))
+   else:
+      click.echo("up to date")
+
+
+_PARTITIONS = """
+SELECT p.relname AS parent, c.relname AS child, pg_get_expr(c.relpartbound, c.oid)
+FROM pg_inherits i
+JOIN pg_class c ON c.oid = i.inhrelid
+JOIN pg_class p ON p.oid = i.inhparent
+JOIN pg_namespace n ON n.oid = p.relnamespace
+WHERE n.nspname = 'node_monitor' AND p.relkind = 'p'
+ORDER BY p.relname, c.relname
+"""
+
+
+@database.command("status")
+@click.option("--config", "config_path", type=click.Path(), default=None)
+def database_status(config_path) -> None:
+   """Show schema version and partitions; exit 1 if the schema is behind."""
+   url, timeout = _database_url(config_path)
+
+   def run():
+      with connect(url, connect_timeout_sec=timeout, autocommit=True) as conn:
+         return current_version(conn), conn.execute(_PARTITIONS).fetchall()
+
+   version, partitions = _run_database(run)
+   click.echo(f"current version: {version}")
+   click.echo(f"required version: {REQUIRED_VERSION}")
+   pending = [name for v, name in MIGRATIONS if v > version]
+   click.echo("pending: " + (", ".join(pending) if pending else "none"))
+   for parent, child, bound in partitions:
+      click.echo(f"partition {parent}.{child}: {bound}")
+   if pending:
+      raise SystemExit(1)

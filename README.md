@@ -70,10 +70,13 @@ used: `node_monitor_owner` (owns the schema; the collector and migrations) and
 `NODE_MONITOR_DB_URL` and `NODE_MONITOR_WEB_DB_URL` override the two URLs. If a URL in
 the file contains a password, the file must have mode 0600 or loading fails.
 
-Intended usage (the commands arrive with the CLI work):
+Usage:
 
 ```
 node-monitor database bootstrap --admin-url postgresql://localhost/postgres  # roles + database
 node-monitor database migrate    # run with the owner-role URL from database.url
 node-monitor database status     # schema version and connectivity
 ```
+
+`database migrate` must run with the owner-role URL (`database.url`), so that tables and
+partitions get the reader's default privilege.
