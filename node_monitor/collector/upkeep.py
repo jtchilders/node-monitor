@@ -8,6 +8,7 @@ outage must not take the collector down, and `BufferedWriter` already reports ou
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import datetime, timedelta
 
 from node_monitor.config import RetentionConfig
@@ -56,8 +57,12 @@ class Upkeep:
       # True while heartbeats are failing, so an outage is logged once, not per attempt.
       self._heartbeat_failing = False
 
-   def tick(self, now: datetime, status: dict) -> list[Record]:
-      """Do whatever is due; return collector-level events to be written. Never raises."""
+   def tick(self, now: datetime, status: Callable[[], dict]) -> list[Record]:
+      """Do whatever is due; return collector-level events to be written. Never raises.
+
+      `status` builds the heartbeat's status; it is called only when a heartbeat is due,
+      since building it can be costly (it lists the spool) and ticks come every round.
+      """
       try:
          return self._tick(now, status)
       except Exception:  # noqa: BLE001 - housekeeping must never stop the writer
@@ -84,7 +89,7 @@ class Upkeep:
 
    # --- work ---------------------------------------------------------------------------
 
-   def _tick(self, now: datetime, status: dict) -> list[Record]:
+   def _tick(self, now: datetime, status: Callable[[], dict]) -> list[Record]:
       heartbeat_due = (
          self._last_heartbeat_attempt is None
          or now - self._last_heartbeat_attempt >= self._heartbeat_interval
@@ -93,8 +98,9 @@ class Upkeep:
       events: list[Record] = []
       if heartbeat_due:
          self._last_heartbeat_attempt = now
+         current = status()
          try:
-            self._heartbeat(now, status)
+            self._heartbeat(now, current)
          except Exception as exc:  # noqa: BLE001
             self._drop_connection()
             self._heartbeat_failed(exc)

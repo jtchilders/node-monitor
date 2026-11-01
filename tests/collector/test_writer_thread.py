@@ -51,9 +51,11 @@ class FakeUpkeep:
       self.events = list(events)
       self.ticks = 0
       self.closes = []
+      self.statuses = []
 
    def tick(self, now, status):
       self.ticks += 1
+      self.statuses.append(status)
       out, self.events = self.events, []
       return out
 
@@ -153,6 +155,16 @@ def test_exit_writes_carried_events_in_at_most_3_rounds(parts):
    assert not thread.is_alive()
    assert len(buffered.calls) == 1 + 3
    assert buffered.closed == 1
+
+
+def test_status_is_left_to_upkeep_to_build_when_needed(parts):
+   queue, buffered, upkeep, thread = parts
+   queue.put([durable("a")])
+   queue.close()
+   thread.start()
+   thread.join(5)
+   assert upkeep.statuses and all(callable(s) for s in upkeep.statuses)
+   assert upkeep.statuses[0]() == {"state": "running"}
 
 
 def test_status_combines_buffered_queue_and_last_write(parts):

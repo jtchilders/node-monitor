@@ -80,7 +80,7 @@ class WriterThread(threading.Thread):
          next_carried += self._submit(live)
       if tick:
          try:
-            next_carried += self._upkeep.tick(self._clock(), self._status_fn())
+            next_carried += self._upkeep.tick(self._clock(), self._status_fn)
          except Exception:  # noqa: BLE001
             log.exception("upkeep tick failed")
       self._carried = next_carried
