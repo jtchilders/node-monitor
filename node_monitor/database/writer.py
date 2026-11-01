@@ -20,7 +20,12 @@ from psycopg.pq import TransactionStatus
 from node_monitor.config import RetentionConfig
 from node_monitor.database.codec import to_db_value
 from node_monitor.database.connect import DatabaseUnavailable, connect, is_unavailable
-from node_monitor.database.maintenance import ensure_partition, partition_name
+from node_monitor.database.maintenance import (
+   PARTITION_KEY,
+   PARTITIONED,
+   ensure_partition,
+   partition_name,
+)
 from node_monitor.pipeline.enrich import LIVE_PROCESS_COLUMNS
 from node_monitor.pipeline.node_metrics import NODE_METRICS_COLUMNS
 from node_monitor.pipeline.records import (
@@ -47,14 +52,6 @@ _TABLE = {
    USER_USAGE_5M: "user_usage_5m",
    NODE_USAGE_5M: "node_usage_5m",
    COLLECTION_EVENT: "collection_events",
-}
-
-# Partitioned table -> (partition key column, RetentionConfig field).
-_PARTITIONED = {
-   "node_metrics_1m": ("minute", "node_metrics_days"),
-   "user_usage_5m": ("interval_start", "usage_summary_days"),
-   "node_usage_5m": ("interval_start", "usage_summary_days"),
-   "collection_events": ("ts", "collection_events_days"),
 }
 
 # Summary table -> (columns after system/node, primary key).
@@ -303,14 +300,14 @@ class DatabaseWriter:
             raise ValueError(f"unknown record kind {rec.kind!r}")
       cutoffs = {
          table: now - timedelta(days=getattr(self._retention, attr))
-         for table, (_, attr) in _PARTITIONED.items()
+         for table, attr in PARTITIONED.items()
       }
       plan = _Plan()
       for rec in records:
          table = _TABLE[rec.kind]
          row = rec.row
-         if table in _PARTITIONED:
-            column = _PARTITIONED[table][0]
+         if table in PARTITIONED:
+            column = PARTITION_KEY[table]
             ts = row.get(column)
             if ts is None:
                raise ValueError(f"{rec.kind} record without {column}")
