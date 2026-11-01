@@ -183,3 +183,116 @@ def test_invalid_values_are_rejected(tmp_path, section, key, value, match):
    data = {**MINIMAL, section: {key: value}}
    with pytest.raises(ConfigError, match=match):
       load_config(str(write_yaml(tmp_path, data)))
+
+
+def test_database_sections_default(tmp_path):
+   cfg = load_config(str(write_yaml(tmp_path, MINIMAL)))
+   assert cfg.database.url is None
+   assert cfg.database.connect_timeout_sec == 10
+   assert cfg.web.database_url is None
+   assert (cfg.web.host, cfg.web.port) == ("127.0.0.1", 9998)
+   assert cfg.retention.node_metrics_days == 730
+   assert cfg.retention.usage_summary_days == 730
+   assert cfg.retention.collection_events_days == 180
+   assert cfg.spool.max_bytes == 1073741824
+
+
+def test_database_sections_are_read(tmp_path):
+   data = {
+      **MINIMAL,
+      "database": {"url": "postgres://o@h/db", "connect_timeout_sec": 3},
+      "web": {"database_url": "postgresql://r@h/db", "host": "0.0.0.0", "port": 80},
+      "retention": {
+         "node_metrics_days": 5,
+         "process_samples_days": 30,
+         "command_lines_days": 9,
+      },
+      "spool": {"max_bytes": 100},
+   }
+   cfg = load_config(str(write_yaml(tmp_path, data)))
+   assert cfg.database.url == "postgres://o@h/db"
+   assert cfg.database.connect_timeout_sec == 3
+   assert cfg.web.database_url == "postgresql://r@h/db"
+   assert cfg.web.port == 80
+   assert cfg.retention.node_metrics_days == 5
+   assert cfg.spool.max_bytes == 100
+
+
+@pytest.mark.parametrize(
+   "section,key,value",
+   [
+      ("retention", "node_metrics_days", 0),
+      ("retention", "usage_summary_days", -1),
+      ("retention", "collection_events_days", True),
+      ("retention", "node_metrics_days", float("nan")),
+      ("retention", "node_metrics_days", float("inf")),
+      ("retention", "node_metrics_days", 1.5),
+      ("retention", "node_metrics_days", "10"),
+      ("spool", "max_bytes", 0),
+      ("spool", "max_bytes", True),
+      ("spool", "max_bytes", float("inf")),
+      ("spool", "max_bytes", float("nan")),
+      ("database", "url", "mysql://x@h/db"),
+      ("database", "url", 5),
+      ("database", "connect_timeout_sec", 0),
+      ("web", "database_url", "http://h/db"),
+      ("web", "port", 0),
+      ("web", "port", 70000),
+      ("web", "port", True),
+      ("web", "host", ""),
+   ],
+)
+def test_invalid_database_values_are_rejected(tmp_path, section, key, value):
+   data = {**MINIMAL, section: {key: value}}
+   with pytest.raises(ConfigError, match=key):
+      load_config(str(write_yaml(tmp_path, data)))
+
+
+def test_unknown_keys_in_new_sections_are_rejected(tmp_path):
+   with pytest.raises(ConfigError, match="bogus"):
+      load_config(str(write_yaml(tmp_path, {**MINIMAL, "spool": {"bogus": 1}})))
+
+
+def test_env_overrides_urls(tmp_path, monkeypatch):
+   monkeypatch.setenv("NODE_MONITOR_DB_URL", "postgresql://own@e/db")
+   monkeypatch.setenv("NODE_MONITOR_WEB_DB_URL", "postgresql://rd@e/db")
+   data = {**MINIMAL, "database": {"url": "postgresql://f@h/db"}}
+   cfg = load_config(str(write_yaml(tmp_path, data)))
+   assert cfg.database.url == "postgresql://own@e/db"
+   assert cfg.web.database_url == "postgresql://rd@e/db"
+
+
+def test_env_override_is_validated(tmp_path, monkeypatch):
+   monkeypatch.setenv("NODE_MONITOR_DB_URL", "mysql://x@h/db")
+   with pytest.raises(ConfigError, match="NODE_MONITOR_DB_URL"):
+      load_config(str(write_yaml(tmp_path, MINIMAL)))
+
+
+PASSWORD_DB = {"database": {"url": "postgresql://owner:s3cret@h/db"}}
+
+
+def test_password_url_with_open_mode_is_rejected(tmp_path):
+   path = write_yaml(tmp_path, {**MINIMAL, **PASSWORD_DB})
+   path.chmod(0o644)
+   with pytest.raises(ConfigError, match="mode 0600"):
+      load_config(str(path))
+
+
+def test_password_in_web_url_with_group_access_is_rejected(tmp_path):
+   data = {**MINIMAL, "web": {"database_url": "postgresql://r:pw@h/db"}}
+   path = write_yaml(tmp_path, data)
+   path.chmod(0o640)
+   with pytest.raises(ConfigError, match="mode 0600"):
+      load_config(str(path))
+
+
+def test_password_url_with_mode_0600_is_accepted(tmp_path):
+   path = write_yaml(tmp_path, {**MINIMAL, **PASSWORD_DB})
+   path.chmod(0o600)
+   assert load_config(str(path)).database.url == "postgresql://owner:s3cret@h/db"
+
+
+def test_url_without_password_with_open_mode_is_accepted(tmp_path):
+   path = write_yaml(tmp_path, {**MINIMAL, "database": {"url": "postgresql://o@h/db"}})
+   path.chmod(0o644)
+   assert load_config(str(path)).database.url == "postgresql://o@h/db"

@@ -1,9 +1,11 @@
 """Configuration loading and validation."""
 
+import math
 import os
 import re
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import yaml
 
@@ -48,6 +50,31 @@ class RedactionConfig:
 
 
 @dataclass(frozen=True)
+class DatabaseConfig:
+   url: str | None = None
+   connect_timeout_sec: float = 10
+
+
+@dataclass(frozen=True)
+class WebConfig:
+   database_url: str | None = None
+   host: str = "127.0.0.1"
+   port: int = 9998
+
+
+@dataclass(frozen=True)
+class RetentionConfig:
+   node_metrics_days: int = 730
+   usage_summary_days: int = 730
+   collection_events_days: int = 180
+
+
+@dataclass(frozen=True)
+class SpoolConfig:
+   max_bytes: int = 1073741824
+
+
+@dataclass(frozen=True)
 class Config:
    system: str
    nodes: tuple[NodeConfig, ...]
@@ -58,6 +85,10 @@ class Config:
    classification: ClassificationConfig
    source_path: Path
    redaction: RedactionConfig = RedactionConfig()
+   database: DatabaseConfig = DatabaseConfig()
+   web: WebConfig = WebConfig()
+   retention: RetentionConfig = RetentionConfig()
+   spool: SpoolConfig = SpoolConfig()
 
 
 TOP_LEVEL_KEYS = {
@@ -77,6 +108,8 @@ TOP_LEVEL_KEYS = {
 # Spec keys that M1+ consumes; accepted so one config file serves every milestone.
 _COLLECTION_FUTURE = {"hourly_census"}
 _CLASSIFICATION_FUTURE = {"notable_cpu_seconds_per_min", "notable_rss_mb"}
+# Retention for these arrives with the process tables in M3.
+_RETENTION_FUTURE = {"process_samples_days", "command_lines_days"}
 _NODE_KEYS = {"host", "label", "ssh_target"}
 
 
@@ -123,6 +156,33 @@ def _positive(where: str, key: str, value) -> None:
    # bool is an int subclass; `true` is never a sensible interval.
    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
       raise ConfigError(f"{where}.{key} must be a positive number, got {value!r}")
+
+
+def _positive_int(where: str, key: str, value) -> None:
+   if (
+      isinstance(value, bool)
+      or not isinstance(value, int)
+      or (isinstance(value, float) and not math.isfinite(value))
+      or not value > 0
+   ):
+      raise ConfigError(f"{where}.{key} must be a positive integer, got {value!r}")
+
+
+def _check_url(label: str, url) -> None:
+   if url is None:
+      return
+   if not isinstance(url, str) or not url.startswith(("postgresql://", "postgres://")):
+      raise ConfigError(f"{label} must be a postgresql:// or postgres:// URL, got {url!r}")
+
+
+def _has_password(url) -> bool:
+   if not isinstance(url, str):
+      return False
+   try:
+      parts = urlsplit(url)
+      return bool(parts.password) or "password" in parse_qs(parts.query)
+   except ValueError:
+      return False
 
 
 def _near_integer(x: float) -> bool:
@@ -234,6 +294,42 @@ def load_config(path: str | None = None) -> Config:
    redaction_data["extra_patterns"] = tuple(patterns)
    redaction = _build(RedactionConfig, "redaction", redaction_data)
 
+   database_data = _section(raw, "database")
+   database = _build(DatabaseConfig, "database", database_data)
+   web = _build(WebConfig, "web", _section(raw, "web"))
+   retention = _build(RetentionConfig, "retention", _section(raw, "retention"), _RETENTION_FUTURE)
+   spool = _build(SpoolConfig, "spool", _section(raw, "spool"))
+
+   _check_url("database.url", database.url)
+   _check_url("web.database_url", web.database_url)
+   _positive("database", "connect_timeout_sec", database.connect_timeout_sec)
+   _positive_int("spool", "max_bytes", spool.max_bytes)
+   for key in ("node_metrics_days", "usage_summary_days", "collection_events_days"):
+      _positive_int("retention", key, getattr(retention, key))
+   if not isinstance(web.host, str) or not web.host:
+      raise ConfigError(f"web.host must be a non-empty string, got {web.host!r}")
+   if isinstance(web.port, bool) or not isinstance(web.port, int) or not 1 <= web.port <= 65535:
+      raise ConfigError(f"web.port must be an integer in 1..65535, got {web.port!r}")
+
+   # A password in the file makes the file a credential (spec §3); check what the
+   # file holds, before any environment override replaces it.
+   if _has_password(database.url) or _has_password(web.database_url):
+      mode = source.stat().st_mode & 0o777
+      if mode & 0o077:
+         raise ConfigError(
+            f"{source} contains a database password and must have mode 0600 "
+            f"(found {mode:04o}); run: chmod 600 {source}"
+         )
+
+   db_override = os.environ.get("NODE_MONITOR_DB_URL")
+   if db_override:
+      _check_url("NODE_MONITOR_DB_URL", db_override)
+      database = replace(database, url=db_override)
+   web_override = os.environ.get("NODE_MONITOR_WEB_DB_URL")
+   if web_override:
+      _check_url("NODE_MONITOR_WEB_DB_URL", web_override)
+      web = replace(web, database_url=web_override)
+
    return Config(
       system=raw["system"],
       nodes=_parse_nodes(raw["nodes"]),
@@ -244,4 +340,8 @@ def load_config(path: str | None = None) -> Config:
       classification=classification,
       source_path=source,
       redaction=redaction,
+      database=database,
+      web=web,
+      retention=retention,
+      spool=spool,
    )

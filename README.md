@@ -56,3 +56,24 @@ records.
   classified as `system` and left out of usage summaries.
 - `redaction.extra_patterns` (default `[]`): extra regexes applied after the built-in
   command-line redaction rules; the first capture group (or the whole match) is masked.
+
+## Database
+
+The collector writes to PostgreSQL (database and schema `node_monitor`). Two roles are
+used: `node_monitor_owner` (owns the schema; the collector and migrations) and
+`node_monitor_reader` (SELECT only; web and CLI). Configure them in the config file:
+
+- `database.url`: owner-role URL, e.g. `postgresql://node_monitor_owner@localhost/node_monitor`
+- `web.database_url`: reader-role URL
+- `retention.*_days` (defaults 730 / 730 / 180) and `spool.max_bytes` (default 1 GiB)
+
+`NODE_MONITOR_DB_URL` and `NODE_MONITOR_WEB_DB_URL` override the two URLs. If a URL in
+the file contains a password, the file must have mode 0600 or loading fails.
+
+Intended usage (the commands arrive with the CLI work):
+
+```
+node-monitor database bootstrap --admin-url postgresql://localhost/postgres  # roles + database
+node-monitor database migrate    # run with the owner-role URL from database.url
+node-monitor database status     # schema version and connectivity
+```

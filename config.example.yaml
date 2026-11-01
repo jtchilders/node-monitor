@@ -17,11 +17,13 @@ ssh:
 probe_python: /usr/bin/python3.11
 working_dir: ~/node-monitor          # logs/ and state/ live here
 
-# The sections below take effect in M1+; M0 accepts and ignores them.
+# database/web/retention/spool configure the M1b database writer and readers.
+# A URL containing a password requires this file to have mode 0600.
+# Env overrides: NODE_MONITOR_DB_URL, NODE_MONITOR_WEB_DB_URL.
 database:
-  url: postgresql://node_monitor_owner@host:port/node_monitor
+  url: postgresql://node_monitor_owner@localhost/node_monitor
 web:
-  database_url: postgresql://node_monitor_reader@host:port/node_monitor
+  database_url: postgresql://node_monitor_reader@localhost/node_monitor
   host: 127.0.0.1
   port: 9998
 
