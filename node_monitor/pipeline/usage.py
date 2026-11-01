@@ -29,7 +29,13 @@ _COMMON_COLUMNS = (
    "unmeasured_count",
 )
 
-USER_USAGE_COLUMNS = ("username",) + _COMMON_COLUMNS
+# A user's by_category and by_dormancy are per-key sums of by_category_dormancy, so user
+# rows (the bulk of the data) don't store them; the node row keeps both for cheap node views.
+_USER_DERIVED_MAPS = ("by_category", "by_dormancy")
+
+USER_USAGE_COLUMNS = ("username",) + tuple(
+   c for c in _COMMON_COLUMNS if c not in _USER_DERIVED_MAPS
+)
 NODE_USAGE_COLUMNS = _COMMON_COLUMNS + (
    "user_count_avg",
    "user_count_max",
@@ -86,7 +92,7 @@ class _Tally:
       for category, table in census.cat_dorm.items():
          _merge(self.cat_dorm.setdefault(category, {}), table)
 
-   def row(self, start, samples, expected, gpu_samples):
+   def row(self, start, samples, expected, gpu_samples, omit=()):
       def cell(c):
          return {"count": c[0] / samples, "cpu_s": c[1], "rss_kb": c[2] / samples}
 
@@ -104,7 +110,8 @@ class _Tally:
          "interactive_fraction": self.inter / self.n if self.n else 0.0,
       }
       for name in _MAPS:
-         row[name] = {k: cell(c) for k, c in sorted(self.maps[name].items())}
+         if name not in omit:
+            row[name] = {k: cell(c) for k, c in sorted(self.maps[name].items())}
       row["by_category_dormancy"] = {
          cat: {k: cell(c) for k, c in sorted(table.items())}
          for cat, table in sorted(self.cat_dorm.items())
@@ -218,7 +225,9 @@ class UsageAggregator:
       out = []
       for name, tally in sorted(iv.users.items()):
          row = {"username": name}
-         row.update(tally.row(iv.start, iv.samples, self._expected, iv.gpu_samples))
+         row.update(
+            tally.row(iv.start, iv.samples, self._expected, iv.gpu_samples, omit=_USER_DERIVED_MAPS)
+         )
          out.append(("user_usage_5m", row))
       node = iv.node.row(iv.start, iv.samples, self._expected, iv.gpu_samples)
       node["user_count_avg"] = iv.user_sum / iv.samples

@@ -66,8 +66,11 @@ def _column_types(conn):
 
 
 def test_migrations_are_discovered_from_package_data():
-   assert MIGRATIONS == [(1, "0001_initial.sql")]
-   assert REQUIRED_VERSION == 1
+   assert MIGRATIONS == [
+      (1, "0001_initial.sql"),
+      (2, "0002_user_maps_and_event_key.sql"),
+   ]
+   assert REQUIRED_VERSION == 2
    pkg = importlib.resources.files("node_monitor.database.migrations")
    assert pkg.joinpath("0001_initial.sql").read_text().strip()
 
@@ -93,19 +96,19 @@ def test_current_version_is_zero_before_migrating(pg_db):
 
 def test_migrate_applies_all_and_is_idempotent(pg_db):
    with connect(pg_db) as conn:
-      assert migrate(conn) == [1]
+      assert migrate(conn) == [1, 2]
       assert migrate(conn) == []
       assert current_version(conn) == REQUIRED_VERSION
       rows = conn.execute(
          "SELECT version, name, applied_at FROM node_monitor.schema_migrations"
       ).fetchall()
-   assert [(v, n) for v, n, _ in rows] == [(1, "0001_initial.sql")]
+   assert [(v, n) for v, n, _ in rows] == MIGRATIONS
    assert rows[0][2].tzinfo is not None
 
 
 def test_migrate_works_on_an_autocommit_connection(pg_db):
    with connect(pg_db, autocommit=True) as conn:
-      assert migrate(conn) == [1]
+      assert migrate(conn) == [1, 2]
       assert conn.autocommit is True
 
 
@@ -113,7 +116,7 @@ def test_check_schema_raises_until_migrated(pg_db):
    with connect(pg_db) as conn:
       with pytest.raises(SchemaOutOfDate) as info:
          check_schema(conn)
-      assert str(info.value) == "schema version 0, need 1: run `node-monitor database migrate`"
+      assert str(info.value) == "schema version 0, need 2: run `node-monitor database migrate`"
       migrate(conn)
       check_schema(conn)
 
@@ -145,13 +148,13 @@ def test_check_schema_that_raises_leaves_the_connection_idle(pg_db):
       with pytest.raises(SchemaOutOfDate):
          check_schema(conn)
       assert conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
-      assert migrate(conn) == [1]
+      assert migrate(conn) == [1, 2]
 
 
 def test_current_version_keeps_the_callers_open_transaction(migrated_db):
    with connect(migrated_db) as conn:
       conn.execute(_HEARTBEAT_INSERT, ("polaris",))
-      assert current_version(conn) == 1
+      assert current_version(conn) == REQUIRED_VERSION
       assert conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
       conn.commit()
    assert _heartbeat_count(migrated_db) == 1
@@ -175,31 +178,75 @@ def test_concurrent_migrate_is_serialized(pg_db):
    for t in threads:
       t.join(timeout=60)
    assert errors == []
-   assert sorted(results) == [[], [1]]
+   assert sorted(results) == [[], [1, 2]]
    with connect(pg_db) as conn:
-      assert current_version(conn) == 1
+      assert current_version(conn) == REQUIRED_VERSION
 
 
 def test_failed_migration_rolls_back_and_releases_the_lock(pg_db, monkeypatch):
    real_read = migrate_mod._read_sql
 
    def read(filename):
-      if filename == "0002_broken.sql":
+      if filename == "0003_broken.sql":
          return "CREATE TABLE node_monitor.half_done (x int);\nSELEC broken;"
       return real_read(filename)
 
-   monkeypatch.setattr(migrate_mod, "MIGRATIONS", MIGRATIONS + [(2, "0002_broken.sql")])
+   monkeypatch.setattr(migrate_mod, "MIGRATIONS", MIGRATIONS + [(3, "0003_broken.sql")])
    monkeypatch.setattr(migrate_mod, "_read_sql", read)
    with connect(pg_db) as conn:
       with pytest.raises(psycopg.errors.SyntaxError):
          migrate(conn)
-      assert current_version(conn) == 1
+      assert current_version(conn) == REQUIRED_VERSION
       assert conn.execute("SELECT to_regclass('node_monitor.half_done')").fetchone()[0] is None
    with connect(pg_db) as other:
       locked = other.execute(
          "SELECT pg_try_advisory_lock(hashtext('node_monitor.migrate'))"
       ).fetchone()[0]
    assert locked is True
+
+
+_EVENTS_PARTITION = (
+   "CREATE TABLE collection_events_2026_11 PARTITION OF collection_events"
+   " FOR VALUES FROM ('2026-11-01 00:00+00') TO ('2026-12-01 00:00+00')"
+)
+_EVENT_INSERT = (
+   "INSERT INTO collection_events (ts, system, node, event_type, detail)"
+   " VALUES ('2026-11-01 12:00+00', 'polaris', %s, %s, '{}')"
+)
+
+
+def _version_1(conn, monkeypatch):
+   monkeypatch.setattr(migrate_mod, "MIGRATIONS", [m for m in MIGRATIONS if m[0] <= 1])
+   assert migrate(conn) == [1]
+   monkeypatch.setattr(migrate_mod, "MIGRATIONS", MIGRATIONS)
+
+
+def test_migration_0002_drops_user_maps_and_dedupes_events(pg_db, monkeypatch):
+   with connect(pg_db, autocommit=True) as conn:
+      _version_1(conn, monkeypatch)
+      conn.execute(_EVENTS_PARTITION)
+      for node, event_type in ((None, "e"), (None, "e"), (None, "other"), ("h1", "e"), ("h1", "e")):
+         conn.execute(_EVENT_INSERT, (node, event_type))
+      before = conn.execute("SELECT id, node, event_type FROM collection_events ORDER BY id")
+      ids = before.fetchall()
+      assert len(ids) == 5
+      assert migrate(conn) == [2]
+      assert "by_category" not in _columns(conn, "user_usage_5m")
+      assert "by_dormancy" not in _columns(conn, "user_usage_5m")
+      assert {"by_category", "by_dormancy"} <= _columns(conn, "node_usage_5m")
+      left = conn.execute("SELECT id, node, event_type FROM collection_events ORDER BY id")
+      # The lower id of each duplicated pair survives; NULL nodes compare equal.
+      assert left.fetchall() == [ids[0], ids[2], ids[3]]
+
+
+def test_event_natural_key_rejects_duplicates_including_null_node(migrated_db):
+   with connect(migrated_db) as conn:
+      conn.execute(_EVENTS_PARTITION)
+      for node in (None, "h1"):
+         conn.execute(_EVENT_INSERT, (node, "e"))
+         with pytest.raises(psycopg.errors.UniqueViolation):
+            with conn.transaction():
+               conn.execute(_EVENT_INSERT, (node, "e"))
 
 
 # --- the schema -----------------------------------------------------------------------
@@ -309,9 +356,7 @@ def test_column_types(migrated_db):
       ("node_metrics_1m", "network_rates"),
       ("node_metrics_1m", "lustre_md_rates"),
       ("node_metrics_1m", "gpus"),
-      ("user_usage_5m", "by_category"),
       ("user_usage_5m", "by_activity"),
-      ("user_usage_5m", "by_dormancy"),
       ("user_usage_5m", "by_category_dormancy"),
       ("node_usage_5m", "by_category"),
       ("node_usage_5m", "by_activity"),
@@ -365,10 +410,10 @@ def test_collection_events_generate_ids_and_allow_collector_level_rows(migrated_
       ids = [
          conn.execute(
             "INSERT INTO collection_events (ts, system, node, event_type, detail)"
-            " VALUES (%s, 'polaris', NULL, 'collector_started', '{}') RETURNING id",
-            (datetime(2026, 11, 1, 12, tzinfo=timezone.utc),),
+            " VALUES (%s, 'polaris', NULL, %s, '{}') RETURNING id",
+            (datetime(2026, 11, 1, 12, tzinfo=timezone.utc), event_type),
          ).fetchone()[0]
-         for _ in range(2)
+         for event_type in ("collector_started", "collector_stopped")
       ]
    assert len(set(ids)) == 2 and all(isinstance(i, int) for i in ids)
 

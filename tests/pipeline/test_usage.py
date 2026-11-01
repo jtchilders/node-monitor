@@ -74,11 +74,34 @@ def test_maps_and_fractions():
    agg = UsageAggregator(300, 60)
    agg.add_census(rows, at(0))
    user = dict(agg.flush())["user_usage_5m"]
-   assert user["by_category"]["ai_agent"] == {"count": 1.0, "cpu_s": 0.0, "rss_kb": 500.0}
+   assert "by_category" not in user and "by_dormancy" not in user
    assert user["by_activity"]["unknown"]["count"] == 1.0
-   assert user["by_dormancy"]["idle|1h-1d|absent"]["rss_kb"] == 500.0
    assert user["by_category_dormancy"]["ai_agent"]["idle|1h-1d|absent"]["count"] == 1.0
    assert user["d_state_fraction"] == 0.5 and user["interactive_fraction"] == 0.5
+
+
+def test_user_rows_omit_derivable_maps():
+   agg = UsageAggregator(300, 60)
+   agg.add_census(
+      [
+         e(username="alice", category="python", rss_kb=100, cpu_seconds=1.0),
+         e(username="alice", category="shell", idle_bucket="1h-1d", rss_kb=50, cpu_seconds=2.0),
+         e(username="bob", category="python", cpu_state="idle", rss_kb=300, cpu_seconds=3.0),
+      ],
+      at(0),
+   )
+   agg.add_census([e(username="bob", category="python", rss_kb=10, cpu_seconds=0.5)], at(60))
+   res = by_kind(agg.flush())
+   for row in res["user_usage_5m"]:
+      assert "by_category" not in row and "by_dormancy" not in row
+   node = res["node_usage_5m"][0]
+   assert "by_category" in node and "by_dormancy" in node
+   # Summing a category's dormancy cells reproduces the node's by_category cell.
+   for cat, table in node["by_category_dormancy"].items():
+      for field in ("count", "cpu_s", "rss_kb"):
+         total = sum(cell[field] for cell in table.values())
+         assert abs(total - node["by_category"][cat][field]) < 1e-9
+   assert set(node["by_category"]) == {"python", "shell"}
 
 
 def test_node_row_counts_users_and_active_users():
@@ -194,7 +217,8 @@ def test_category_absent_from_some_censuses_divides_by_sample_count():
    for i, rows in enumerate(censuses):
       agg.add_census(rows, at(60 * i))
    res = by_kind(agg.flush())
-   for row in (res["user_usage_5m"][0], res["node_usage_5m"][0]):
+   assert "by_category" not in res["user_usage_5m"][0]
+   for row in (res["node_usage_5m"][0],):
       assert row["sample_count"] == 3
       cats = row["by_category"]
       assert cats["python"] == {"count": 1.0, "cpu_s": 6.0, "rss_kb": 200.0}

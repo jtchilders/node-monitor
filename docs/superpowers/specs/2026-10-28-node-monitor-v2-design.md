@@ -300,7 +300,7 @@ carries `sample_count` and `expected_count`.
 | Long-term | `command_lines` | (system, username, cmdline_hash) | — | 2 years from last_seen |
 | Inventory | `nodes` | (system, node); label, first/last seen, current boot_id | — | forever |
 | Inventory | `node_hardware` | (system, node, boot_id) | — | forever |
-| Ops | `collection_events` | id; ts, system, node, event_type, detail jsonb | monthly | 180 days |
+| Ops | `collection_events` | id; ts, system, node, event_type, detail jsonb; natural key (system, node, ts, event_type) | monthly | 180 days |
 | Ops | `collector_heartbeat` | (system); collector host, version, started_at, last_seen | — | current |
 
 ### Table contents
@@ -324,9 +324,12 @@ probe sample latency, node clock offset, sample_count/expected_count.
 **`user_usage_5m`** — process_count (avg, max), cpu_seconds, rss_kb (avg,
 max), gpu_mem_mb (avg, max), threads (avg), d_state_fraction,
 interactive_fraction, plus jsonb maps:
-- `by_category`, `by_activity`, `by_tag`: `{key: {count, cpu_s, rss_kb}}`
-- `by_dormancy`: `{"<cpu_state>|<idle_bucket>|<owner_presence>": {count, cpu_s, rss_kb}}`
-- `by_category_dormancy`: same dormancy key nested under category
+- `by_activity`, `by_tag`: `{key: {count, cpu_s, rss_kb}}`
+- `by_category_dormancy`: `{category: {"<cpu_state>|<idle_bucket>|<owner_presence>": {count, cpu_s, rss_kb}}}`
+
+`by_category` and `by_dormancy` are not stored per user: they are the per-key sums of
+`by_category_dormancy` over its dormancy keys and over its categories respectively.
+`node_usage_5m` stores both.
 
 `count` values are interval averages of per-census counts.
 

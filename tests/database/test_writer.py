@@ -221,11 +221,17 @@ def test_writing_a_batch_twice_is_idempotent(migrated_db):
    second = _counts(migrated_db)
    events = sum(r.kind == COLLECTION_EVENT for r in recs)
    assert events > 0
-   # Events have no natural key, so only they are appended.
-   assert second == {**first, "collection_events": first["collection_events"] + events}
+   assert second == first
    assert first["node_metrics_1m"] == 6 and first["live_processes"] == 2
    for table, before in summaries.items():
       assert _rows(migrated_db, f"SELECT * FROM {table} ORDER BY 1, 2, 3") == before, table
+
+
+def test_writer_events_are_idempotent(migrated_db):
+   recs = [_event(NOW, node="h1"), _event(NOW, node=None)]
+   _write(migrated_db, recs)
+   _write(migrated_db, recs)
+   assert _one(migrated_db, "SELECT count(*) AS n FROM collection_events")["n"] == 2
 
 
 def _two_censuses():
@@ -499,7 +505,8 @@ def test_broken_connection_is_replaced_on_next_write(migrated_db, pg_admin_url):
       w.write([_event(NOW)], NOW)
    w.write([_event(NOW)], NOW)
    w.close()
-   assert _counts(migrated_db)["collection_events"] == 2
+   # The same event written before and after the outage is stored once.
+   assert _counts(migrated_db)["collection_events"] == 1
 
 
 def test_ensure_partition_reports_creation(migrated_db):

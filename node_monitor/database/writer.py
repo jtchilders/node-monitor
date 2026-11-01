@@ -1,9 +1,9 @@
 """Writes pipeline records to PostgreSQL: one batch per transaction, safe to replay.
 
-Every statement is idempotent except the collection_events INSERT (events have no natural
-key), so a batch replayed from the spool after a lost acknowledgement changes nothing but
-the event log. Live state only ever moves forward in time: an older live snapshot or
-live_node row, replayed after newer data was written, is skipped.
+Every statement is idempotent, so a batch replayed from the spool after a lost
+acknowledgement changes nothing; events dedupe on their natural key.
+Live state only ever moves forward in time: an older live snapshot or live_node row,
+replayed after newer data was written, is skipped.
 """
 
 from __future__ import annotations
@@ -148,7 +148,9 @@ _HARDWARE_SQL = sql.SQL("{} ON CONFLICT (system, node, boot_id) DO NOTHING").for
    _insert("node_hardware", _IDENTITY + _HARDWARE_COLUMNS)
 )
 
-_EVENT_SQL = _insert("collection_events", _EVENT_COLUMNS)
+_EVENT_SQL = sql.SQL(
+   "{} ON CONFLICT ON CONSTRAINT collection_events_natural_key DO NOTHING"
+).format(_insert("collection_events", _EVENT_COLUMNS))
 
 _PROCESS_SQL = _insert("live_processes", _IDENTITY + ("ts",) + LIVE_PROCESS_COLUMNS)
 
