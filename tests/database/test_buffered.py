@@ -1,5 +1,5 @@
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import psycopg
 import pytest
@@ -66,6 +66,11 @@ class StubWriter:
       # Fail as unavailable after this many more successful writes.
       self.fail_after = None
       self.result = WriteResult({}, {}, [])
+      # None: the database answers exactly when it is not down.
+      self.ping_result = None
+
+   def ping(self):
+      return (not self.down) if self.ping_result is None else self.ping_result
 
    def write(self, records, now):
       self.attempts += 1
@@ -89,6 +94,44 @@ def make(tmp_path, writer=None, *, max_bytes=10**7, **kw):
 
 
 # --- with a stub writer ------------------------------------------------------------------
+
+
+def _fail_b_repeatedly(tmp_path, *, answers, rounds):
+   bw, w, spool = make(tmp_path, backoff=(5, 300))
+   w.down = True
+   for name in "ABC":
+      bw.submit(batch(name), at(0))
+   w.down = False
+   w.ping_result = answers
+   w.poison["B"] = DatabaseUnavailable("database unavailable: out of memory")
+   events = []
+   t = 0
+   for i in range(rounds):
+      next_retry = bw.status()["next_retry"]
+      if next_retry is not None:
+         t = max(t, int((datetime.fromisoformat(next_retry) - at(0)).total_seconds()))
+      events += bw.submit(batch(f"fresh{i}", t), at(t))
+      t += 1
+   return bw, w, spool, events
+
+
+def test_spooled_batch_failing_while_database_answers_is_quarantined_after_3_attempts(tmp_path):
+   bw, w, spool, events = _fail_b_repeatedly(tmp_path, answers=True, rounds=3)
+   assert [p.name for p in (spool.directory / "corrupt").iterdir()]
+   quarantined = events_of(events, "spool_batch_quarantined")
+   assert len(quarantined) == 1
+   assert quarantined[0].row["detail"]["reason"] == "repeated failure while the database answered"
+   assert quarantined[0].row["detail"]["attempts"] == 3
+   assert names(w.written) == ["A", "C", "fresh0", "fresh1", "fresh2"]
+   assert spooled_names(spool) == []
+
+
+def test_spooled_batch_is_never_quarantined_while_ping_fails(tmp_path):
+   bw, w, spool, events = _fail_b_repeatedly(tmp_path, answers=False, rounds=10)
+   corrupt = spool.directory / "corrupt"
+   assert not corrupt.exists() or not list(corrupt.iterdir())
+   assert "B" in spooled_names(spool)
+   assert events_of(events, "spool_batch_quarantined") == []
 
 
 def test_no_database_attempts_before_next_retry(tmp_path):

@@ -53,11 +53,15 @@ class BufferedWriter:
       *,
       system: str,
       backoff: tuple[float, float] = (5, 300),
+      max_replay_attempts: int = 3,
    ):
       self._writer = writer
       self._spool = spool
       self._system = system
       self._backoff = backoff
+      self._max_replay_attempts = max_replay_attempts
+      # path -> outage-class failures of that spooled batch while the database answered.
+      self._replay_failures: dict = {}
       # True once a write has succeeded, until the next outage.
       self._connected = False
       self._outage_since: datetime | None = None
@@ -140,19 +144,33 @@ class BufferedWriter:
             continue
          try:
             result: WriteResult = self._writer.write(batch, now)
-         except DatabaseUnavailable:
-            raise
-         except Exception as exc:  # noqa: BLE001 - one bad batch must not block the rest
-            log.error("quarantining spool file %s: %s", path.name, _describe(exc))
-            self._spool.quarantine(path)
-            if _exists(path):
-               self._skip.add(path)
-            events.append(
-               self._event(
-                  now, "spool_batch_quarantined", {"file": path.name, "error": _describe(exc)}
-               )
+         except DatabaseUnavailable as exc:
+            # An error classed as an outage can be deterministic (out of memory, temp file
+            # limit); if the database still answers, this batch alone is the suspect, and
+            # it must not block the spool forever.
+            if not self._writer.ping():
+               raise
+            failures = self._replay_failures.get(path, 0) + 1
+            if failures < self._max_replay_attempts:
+               self._replay_failures[path] = failures
+               raise
+            log.error("quarantining spool file %s after %d failures", path.name, failures)
+            self._quarantine_spooled(
+               path,
+               now,
+               events,
+               {
+                  "error": _describe(exc),
+                  "reason": "repeated failure while the database answered",
+                  "attempts": failures,
+               },
             )
             continue
+         except Exception as exc:  # noqa: BLE001 - one bad batch must not block the rest
+            log.error("quarantining spool file %s: %s", path.name, _describe(exc))
+            self._quarantine_spooled(path, now, events, {"error": _describe(exc)})
+            continue
+         self._replay_failures.pop(path, None)
          self._spool.remove(path)
          if _exists(path):
             self._skip.add(path)
@@ -161,6 +179,13 @@ class BufferedWriter:
          self._replayed_records += len(batch)
          beyond.update(result.rows_beyond_retention)
       return wrote
+
+   def _quarantine_spooled(self, path, now, events, detail):
+      self._replay_failures.pop(path, None)
+      self._spool.quarantine(path)
+      if _exists(path):
+         self._skip.add(path)
+      events.append(self._event(now, "spool_batch_quarantined", {"file": path.name, **detail}))
 
    def _quarantine_fresh(self, records, exc, now, events):
       if not records:

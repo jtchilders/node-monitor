@@ -116,6 +116,15 @@ def test_unknown_kind_rejected_before_connecting():
       w.write([_event(NOW), Record("bogus", {})], NOW)
 
 
+def test_ping_reports_reachability(migrated_db):
+   up = _writer(migrated_db)
+   assert up.ping() is True
+   up.close()
+   down = _writer(UNREACHABLE, connect_timeout_sec=1)
+   assert down.ping() is False
+   down.close()
+
+
 def test_naive_now_rejected():
    w = _writer(UNREACHABLE, connect_timeout_sec=2)
    with pytest.raises(ValueError):

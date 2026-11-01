@@ -270,6 +270,17 @@ class DatabaseWriter:
          partitions_created=created,
       )
 
+   def ping(self) -> bool:
+      """True if the database answers a trivial query. Never raises."""
+      try:
+         self._connection().execute("SELECT 1")
+         return True
+      except BaseException as exc:
+         if not isinstance(exc, Exception):
+            raise
+         self._discard_if_unusable(force=True)
+         return False
+
    def close(self) -> None:
       conn, self._conn = self._conn, None
       if conn is not None:
