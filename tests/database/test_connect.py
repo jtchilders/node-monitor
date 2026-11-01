@@ -27,6 +27,12 @@ def test_outages_are_unavailable(exc):
       psycopg.errors.NumericValueOutOfRange(),
       psycopg.DataError(),
       psycopg.ProgrammingError(),
+      # OperationalError subclasses that depend on the data: a replay fails the same way.
+      psycopg.errors.ProgramLimitExceeded(),
+      psycopg.errors.StatementTooComplex(),
+      psycopg.errors.TooManyColumns(),
+      psycopg.errors.TooManyArguments(),
+      psycopg.errors.QueryCanceled(),
       ValueError("not a database error"),
    ],
 )
@@ -38,6 +44,39 @@ def test_unreachable_server_is_unavailable():
    with pytest.raises(psycopg.Error) as info:
       connect("postgresql://localhost:1/x", connect_timeout_sec=2)
    assert is_unavailable(info.value)
+
+
+def test_closed_connection_is_unavailable(pg_admin_url):
+   conn = connect(pg_admin_url)
+   conn.close()
+   with pytest.raises(psycopg.OperationalError) as info:
+      conn.execute("SELECT 1")
+   assert is_unavailable(info.value)
+
+
+def test_oversized_index_entry_is_not_unavailable(pg_db):
+   # Hex of random md5s compresses only about 2:1, so the entry stays far over btree's
+   # ~2.7 kB limit after compression.
+   with connect(pg_db) as conn:
+      conn.execute("CREATE TABLE node_monitor.big (x text)")
+      conn.execute("CREATE INDEX ON node_monitor.big (x)")
+      with pytest.raises(psycopg.Error) as info:
+         conn.execute(
+            "INSERT INTO node_monitor.big"
+            " SELECT string_agg(md5(random()::text), '') FROM generate_series(1, 400)"
+         )
+   assert isinstance(info.value, psycopg.errors.ProgramLimitExceeded)
+   assert isinstance(info.value, psycopg.OperationalError)
+   assert not is_unavailable(info.value)
+
+
+def test_statement_timeout_is_not_unavailable(pg_admin_url):
+   with connect(pg_admin_url) as conn:
+      conn.execute("SET statement_timeout = '1ms'")
+      with pytest.raises(psycopg.Error) as info:
+         conn.execute("SELECT pg_sleep(1)")
+   assert isinstance(info.value, psycopg.errors.QueryCanceled)
+   assert not is_unavailable(info.value)
 
 
 def test_syntax_error_is_not_unavailable(pg_admin_url):

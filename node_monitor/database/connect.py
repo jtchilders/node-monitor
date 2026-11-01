@@ -9,6 +9,9 @@ from psycopg.conninfo import conninfo_to_dict
 # extra round trip or transaction.
 _SESSION_OPTIONS = "-c search_path=node_monitor,public -c TimeZone=UTC"
 
+_PROGRAM_LIMIT_CLASS = "54"
+_QUERY_CANCELED = "57014"
+
 
 class DatabaseUnavailable(Exception):
    """The database cannot be reached or is not accepting work; the operation may succeed
@@ -33,5 +36,17 @@ def is_unavailable(exc: BaseException) -> bool:
    ConnectionTimeout) for failures of the connection or the server rather than of the
    statement, so retrying later is the right response. Programming and data errors would
    fail again on retry and are False.
+
+   Two OperationalError families are False because they depend on the data, not the
+   server: a program limit (SQLSTATE class 54, e.g. an index row or jsonb value too large)
+   and a statement timeout (QueryCanceled). A batch that hits one fails identically on
+   every replay, so treating it as an outage would spool it and block every batch behind it.
    """
-   return isinstance(exc, (DatabaseUnavailable, psycopg.OperationalError))
+   if isinstance(exc, DatabaseUnavailable):
+      return True
+   if not isinstance(exc, psycopg.OperationalError):
+      return False
+   # Matched by SQLSTATE: psycopg makes StatementTooComplex, TooManyColumns and the other
+   # class 54 errors siblings of ProgramLimitExceeded, not subclasses.
+   sqlstate = exc.sqlstate or ""
+   return not (sqlstate.startswith(_PROGRAM_LIMIT_CLASS) or sqlstate == _QUERY_CANCELED)

@@ -114,9 +114,47 @@ def test_check_schema_raises_until_migrated(pg_db):
       with pytest.raises(SchemaOutOfDate) as info:
          check_schema(conn)
       assert str(info.value) == "schema version 0, need 1: run `node-monitor database migrate`"
-      conn.rollback()
       migrate(conn)
       check_schema(conn)
+
+
+_HEARTBEAT_INSERT = (
+   "INSERT INTO collector_heartbeat (system, collector_host, version, started_at, last_seen,"
+   " status) VALUES (%s, 'h', 'v', now(), now(), '{}')"
+)
+
+
+def _heartbeat_count(url):
+   with connect(url) as other:
+      return other.execute("SELECT count(*) FROM collector_heartbeat").fetchone()[0]
+
+
+def test_check_schema_leaves_a_default_connection_idle(migrated_db):
+   # Left inside the check's implicit transaction, the next `conn.transaction()` would be a
+   # savepoint and its INSERT would never be committed.
+   with connect(migrated_db) as conn:
+      check_schema(conn)
+      assert conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+      with conn.transaction():
+         conn.execute(_HEARTBEAT_INSERT, ("polaris",))
+      assert _heartbeat_count(migrated_db) == 1
+
+
+def test_check_schema_that_raises_leaves_the_connection_idle(pg_db):
+   with connect(pg_db) as conn:
+      with pytest.raises(SchemaOutOfDate):
+         check_schema(conn)
+      assert conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+      assert migrate(conn) == [1]
+
+
+def test_current_version_keeps_the_callers_open_transaction(migrated_db):
+   with connect(migrated_db) as conn:
+      conn.execute(_HEARTBEAT_INSERT, ("polaris",))
+      assert current_version(conn) == 1
+      assert conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+      conn.commit()
+   assert _heartbeat_count(migrated_db) == 1
 
 
 def test_concurrent_migrate_is_serialized(pg_db):
@@ -157,7 +195,6 @@ def test_failed_migration_rolls_back_and_releases_the_lock(pg_db, monkeypatch):
          migrate(conn)
       assert current_version(conn) == 1
       assert conn.execute("SELECT to_regclass('node_monitor.half_done')").fetchone()[0] is None
-      conn.rollback()
    with connect(pg_db) as other:
       locked = other.execute(
          "SELECT pg_try_advisory_lock(hashtext('node_monitor.migrate'))"

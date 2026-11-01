@@ -53,14 +53,22 @@ def _read_sql(filename: str) -> str:
 
 
 def current_version(conn: psycopg.Connection) -> int:
-   exists = conn.execute(
-      "SELECT to_regclass('node_monitor.schema_migrations') IS NOT NULL"
-   ).fetchone()[0]
-   if not exists:
-      return 0
-   return conn.execute(
-      "SELECT coalesce(max(version), 0) FROM node_monitor.schema_migrations"
-   ).fetchone()[0]
+   # On a non-autocommit connection these SELECTs open a transaction. Left open, it would
+   # turn the caller's next `with conn.transaction():` into a savepoint that commits
+   # nothing, so a connection that arrived idle is handed back idle.
+   opened_here = not conn.autocommit and conn.info.transaction_status == pq.TransactionStatus.IDLE
+   try:
+      exists = conn.execute(
+         "SELECT to_regclass('node_monitor.schema_migrations') IS NOT NULL"
+      ).fetchone()[0]
+      if not exists:
+         return 0
+      return conn.execute(
+         "SELECT coalesce(max(version), 0) FROM node_monitor.schema_migrations"
+      ).fetchone()[0]
+   finally:
+      if opened_here and not conn.closed:
+         conn.rollback()
 
 
 def check_schema(conn: psycopg.Connection) -> None:
