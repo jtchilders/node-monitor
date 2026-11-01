@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from node_monitor import version
 from node_monitor.cli.main import cli
 from node_monitor.collector import soak
 from node_monitor.collector.bootstrap import probe_source
@@ -169,7 +170,7 @@ async def test_run_soak_end_to_end_with_fake_ssh(tmp_path):
    manifest = json.loads((tmp_path / "out" / "manifest.json").read_text())
    assert manifest["system"] == "test"
    assert manifest["probe_sha256"] == hashlib.sha256(probe_source().encode("utf-8")).hexdigest()
-   assert manifest["git_describe"] == soak._git_describe(Path(soak.__file__).parent)
+   assert manifest["git_describe"] == version._git_describe(Path(soak.__file__).parent)
    assert manifest["git_describe"] is not None  # the tests run from a checkout
    assert mode(tmp_path / "out") == 0o700
    assert {mode(p) for p in (tmp_path / "out").iterdir()} == {0o600}
@@ -328,12 +329,12 @@ def test_git_describe_reports_dirty_and_missing_repo(tmp_path):
    (repo / "f").write_text("a")
    git(repo, "add", "f")
    git(repo, "commit", "-q", "-m", "init")
-   clean = soak._git_describe(repo)
+   clean = version._git_describe(repo)
    assert clean and not clean.endswith("-dirty")
    (repo / "f").write_text("b")
-   assert soak._git_describe(repo) == clean + "-dirty"
+   assert version._git_describe(repo) == clean + "-dirty"
    (tmp_path / "plain").mkdir()
-   assert soak._git_describe(tmp_path / "plain") is None
+   assert version._git_describe(tmp_path / "plain") is None
 
 
 # --------------------------------------------------------------------------

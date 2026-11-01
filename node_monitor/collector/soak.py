@@ -1,28 +1,20 @@
 """M0 soak: record every node's probe stream to JSONL and summarize the recording."""
 
-import asyncio
 import hashlib
 import json
 import os
 import re
-import signal
-import subprocess
 import sys
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
-from node_monitor.collector.bootstrap import (
-   build_payload,
-   probe_config,
-   probe_source,
-   remote_command,
-)
-from node_monitor.collector.session import NodeSession
-from node_monitor.collector.ssh import ssh_argv, write_ssh_config
+from node_monitor.collector.bootstrap import probe_source
+from node_monitor.collector.fleet import build_sessions, run_sessions
 from node_monitor.config import Config
 from node_monitor.probe.probe import PROBE_VERSION
+from node_monitor.version import _git, _git_describe
 
 _FILE_RE = re.compile(r"^(?P<label>.+)-(?P<day>\d{8})\.jsonl$")
 # Soak output can hold every user's command lines (--full-census) on a shared filesystem.
@@ -146,21 +138,8 @@ class SoakRecorder:
 _PACKAGE_DIR = Path(__file__).resolve().parent
 
 
-def _git(args: list[str], cwd: Path) -> str | None:
-   try:
-      out = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=5)
-   except (OSError, subprocess.SubprocessError):
-      return None
-   return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
-
-
 def _git_commit(cwd: Path = _PACKAGE_DIR) -> str | None:
    return _git(["rev-parse", "HEAD"], cwd)
-
-
-def _git_describe(cwd: Path = _PACKAGE_DIR) -> str | None:
-   # "-dirty" marks uncommitted changes to tracked files: the code that ran is not HEAD.
-   return _git(["describe", "--always", "--dirty"], cwd)
 
 
 def _write_manifest(config: Config, out_dir: Path, probe_bytes: bytes) -> None:
@@ -190,68 +169,27 @@ async def run_soak(
 ) -> int:
    """Run one session per node until `duration_sec` elapses or SIGINT/SIGTERM.
 
-   `probe_overrides` is merged over the probe config for every node. Probes on one host
-   would take over each other's lock, so a `lock_path` override is made per node by
-   appending `.<label>`.
+   `probe_overrides` is passed through to `build_sessions`.
    """
    out_dir = make_private_dir(out_dir)
-   ssh_config = write_ssh_config(config.working_dir / "state", config.ssh)
-   source = probe_source()
-   _write_manifest(config, out_dir, source.encode("utf-8"))
+   _write_manifest(config, out_dir, probe_source().encode("utf-8"))
    recorder = SoakRecorder(out_dir, full_census)
-   command = remote_command(config.probe_python)
-   coll = config.collection
-
-   sessions = {}
-   for node in config.nodes:
-      cfg = {**probe_config(config), **(probe_overrides or {})}
-      if "lock_path" in cfg:
-         cfg["lock_path"] = f"{cfg['lock_path']}.{node.label}"
-      sessions[node.label] = NodeSession(
-         node.label,
-         argv=ssh_argv(ssh_binary, ssh_config, node.ssh_target, command),
-         payload=build_payload(source, cfg),
+   try:
+      sessions = build_sessions(
+         config,
          on_message=recorder.on_message,
          on_event=recorder.on_event,
-         silence_timeout=coll.session_silence_timeout_sec,
-         max_lifetime=coll.session_max_lifetime_sec,
-         backoff=coll.reconnect_backoff_sec,
+         ssh_binary=ssh_binary,
+         probe_overrides=probe_overrides,
       )
-
-   async def supervise(label: str, session: NodeSession) -> None:
-      try:
-         await session.run()
-      except Exception as exc:
-         print(f"soak: session for {label} ended with {exc!r}", file=sys.stderr)
-         recorder.on_event(label, "session_crashed", {"error": repr(exc)})
-
-   loop = asyncio.get_running_loop()
-   stop_requested = asyncio.Event()
-   installed = []
-   for sig in (signal.SIGINT, signal.SIGTERM):
-      try:
-         loop.add_signal_handler(sig, stop_requested.set)
-         installed.append(sig)
-      except (NotImplementedError, RuntimeError, ValueError):
-         pass
-   tasks = [asyncio.create_task(supervise(lbl, s)) for lbl, s in sessions.items()]
-   try:
-      waiter = asyncio.create_task(stop_requested.wait())
-      all_done = asyncio.create_task(asyncio.wait(tasks))
-      try:
-         await asyncio.wait(
-            {waiter, all_done}, timeout=duration_sec, return_when=asyncio.FIRST_COMPLETED
-         )
-      finally:
-         waiter.cancel()
-         all_done.cancel()
-      # Stop everything first, then wait together: shutdown costs the slowest session.
-      for session in sessions.values():
-         session.stop()
-      await asyncio.gather(*tasks)
+      await run_sessions(
+         sessions,
+         duration_sec=duration_sec,
+         on_crash=lambda label, exc: recorder.on_event(
+            label, "session_crashed", {"error": repr(exc)}
+         ),
+      )
    finally:
-      for sig in installed:
-         loop.remove_signal_handler(sig)
       recorder.close()
    return 0
 
