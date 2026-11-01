@@ -69,6 +69,18 @@ def test_acquire_writes_private_info_and_release_removes_it(tmp_path):
    again.release()
 
 
+def test_acquire_tightens_an_existing_shared_state_directory(tmp_path):
+   state = tmp_path / "state"
+   state.mkdir()
+   os.chmod(state, 0o775)
+   lock = InstanceLock(tmp_path)
+   lock.acquire()
+   try:
+      assert state.stat().st_mode & 0o777 == 0o700
+   finally:
+      lock.release()
+
+
 def test_info_records_systemd_invocation(tmp_path, monkeypatch):
    monkeypatch.setenv("INVOCATION_ID", "abc")
    lock = InstanceLock(tmp_path)

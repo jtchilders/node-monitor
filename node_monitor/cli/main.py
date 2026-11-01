@@ -494,6 +494,10 @@ class _UtcFormatter(logging.Formatter):
 def daemon_start(foreground, config_path) -> None:
    """Start the collector daemon."""
    config = _load(config_path)
+   # state/ holds the ssh config and logs/ the log: both may exist from a group-shared
+   # checkout, and make_private_dir tightens existing directories as well as new ones.
+   make_private_dir(config.working_dir / "state")
+   log_dir = make_private_dir(config.working_dir / "logs")
    if foreground:
       handler = logging.StreamHandler(sys.stderr)
       handler.setFormatter(_UtcFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
@@ -514,12 +518,14 @@ def daemon_start(foreground, config_path) -> None:
    if info:
       raise _already_running(info)
    clear_stale(config.working_dir)
-   log_dir = make_private_dir(config.working_dir / "logs")
    log_path = log_dir / "daemon.log"
    argv = [sys.executable, "-m", "node_monitor.cli.main", "daemon", "start", "--foreground"]
    if config_path:
       argv += ["--config", str(Path(config_path).expanduser().resolve())]
-   with open(log_path, "ab") as log:
+   # Owner-only like the directory: the log can quote command lines and errors.
+   log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+   os.fchmod(log_fd, 0o600)
+   with os.fdopen(log_fd, "ab") as log:
       child = subprocess.Popen(
          argv,
          stdin=subprocess.DEVNULL,

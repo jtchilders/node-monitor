@@ -116,3 +116,29 @@ def test_ssh_config_without_identity_omits_identities_only(tmp_path):
 def test_ssh_argv_shape():
    argv = ssh_argv("ssh", Path("/s/ssh_config"), "host.x", "echo hi")
    assert argv == ["ssh", "-F", "/s/ssh_config", "-o", "BatchMode=yes", "host.x", "echo hi"]
+
+
+def test_ssh_config_tightens_an_existing_file_and_directory(tmp_path):
+   state = tmp_path / "state"
+   state.mkdir()
+   os.chmod(state, 0o775)
+   old = state / "ssh_config"
+   old.write_text("Host *\n   ProxyCommand evil\n")
+   os.chmod(old, 0o644)
+   path = write_ssh_config(state, SshConfig())
+   assert stat.S_IMODE(path.stat().st_mode) == 0o600
+   assert stat.S_IMODE(state.stat().st_mode) == 0o700
+   assert "ProxyCommand" not in path.read_text()
+
+
+def test_ssh_config_replaces_a_planted_symlink_without_following_it(tmp_path):
+   state = tmp_path / "state"
+   state.mkdir()
+   victim = tmp_path / "victim"
+   victim.write_text("untouched\n")
+   (state / "ssh_config").symlink_to(victim)
+   path = write_ssh_config(state, SshConfig())
+   assert not path.is_symlink()
+   assert "BatchMode yes" in path.read_text()
+   assert victim.read_text() == "untouched\n"
+   assert [p.name for p in state.iterdir() if p.name.startswith(".")] == []

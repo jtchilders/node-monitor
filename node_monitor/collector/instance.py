@@ -116,6 +116,9 @@ class InstanceLock:
    def acquire(self) -> None:
       state, lock_path, info_path = _paths(self.working_dir)
       state.mkdir(mode=0o700, parents=True, exist_ok=True)
+      # state/ holds ssh_config, which ssh executes from: an existing directory shared with
+      # a group is tightened, since mkdir leaves its mode alone.
+      os.chmod(state, 0o700)
       fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
       try:
          fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

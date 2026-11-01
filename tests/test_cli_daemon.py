@@ -191,7 +191,28 @@ def test_daemon_start_reports_early_exit_with_log_tail(tmp_path, workdir):
    assert result.exit_code == 1
    assert "database.url" in result.output
    assert (workdir / "logs").stat().st_mode & 0o777 == 0o700
+   assert (workdir / "logs" / "daemon.log").stat().st_mode & 0o777 == 0o600
    assert not (workdir / "state" / "daemon.json").exists()
+
+
+def test_foreground_start_tightens_shared_state_and_logs(tmp_path, workdir):
+   for name in ("state", "logs"):
+      (workdir / name).mkdir(parents=True)
+      os.chmod(workdir / name, 0o775)
+   # No database.url: the daemon refuses to start, but only after the directories are fixed.
+   result = run("daemon", "start", "--foreground", "--config", _config(tmp_path, workdir))
+   assert result.exit_code == 1
+   assert "database.url" in result.output
+   for name in ("state", "logs"):
+      assert (workdir / name).stat().st_mode & 0o777 == 0o700, name
+
+
+def test_background_start_tightens_shared_state(tmp_path, workdir):
+   (workdir / "state").mkdir(parents=True)
+   os.chmod(workdir / "state", 0o775)
+   result = run("daemon", "start", "--config", _config(tmp_path, workdir))
+   assert "database.url" in result.output
+   assert (workdir / "state").stat().st_mode & 0o777 == 0o700
 
 
 @pytest.fixture

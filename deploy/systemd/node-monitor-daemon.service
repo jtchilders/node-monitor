@@ -8,6 +8,9 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# Everything the daemon creates (log, spool, state) is owner-only: the log and the spool
+# hold other users' command lines.
+UMask=0077
 WorkingDirectory=%h/node-monitor
 Environment=PATH=%h/node-monitor/venv/bin:/usr/local/bin:/usr/bin:/bin
 # The leading "-" lets the daemon start even if the database stays down.

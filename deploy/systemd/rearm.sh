@@ -4,6 +4,10 @@ set -euo pipefail
 
 UNIT=node-monitor-daemon.service
 
+# The unit appends to logs/daemon.log; without the directory systemd fails the start
+# (209/STDOUT) and retries every 15 s forever.
+mkdir -m 700 -p "$HOME/node-monitor/logs"
+
 loginctl enable-linger "$USER"
 systemctl --user daemon-reload
 systemctl --user enable "$UNIT"
