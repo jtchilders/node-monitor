@@ -130,7 +130,6 @@ class InstanceLock:
          "pid": os.getpid(),
          "host": socket.gethostname(),
          "started_at": datetime.now(timezone.utc).isoformat(),
-         "systemd": "INVOCATION_ID" in os.environ,
       }
       tmp = info_path.with_name("daemon.json.tmp")
       tmp_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

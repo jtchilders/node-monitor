@@ -489,7 +489,7 @@ class _UtcFormatter(logging.Formatter):
 
 
 @daemon.command("start")
-@click.option("--foreground", is_flag=True, help="Run in this process (for systemd).")
+@click.option("--foreground", is_flag=True, help="Run in this process.")
 @click.option("--config", "config_path", type=click.Path(), default=None)
 def daemon_start(foreground, config_path) -> None:
    """Start the collector daemon."""
@@ -544,9 +544,8 @@ def daemon_start(foreground, config_path) -> None:
 
 @daemon.command("stop")
 @click.option("--timeout", type=float, default=60, show_default=True, help="Seconds to wait.")
-@click.option("--force", is_flag=True, help="Stop even if systemd manages the daemon.")
 @click.option("--config", "config_path", type=click.Path(), default=None)
-def daemon_stop(timeout, force, config_path) -> None:
+def daemon_stop(timeout, config_path) -> None:
    """Send SIGTERM to the running daemon and wait for it to exit."""
    config = _load(config_path)
    info = running_info(config.working_dir)
@@ -559,9 +558,6 @@ def daemon_stop(timeout, force, config_path) -> None:
       raise click.ClickException(
          f"daemon is running on {info.get('host')} (pid {info.get('pid')}); stop it there"
       )
-   if info.get("systemd") and not force:
-      click.echo("managed by systemd: systemctl --user stop node-monitor-daemon")
-      raise SystemExit(1)
    pid = info["pid"]
    try:
       os.kill(pid, signal.SIGTERM)
@@ -604,10 +600,7 @@ def daemon_status(config_path) -> None:
       healthy = True
       started = datetime.fromisoformat(info["started_at"])
       up = (datetime.now(timezone.utc) - started).total_seconds()
-      click.echo(
-         f"local process: running (pid {info['pid']} on {info['host']}, up {_age(up)}, "
-         f"systemd: {'yes' if info.get('systemd') else 'no'})"
-      )
+      click.echo(f"local process: running (pid {info['pid']} on {info['host']}, up {_age(up)})")
    else:
       stale = None if info else clear_stale(config.working_dir)
       note = f" (stale daemon.json from pid {stale.get('pid')} removed)" if stale else ""

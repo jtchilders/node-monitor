@@ -54,7 +54,7 @@ always-on, restart-safe collector. Specific pieces are reused (§12). The old
 ```
                    one login node per system (e.g. polaris-login-04)
  ┌──────────────────────────────────────────────────────────────────────┐
- │ collector daemon (systemd user unit, Restart=always)                 │
+ │ collector daemon (started by hand: daemon start)                     │
  │                                                                      │
  │  NodeSession ×N ──lines──► Aggregator ──records──► Writer ──► Postgres│
  │  (ssh + probe)             (live, 1m, 5m,          (retry,     ▲     │
@@ -83,7 +83,7 @@ always-on, restart-safe collector. Specific pieces are reused (§12). The old
 │   │   ├── notifications/         (M4) alert rules + Slack
 │   │   ├── cli/                   click commands
 │   │   └── config.py
-│   ├── deploy/systemd/            user units, rearm.sh
+│   ├── deploy/                    manual-operation runbook
 │   ├── docs/
 │   └── tests/
 ├── logs/                          daemon and web logs
@@ -225,8 +225,8 @@ runs per node.
 | Long-lived session | `session_max_lifetime_sec` | Collector rotates the session proactively. |
 | Node reboot | session failure; on reconnect `hello.boot_id` differs | New `node_hardware` row; reset delta baselines; `node_rebooted` event. |
 | Overloaded / hung node | silence timeout; per-sample latency | Treated as a drop; latency recorded in `node_metrics_1m`. |
-| Collector crash | systemd | `Restart=always`. Partially filled intervals are written with reduced coverage. |
-| Collector host reboot | systemd + linger | Starts at boot; `rearm.sh` re-enables linger if maintenance cleared it. Heartbeat row shows staleness on the dashboard. |
+| Collector crash | operator | The operator restarts it; the stale heartbeat and `daemon status` make the crash visible. Partially filled intervals are written with reduced coverage. |
+| Collector host reboot | operator | The operator restarts it after maintenance. Heartbeat row shows staleness on the dashboard. |
 | PostgreSQL outage | write failure | Retry with backoff; records buffer in memory, then in `state/spool/` (capped at `spool.max_bytes`; superseded live snapshots dropped first); replayed in order on recovery; `spool_replayed` event. The collector never exits on DB errors. |
 
 Intervals are bucketed on the collector's clock (UTC, wall-clock aligned) so
@@ -397,22 +397,13 @@ filters `-u/--user`, `-n/--node`, `-c/--category`, `--sort`, `--reverse`.
 
 ## 9. Deployment
 
-`deploy/systemd/` provides user units following pbs_monitor's proven
-pattern:
-
-- `node-monitor-daemon.service`: `ExecStart=… node-monitor daemon start
-  --foreground`, `Restart=always`, `RestartSec=15`,
-  `StartLimitIntervalSec=0`, explicit `PATH`, logs appended under
-  `~/node-monitor/logs/`. `ExecStartPre=-… node-monitor database wait
-  --timeout 60` bounds the wait for PostgreSQL (the `-` means a database that stays down
-  never blocks the start); the unit does **not** `Requires=` pbs_monitor's
-  Postgres unit, and the daemon itself tolerates DB absence.
-- `node-monitor-web.service` (optional) arrives with M2.
-- `rearm.sh`: re-enables linger and restarts units after maintenance.
-
-Units are installed into `~/.config/systemd/user/` (on `$HOME`, which
-survives login-node reimaging). A README covers install, linger, and the
-clean-environment pitfalls documented in pbs_monitor.
+Manual operation. ALCF login nodes give users no systemd (no user manager, no linger),
+so the collector is started with `node-monitor daemon start` (background mode, logging to
+`~/node-monitor/logs/daemon.log`) and restarted by the operator after login-node
+maintenance, as pbs_monitor is. `node-monitor database wait --timeout 60` checks that
+PostgreSQL is up first; a daemon started while the database is down spools and catches up.
+`deploy/README.md` is the runbook (setup, start, check, stop, after-maintenance, pitfalls).
+`node-monitor-web` arrives with M2.
 
 ## 10. Alerts and intelligence (M4)
 
@@ -473,7 +464,7 @@ before the next begins.
 | Milestone | Delivers | Exit criterion |
 |---|---|---|
 | M0 Soak | Streaming probe, bootstrap, minimal collector logging lines to a file | ≥ 24 h on login-01/02/04: tolerated by login-node policy, overhead measured, drop/reconnect behaves |
-| M1 Collector + DB | Full collector, migrations, live and long-term tables (`live_*`, `node_metrics_1m`, `*_usage_5m`, inventory, events, heartbeat), classification, redaction, dormancy, spool, maintenance, systemd units; CLI `status`, `nodes`, `top`, `users`, `user`, `idle`, `daemon`, `database`, `config`. Delivered as three plans: **M1a** probe memory fix + in-memory data pipeline (classification, redaction, dormancy, aggregation); **M1b** database (schema, migrations, writer, spool, maintenance); **M1c** daemon, systemd and CLI | One week unattended under systemd, including a deliberate PostgreSQL restart and a node reboot (M1c); M1a: probe RSS flat over a 12 h re-soak |
+| M1 Collector + DB | Full collector, migrations, live and long-term tables (`live_*`, `node_metrics_1m`, `*_usage_5m`, inventory, events, heartbeat), classification, redaction, dormancy, spool, maintenance, manual-operation runbook; CLI `status`, `nodes`, `top`, `users`, `user`, `idle`, `daemon`, `database`, `config`. Delivered as three plans: **M1a** probe memory fix + in-memory data pipeline (classification, redaction, dormancy, aggregation); **M1b** database (schema, migrations, writer, spool, maintenance); **M1c** daemon, runbook and CLI | One week unattended (started by hand), including a node reboot (M1c); the deliberate PostgreSQL restart is deferred by the owner; M1a: probe RSS flat over a 12 h re-soak |
 | M2 Live web | `/`, `/node/{node}`, `/user/{username}`, process modal | Used for day-to-day triage |
 | M3 History and research | `process_samples` + hourly census, `command_lines`, tags, `/analytics`, `/commands`, `history`, `commands search`, `reclassify` | Dormancy and agent-option questions answerable from the UI and SQL |
 | M4 Alerts + Aurora | Slack rules; Aurora configuration and deployment | Running on both systems |

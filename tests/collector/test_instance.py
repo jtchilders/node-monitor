@@ -59,7 +59,7 @@ def test_acquire_writes_private_info_and_release_removes_it(tmp_path):
    assert (tmp_path / "state").stat().st_mode & 0o777 == 0o700
    info = read_info(tmp_path)
    assert info["pid"] == os.getpid()
-   assert info["systemd"] is False
+   assert "systemd" not in info
    lock.release()
    assert not info_path.exists()
    assert read_info(tmp_path) is None
@@ -77,16 +77,6 @@ def test_acquire_tightens_an_existing_shared_state_directory(tmp_path):
    lock.acquire()
    try:
       assert state.stat().st_mode & 0o777 == 0o700
-   finally:
-      lock.release()
-
-
-def test_info_records_systemd_invocation(tmp_path, monkeypatch):
-   monkeypatch.setenv("INVOCATION_ID", "abc")
-   lock = InstanceLock(tmp_path)
-   lock.acquire()
-   try:
-      assert read_info(tmp_path)["systemd"] is True
    finally:
       lock.release()
 

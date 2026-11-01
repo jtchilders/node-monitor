@@ -30,7 +30,6 @@ time.sleep(120)
 def _no_env(monkeypatch):
    for var in ("NODE_MONITOR_DB_URL", "NODE_MONITOR_WEB_DB_URL", "NODE_MONITOR_CONFIG"):
       monkeypatch.delenv(var, raising=False)
-   monkeypatch.delenv("INVOCATION_ID", raising=False)
 
 
 @pytest.fixture
@@ -88,28 +87,11 @@ def test_daemon_stop_not_running_exits_0(tmp_path, workdir):
    assert "not running" in result.output
 
 
-def test_daemon_stop_refuses_systemd_managed_without_force(tmp_path, workdir, holder):
-   proc = holder({"INVOCATION_ID": "x"})
-   result = run("daemon", "stop", "--config", _config(tmp_path, workdir))
-   assert result.exit_code == 1
-   assert "systemctl --user stop node-monitor-daemon" in result.output
-   assert proc.poll() is None
-
-
 def test_daemon_stop_terminates_a_foreground_child(tmp_path, workdir, holder):
    proc = holder()
    result = run("daemon", "stop", "--timeout", "10", "--config", _config(tmp_path, workdir))
    assert result.exit_code == 0, result.output
    assert proc.wait(timeout=5) != 0  # killed by SIGTERM
-
-
-def test_daemon_stop_force_overrides_systemd(tmp_path, workdir, holder):
-   proc = holder({"INVOCATION_ID": "x"})
-   result = run(
-      "daemon", "stop", "--force", "--timeout", "10", "--config", _config(tmp_path, workdir)
-   )
-   assert result.exit_code == 0, result.output
-   proc.wait(timeout=5)
 
 
 def test_daemon_status_not_running_without_database(tmp_path, workdir):
@@ -242,7 +224,6 @@ def stale_info(workdir):
             "pid": proc.pid,
             "host": socket.gethostname(),
             "started_at": "2026-01-01T00:00:00+00:00",
-            "systemd": False,
          }
       )
    )
