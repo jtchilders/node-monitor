@@ -94,3 +94,30 @@ def test_unknown_sort_raises(conn):
       queries.processes(conn, SYSTEM, sort="rss; DROP TABLE nodes")
    with pytest.raises(ValueError):
       queries.users(conn, SYSTEM, sort="threads")
+
+
+def _age_snapshot(conn, node, minutes):
+   conn.execute(
+      "UPDATE live_snapshots SET ts = now() - make_interval(mins => %s) WHERE node = %s",
+      (minutes, node),
+   )
+
+
+def test_max_age_leaves_out_nodes_whose_snapshot_is_old(conn):
+   _age_snapshot(conn, "n1.example", 10)
+   assert pids(queries.processes(conn, SYSTEM, max_age_sec=120)) == [4, 5]
+   assert pids(queries.processes(conn, SYSTEM)) == [1, 3, 4, 2, 5]
+   assert pids(queries.processes(conn, SYSTEM, max_age_sec=900)) == [1, 3, 4, 2, 5]
+   assert [r["username"] for r in queries.users(conn, SYSTEM, max_age_sec=120)] == ["bob", "carol"]
+   assert [r["username"] for r in queries.users(conn, SYSTEM)] == ["alice", "bob", "carol"]
+   assert queries.stale_process_nodes(conn, SYSTEM, 120) == ["N1"]
+   assert queries.stale_process_nodes(conn, SYSTEM, 120, node="N2") == []
+   assert queries.stale_process_nodes(conn, SYSTEM, 900) == []
+
+
+def test_processes_rows_carry_the_snapshot_time(conn):
+   (snapshot_ts,) = conn.execute(
+      "SELECT ts FROM live_snapshots WHERE node = 'n1.example'"
+   ).fetchone()
+   rows = queries.processes(conn, SYSTEM, node="N1")
+   assert {r["ts"] for r in rows} == {snapshot_ts}

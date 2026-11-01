@@ -1,4 +1,4 @@
-"""Commands that read the live tables: status and nodes."""
+"""Commands that read the live tables: status, nodes and the process views."""
 
 import json
 from contextlib import contextmanager
@@ -233,11 +233,33 @@ def _process_options(func, *, sorts, default_sort):
       func
    )
    func = click.option("-c", "--category", default=None, help="Only this category.")(func)
+   func = include_stale_option(func)
    return click.option("-n", "--node", default=None, help="Only this node (host or label).")(func)
 
 
 def _limit(limit):
    return limit or None
+
+
+def include_stale_option(func):
+   return click.option(
+      "--include-stale",
+      is_flag=True,
+      help=f"Include nodes whose process snapshot is older than {STALE_AFTER_SEC}s.",
+   )(func)
+
+
+def _max_age(conn, system, include_stale, node):
+   """The snapshot age limit for the process queries, None with --include-stale.
+
+   The nodes it leaves out are named on stderr, so JSON and CSV on stdout stay clean."""
+   if include_stale:
+      return None
+   stale = queries.stale_process_nodes(conn, system, STALE_AFTER_SEC, node=node)
+   if stale:
+      labels = ", ".join(visible(label) for label in stale)
+      click.echo(f"excluded stale nodes: {labels} (use --include-stale)", err=True)
+   return STALE_AFTER_SEC
 
 
 def process_options(default_sort):
@@ -260,6 +282,7 @@ _TOP_RAW = [
    Column("idle_for_is_lower_bound", "Idle lower bound"),
    Column("owner_presence", "Presence"),
    Column("cmdline", "Command"),
+   Column("ts", "Snapshot"),
 ]
 _TOP_TABLE = [
    *_ID,
@@ -281,6 +304,7 @@ _IDLE_RAW = [
    _RSS,
    Column("owner_presence", "Presence"),
    Column("cmdline", "Command"),
+   Column("ts", "Snapshot"),
 ]
 _IDLE_TABLE = [
    *_ID,
@@ -296,13 +320,14 @@ _IDLE_TABLE = [
 @click.command()
 @process_options("cpu")
 @click.option("-u", "--user", default=None, help="Only this user.")
-def top(config_path, fmt, node, category, sort, reverse, limit, user) -> None:
+def top(config_path, fmt, node, include_stale, category, sort, reverse, limit, user) -> None:
    """User processes, busiest first."""
    config = _load(config_path)
    with _reader(config) as conn:
+      max_age = _max_age(conn, config.system, include_stale, node)
       rows = queries.processes(
          conn, config.system, user=user, node=node, category=category,
-         sort=sort, reverse=reverse, limit=_limit(limit),
+         sort=sort, reverse=reverse, limit=_limit(limit), max_age_sec=max_age,
       )  # fmt: skip
    render(_display_rows(rows), _cols(fmt, _TOP_TABLE, _TOP_RAW), fmt)
 
@@ -321,14 +346,16 @@ def top(config_path, fmt, node, category, sort, reverse, limit, user) -> None:
    "--sort", type=click.Choice(list(queries._USER_SORTS)), default="rss", show_default=True
 )
 @click.option("-c", "--category", default=None, help="Only this category.")
+@include_stale_option
 @click.option("-n", "--node", default=None, help="Only this node (host or label).")
-def users(config_path, fmt, node, category, sort, reverse, limit) -> None:
+def users(config_path, fmt, node, include_stale, category, sort, reverse, limit) -> None:
    """Per-user totals over user processes."""
    config = _load(config_path)
    with _reader(config) as conn:
+      max_age = _max_age(conn, config.system, include_stale, node)
       rows = queries.users(
          conn, config.system, node=node, category=category,
-         sort=sort, reverse=reverse, limit=_limit(limit),
+         sort=sort, reverse=reverse, limit=_limit(limit), max_age_sec=max_age,
       )  # fmt: skip
    render(
       rows,
@@ -349,13 +376,14 @@ def users(config_path, fmt, node, category, sort, reverse, limit) -> None:
 @click.command()
 @click.argument("username")
 @process_options("cpu")
-def user(config_path, fmt, node, category, sort, reverse, limit, username) -> None:
+def user(config_path, fmt, node, include_stale, category, sort, reverse, limit, username) -> None:
    """Every process of USERNAME, whatever its category."""
    config = _load(config_path)
    with _reader(config) as conn:
+      max_age = _max_age(conn, config.system, include_stale, node)
       rows = queries.processes(
          conn, config.system, user=username, node=node, category=category, user_only=False,
-         sort=sort, reverse=reverse, limit=None,
+         sort=sort, reverse=reverse, limit=None, max_age_sec=max_age,
       )  # fmt: skip
    if not rows:
       raise click.ClickException(f"no live processes for {username}")
@@ -377,13 +405,16 @@ def user(config_path, fmt, node, category, sort, reverse, limit, username) -> No
    help="Idle at least this long: 30m, 2h, 1d, 90s or seconds.",
 )
 @click.option("--any-presence", is_flag=True, help="Include processes whose owner is present.")
-def idle(config_path, fmt, node, category, sort, reverse, limit, min_idle, any_presence) -> None:
+def idle(
+   config_path, fmt, node, include_stale, category, sort, reverse, limit, min_idle, any_presence
+) -> None:
    """User processes idle for a while, by default only those whose owner is absent."""
    config = _load(config_path)
    with _reader(config) as conn:
+      max_age = _max_age(conn, config.system, include_stale, node)
       rows = queries.processes(
          conn, config.system, node=node, category=category, idle_min_sec=min_idle,
          presence=None if any_presence else "absent",
-         sort=sort, reverse=reverse, limit=_limit(limit),
+         sort=sort, reverse=reverse, limit=_limit(limit), max_age_sec=max_age,
       )  # fmt: skip
    render(_display_rows(rows), _cols(fmt, _IDLE_TABLE, _IDLE_RAW), fmt)

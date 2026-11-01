@@ -250,3 +250,55 @@ def test_top_table_escapes_hostile_command_lines(live):
       assert "\x1b" not in out and "\x07" not in out, command
       assert "busy\\n" in out, command
       assert "run\\x1b]0;pwned\\x07\\x1b[31m\\nfake" in out, command
+
+
+def _age_n1_snapshot(url, minutes=10):
+   with connect(url, autocommit=True) as conn:
+      conn.execute(
+         "UPDATE live_snapshots SET ts = now() - make_interval(mins => %s)"
+         " WHERE node = 'n1.example'",
+         (minutes,),
+      )
+
+
+STALE_NOTICE = "excluded stale nodes: N1 (use --include-stale)"
+
+
+@pytest.mark.parametrize(
+   "command,fresh_key,fresh",
+   [
+      (["top"], "pid", [4, 5]),
+      (["users"], "username", ["bob", "carol"]),
+      (["user", "bob"], "pid", [4]),
+      (["idle", "--any-presence", "--min-idle", "60"], "pid", [4]),
+   ],
+)
+def test_process_views_leave_out_stale_nodes_by_default(live, command, fresh_key, fresh):
+   url, _, cfg = live
+   _age_n1_snapshot(url)
+   result = run(*command, "--config", cfg, "--format", "json")
+   assert result.exit_code == 0, result.output
+   assert [r[fresh_key] for r in json.loads(result.stdout)] == fresh
+   assert result.stderr.strip() == STALE_NOTICE
+   assert "N1" not in run(*command, "--config", cfg).stdout
+
+   result = run(*command, "--config", cfg, "--format", "json", "--include-stale")
+   assert result.exit_code == 0, result.output
+   assert len(json.loads(result.stdout)) > len(fresh)
+   assert result.stderr == ""
+
+
+def test_csv_stays_clean_when_nodes_are_left_out(live):
+   url, _, cfg = live
+   _age_n1_snapshot(url)
+   result = run("top", "--config", cfg, "--format", "csv")
+   assert result.stdout.splitlines()[0].split(",")[-1] == "ts"
+   assert "excluded" not in result.stdout
+   assert len(result.stdout.splitlines()) == 3
+
+
+def test_fresh_nodes_print_no_notice(live):
+   _, _, cfg = live
+   result = run("top", "--config", cfg, "--format", "json")
+   assert result.stderr == ""
+   assert all(r["ts"] for r in json.loads(result.stdout))

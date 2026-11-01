@@ -53,6 +53,34 @@ def _limit(limit: int | None) -> tuple[sql.Composable, list]:
    return sql.SQL(" LIMIT %s"), [limit]
 
 
+# live_processes keeps a node's last snapshot after its session ends or the node leaves the
+# config; live_snapshots.ts, compared with the database's clock, says how old it is.
+_FRESH = sql.SQL(
+   "EXISTS (SELECT 1 FROM live_snapshots s WHERE s.system = p.system AND s.node = p.node"
+   " AND s.ts >= now() - make_interval(secs => %s))"
+)
+
+
+def stale_process_nodes(
+   conn: psycopg.Connection, system: str, max_age_sec: float, *, node: str | None = None
+) -> list[str]:
+   """Labels of the nodes whose processes `max_age_sec` leaves out, optionally only `node`
+   (a host or a label)."""
+   where = "p.system = %s AND NOT {fresh}"
+   params: list = [system, max_age_sec]
+   if node is not None:
+      where += " AND (p.node = %s OR COALESCE(ln.label, n.label) = %s)"
+      params += [node, node]
+   query = sql.SQL(
+      "SELECT DISTINCT COALESCE(ln.label, n.label, p.node) AS label"
+      " FROM live_processes p"
+      " LEFT JOIN live_nodes ln ON ln.system = p.system AND ln.node = p.node"
+      " LEFT JOIN nodes n ON n.system = p.system AND n.node = p.node"
+      " WHERE " + where + " ORDER BY label"
+   ).format(fresh=_FRESH)
+   return [r["label"] for r in _rows(conn, query, params)]
+
+
 def node_states(conn: psycopg.Connection, system: str) -> list[dict]:
    """One row per live_nodes row, by label, with the node's user process and user counts."""
    return _rows(
@@ -85,11 +113,13 @@ def processes(
    sort: str = "cpu",
    reverse: bool = False,
    limit: int | None = None,
+   max_age_sec: float | None = None,
 ) -> list[dict]:
    """Live processes, by default user processes only, sorted descending with NULLs last.
 
    `node` matches a host or a label. `idle_min_sec` keeps only processes whose cpu_state is
-   idle, since idle_for_sec is meaningful only for those."""
+   idle, since idle_for_sec is meaningful only for those. `max_age_sec` keeps only nodes
+   whose snapshot is at most that old; `ts` in each row is the snapshot's time."""
    order = _order(_PROCESS_SORTS, sort, reverse)
    where = [sql.SQL("p.system = %s")]
    params: list = [system]
@@ -107,6 +137,9 @@ def processes(
    if idle_min_sec is not None:
       where.append(sql.SQL("p.cpu_state = 'idle' AND p.idle_for_sec >= %s"))
       params.append(idle_min_sec)
+   if max_age_sec is not None:
+      where.append(_FRESH)
+      params.append(max_age_sec)
    limit_sql, limit_params = _limit(limit)
    query = sql.SQL(
       "SELECT p.node, COALESCE(ln.label, n.label, p.node) AS label, p.username, p.pid,"
@@ -130,9 +163,10 @@ def users(
    sort: str = "rss",
    reverse: bool = False,
    limit: int | None = None,
+   max_age_sec: float | None = None,
 ) -> list[dict]:
    """Per-user totals over user processes; `top_category` is the category with the most of
-   that user's RSS."""
+   that user's RSS. `max_age_sec` keeps only nodes whose snapshot is at most that old."""
    order = _order(_USER_SORTS, sort, reverse)
    where = [
       sql.SQL("p.system = %s"),
@@ -146,6 +180,9 @@ def users(
    if category is not None:
       where.append(sql.SQL("p.category = %s"))
       params.append(category)
+   if max_age_sec is not None:
+      where.append(_FRESH)
+      params.append(max_age_sec)
    limit_sql, limit_params = _limit(limit)
    query = sql.SQL(
       "WITH p AS (SELECT p.username, p.node, p.category, p.cpu_seconds, p.rss_kb,"
