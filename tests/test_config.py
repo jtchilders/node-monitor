@@ -235,6 +235,8 @@ def test_database_sections_are_read(tmp_path):
       ("database", "url", "mysql://x@h/db"),
       ("database", "url", 5),
       ("database", "connect_timeout_sec", 0),
+      ("database", "connect_timeout_sec", float("inf")),
+      ("database", "connect_timeout_sec", float("nan")),
       ("web", "database_url", "http://h/db"),
       ("web", "port", 0),
       ("web", "port", 70000),

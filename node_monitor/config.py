@@ -158,6 +158,13 @@ def _positive(where: str, key: str, value) -> None:
       raise ConfigError(f"{where}.{key} must be a positive number, got {value!r}")
 
 
+def _positive_finite(where: str, key: str, value) -> None:
+   # libpq takes whole seconds, and math.ceil(inf) raises.
+   _positive(where, key, value)
+   if not math.isfinite(value):
+      raise ConfigError(f"{where}.{key} must be a finite number, got {value!r}")
+
+
 def _positive_int(where: str, key: str, value) -> None:
    if (
       isinstance(value, bool)
@@ -302,7 +309,7 @@ def load_config(path: str | None = None) -> Config:
 
    _check_url("database.url", database.url)
    _check_url("web.database_url", web.database_url)
-   _positive("database", "connect_timeout_sec", database.connect_timeout_sec)
+   _positive_finite("database", "connect_timeout_sec", database.connect_timeout_sec)
    _positive_int("spool", "max_bytes", spool.max_bytes)
    for key in ("node_metrics_days", "usage_summary_days", "collection_events_days"):
       _positive_int("retention", key, getattr(retention, key))
