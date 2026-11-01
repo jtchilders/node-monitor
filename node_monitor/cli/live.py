@@ -15,6 +15,7 @@ from node_monitor.cli.output import (
    fmt_pct,
    json_default,
    render,
+   visible,
 )
 from node_monitor.config import ConfigError, load_config
 from node_monitor.database import queries
@@ -126,8 +127,9 @@ def status(config_path, fmt) -> None:
       elif fmt == "table":
          flag = "  STALE" if collector["stale"] else ""
          click.echo(
-            f"collector: {collector['host']}  version {collector['version']}  "
-            f"state {collector['state'] or '-'}  last seen "
+            f"collector: {visible(str(collector['host']))}  "
+            f"version {visible(str(collector['version']))}  "
+            f"state {visible(str(collector['state'] or '-'))}  last seen "
             f"{fmt_age(collector['last_seen'], now)} ago{flag}"
          )
          click.echo(
@@ -190,7 +192,11 @@ class IdleDuration(click.ParamType):
 
 
 def _truncate(text, width=COMMAND_WIDTH):
-   if text is None or len(text) <= width:
+   """`text` made visible, then cut to `width` characters, so the cut counts what is shown."""
+   if text is None:
+      return None
+   text = visible(text)
+   if len(text) <= width:
       return text
    return text[: width - 1] + "…"
 

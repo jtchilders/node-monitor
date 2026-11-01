@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import sys
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -31,8 +32,37 @@ def json_default(value):
    raise TypeError(f"cannot serialize {type(value).__name__}")
 
 
+_ESCAPES = {"\n": "\\n", "\t": "\\t", "\r": "\\r"}
+# A cell starting with one of these is a formula to a spreadsheet opening the CSV.
+_FORMULA_START = ("=", "+", "-", "@")
+
+
+def visible(text: str) -> str:
+   """`text` with every control character (C0, DEL, C1) shown as an escape such as \\x1b.
+
+   Command lines and other text from the database are chosen by whoever runs the process;
+   printed raw, escape sequences would drive the reader's terminal and newlines would forge
+   table rows.
+   """
+   if text.isprintable():
+      return text
+   return "".join(
+      _ESCAPES.get(c, f"\\x{ord(c):02x}") if unicodedata.category(c) == "Cc" else c for c in text
+   )
+
+
 def _raw(value):
    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def _csv_cell(value):
+   if value is None:
+      return ""
+   value = _raw(value)
+   if not isinstance(value, str):
+      return value
+   value = visible(value)
+   return "'" + value if value.startswith(_FORMULA_START) else value
 
 
 def render(
@@ -48,7 +78,7 @@ def render(
       writer = csv.writer(out, lineterminator="\n")
       writer.writerow([c.key for c in columns])
       for r in rows:
-         writer.writerow(["" if r.get(c.key) is None else _raw(r.get(c.key)) for c in columns])
+         writer.writerow([_csv_cell(r.get(c.key)) for c in columns])
    elif fmt == "table":
       table = Table(title=Text(title) if title else None, title_justify="left")
       for c in columns:
@@ -66,8 +96,8 @@ def render(
 def _cell(column: Column, value) -> Text:
    # Text, not str: rich would parse brackets in process names and command lines as markup.
    if column.fmt is not None:
-      return Text(column.fmt(value))
-   return Text("-" if value is None else str(value))
+      return Text(visible(column.fmt(value)))
+   return Text("-" if value is None else visible(str(value)))
 
 
 def fmt_kb(kb) -> str:

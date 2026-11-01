@@ -81,3 +81,48 @@ def test_render_table_shows_bracketed_values_literally():
    text = buf.getvalue()
    assert tricky in text
    assert "[Cmd]" in text and "[T]" in text
+
+
+HOSTILE = "evil\x1b]0;pwned\x07 \x1b[31mred\nforged row\ttab\x9bend"
+VISIBLE = "evil\\x1b]0;pwned\\x07 \\x1b[31mred\\nforged row\\ttab\\x9bend"
+
+
+def _render(rows, columns, fmt):
+   buf = io.StringIO()
+   render(rows, columns, fmt, file=buf)
+   return buf.getvalue()
+
+
+def test_table_shows_control_characters_as_visible_escapes():
+   cols = [Column("user", "User"), Column("cmdline", "Command")]
+   text = _render([{"user": "mallory\n", "cmdline": HOSTILE}], cols, "table")
+   for raw in ("\x1b", "\x07", "\x9b", "\t"):
+      assert raw not in text
+   assert VISIBLE in text
+   assert "mallory\\n" in text
+   # One header line, one row line and the box: an embedded newline forged no extra row.
+   assert sum("forged row" in line for line in text.splitlines()) == 1
+   assert not any(line.lstrip("│ ").startswith("forged") for line in text.splitlines())
+
+
+def test_csv_escapes_control_characters_in_cells():
+   cols = [Column("cmdline", "Command")]
+   text = _render([{"cmdline": HOSTILE}], cols, "csv")
+   for raw in ("\x1b", "\x07", "\x9b", "\t"):
+      assert raw not in text
+   assert text.splitlines() == ["cmdline", VISIBLE]
+
+
+def test_csv_blocks_spreadsheet_formulas():
+   cols = [Column("v", "V"), Column("n", "N")]
+   rows = [{"v": v, "n": -5} for v in ("=cmd|' /C calc'!A0", "+1", "-2", "@SUM(A1)", "ok")]
+   parsed = list(csv.reader(io.StringIO(_render(rows, cols, "csv"))))
+   assert [r[0] for r in parsed[1:]] == ["'=cmd|' /C calc'!A0", "'+1", "'-2", "'@SUM(A1)", "ok"]
+   # Numbers are values, not text a spreadsheet would evaluate.
+   assert {r[1] for r in parsed[1:]} == {"-5"}
+
+
+def test_json_keeps_raw_text():
+   text = _render([{"cmdline": HOSTILE}], [Column("cmdline", "Command")], "json")
+   assert "\x1b" not in text  # json escapes it ...
+   assert json.loads(text) == [{"cmdline": HOSTILE}]  # ... and the value is unchanged

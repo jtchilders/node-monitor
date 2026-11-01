@@ -225,3 +225,28 @@ def test_min_idle_accepts_units(live, value, seconds):
    from node_monitor.cli.live import IdleDuration
 
    assert IdleDuration().convert(value, None, None) == seconds
+
+
+def test_command_column_is_escaped_before_truncation():
+   from node_monitor.cli.live import _display_rows
+
+   row = {"idle_for_sec": None, "idle_for_is_lower_bound": False}
+   (shown,) = _display_rows([{**row, "cmdline": "\x1b" * 100}])
+   # Truncation counts the visible escapes, so the cell keeps its width.
+   assert shown["command"] == "\\x1b" * 14 + "\\x1…"
+   assert len(shown["command"]) == 60
+   assert shown["cmdline"] == "\x1b" * 100  # JSON and CSV still get the raw value
+
+
+def test_top_table_escapes_hostile_command_lines(live):
+   url, _, cfg = live
+   with connect(url, autocommit=True) as conn:
+      conn.execute(
+         "UPDATE live_processes SET cmdline = %s, activity = %s WHERE username = 'alice'",
+         ("run\x1b]0;pwned\x07\x1b[31m\nfake", "busy\n"),
+      )
+   for command in (["top"], ["user", "alice"], ["idle", "--any-presence", "--min-idle", "1"]):
+      out = run(*command, "--config", cfg).output
+      assert "\x1b" not in out and "\x07" not in out, command
+      assert "busy\\n" in out, command
+      assert "run\\x1b]0;pwned\\x07\\x1b[31m\\nfake" in out, command
