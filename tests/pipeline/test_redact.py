@@ -69,6 +69,15 @@ MASKED = [
    # The password runs to the last @ before the host.
    ("curl https://bob:p@ss@host/x", "curl https://bob:***@host/x"),
    ("curl https://bob:p@ss@host", "curl https://bob:***@host"),
+   # Hugging Face tokens, wherever they appear.
+   ("huggingface-cli login hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123", "huggingface-cli login ***"),
+   ("env HF=hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123 python", "env HF=*** python"),
+   # Any `*-key`/`*_key` option whose value looks like a key: 24+ characters of
+   # [A-Za-z0-9_-] with no `/` or `.`.
+   ("tool --license-key AbCdEfGhIjKlMnOpQrStUvWx", "tool --license-key ***"),
+   ("tool --license_key=AbCdEfGhIjKlMnOpQrStUvWx12", "tool --license_key=***"),
+   ("tool -dev-key Ab_Cd-EfGhIjKlMnOpQrStUvWx run", "tool -dev-key *** run"),
+   ("tool --WANDB_KEY 0123456789abcdef0123456789abcdef", "tool --WANDB_KEY ***"),
 ]
 
 UNTOUCHED = [
@@ -112,6 +121,15 @@ UNTOUCHED = [
    "tool --keyfile x",
    "make -j32 author=me",
    "curl https://host:8080/a@b",
+   "pip install hf_transfer",
+   "tool --license-key AbCdEfGhIjKlMnOpQrStUvW",
+   "tool --cache-key /var/cache/abcdefghijklmnopqrstuvwxyz",
+   "tool --model-key org.example.abcdefghijklmnopqrstuvwxyz",
+   "tool --sort-key --a-very-long-flag-name-here-indeed",
+   "tool --key AbCdEfGhIjKlMnOpQrStUvWxYz012",
+   "tool --keys AbCdEfGhIjKlMnOpQrStUvWxYz012",
+   "cmake -DAPP_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz ..",
+   "tool --sort-key 'AbCdEfGhIjKlMnOp QrStUvWxYz012'",
 ]
 
 
@@ -190,6 +208,9 @@ def test_pathological_inputs_stay_fast(cmdline):
       "sshpass" + " -p " * 25000,
       "sshpass" + " -P '" * 20000,
       "x " + "-passin pass:" * 8000,
+      "x --" + "a_" * 50000 + "key " + "b" * 30,
+      "x " + "--a-key " * 10000,
+      "x " + "hf_" * 30000,
    ],
 )
 def test_new_patterns_stay_fast(cmdline):

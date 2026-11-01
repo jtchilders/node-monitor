@@ -65,6 +65,18 @@ _DEFINE_EQ = re.compile(
    + _VALUE,
    re.IGNORECASE,
 )
+# Any other `*-key`/`*_key` option (`--license-key`, `--wandb_key`) is masked only when its
+# value has the shape of a key: one token of 24 or more `[A-Za-z0-9_-]`, so that a field
+# name (`--sort-key name`, `--primary-key id`) or a path (`--cache-key /x/y`, `a.pem`) is
+# kept. Bare `--key` is not matched at all.
+_KEY_OPTION = re.compile(
+   _NAME_START
+   + _DASHES
+   + r"(?!no[-_])(?=[A-Za-z0-9])"
+   + _NAME_CHAR
+   + r"*[-_]key(?:=|[ \t]+)(?!-)([A-Za-z0-9_-]{24,})(?!\S)",
+   re.IGNORECASE,
+)
 # keytool passwords are single-dash options whose names end in `pass`.
 _KEYTOOL_PASSWORD = re.compile(r"(?<!\S)-(?:src|dest)?(?:store|key)pass[ \t]+(?!-)" + _VALUE)
 # openssl's `-passin pass:X` / `-passout pass:X`; `env:` and `file:` sources hold no secret.
@@ -100,6 +112,7 @@ _KNOWN_KEYS = (
    re.compile(r"(?<![A-Za-z0-9])(gh[pousr]_[A-Za-z0-9]{20,})"),
    re.compile(r"(?<![A-Za-z0-9])(github_pat_[A-Za-z0-9_]{20,})"),
    re.compile(r"(?<![A-Za-z0-9])(sk-[A-Za-z0-9_-]{16,})"),
+   re.compile(r"(?<![A-Za-z0-9])(hf_[A-Za-z0-9]{30,})"),
 )
 
 
@@ -140,6 +153,7 @@ class Redactor:
       text = _sub(_DEFINE_EQ, text)
       text = _sub(_OPTION_EQ, text)
       text = _sub(_OPTION_SPACE, text)
+      text = _sub(_KEY_OPTION, text)
       text = _sub(_ASSIGNMENT, text)
       text = _sub(_URL_PASSWORD, text)
       text = _sub(_BASIC_AUTH, text)
