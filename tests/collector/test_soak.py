@@ -178,6 +178,22 @@ async def test_run_soak_end_to_end_with_fake_ssh(tmp_path):
    assert set(s) == {"n1", "n2"} and all(v["counters_received"] >= 5 for v in s.values())
 
 
+async def test_run_soak_reports_a_crashed_session(tmp_path, monkeypatch, capsys):
+   class Crashing:
+      async def run(self):
+         raise RuntimeError("boom")
+
+      def stop(self):
+         pass
+
+   monkeypatch.setattr(soak, "build_sessions", lambda config, **kw: {"n1": Crashing()})
+   cfg = config_for_fake_tree(tmp_path, nodes=1, counter=0.2, census=0.5)
+   assert await run_soak(cfg, tmp_path / "out", duration_sec=0.2) == 0
+   assert "soak: session for n1 ended with RuntimeError('boom')" in capsys.readouterr().err
+   (line,) = [json.loads(x) for x in only_file(tmp_path / "out").read_text().splitlines()]
+   assert line["event"] == "session_crashed" and line["detail"] == {"error": "RuntimeError('boom')"}
+
+
 def test_cli_report_table(tmp_path):
    write_manifest(tmp_path, counter_interval_sec=10)
    write_lines(tmp_path, "n1", [counters_at(0, 1.0), counters_at(10, 1.1)])

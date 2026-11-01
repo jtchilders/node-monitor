@@ -1,8 +1,8 @@
 """Session setup and the run/stop lifecycle shared by the soak command and the daemon."""
 
 import asyncio
+import logging
 import signal
-import sys
 from collections.abc import Callable
 
 from node_monitor.collector.bootstrap import (
@@ -14,6 +14,8 @@ from node_monitor.collector.bootstrap import (
 from node_monitor.collector.session import NodeSession
 from node_monitor.collector.ssh import ssh_argv, write_ssh_config
 from node_monitor.config import Config
+
+log = logging.getLogger(__name__)
 
 
 def build_sessions(
@@ -62,14 +64,15 @@ async def run_sessions(
    """Run every session until `duration_sec` elapses, `stop` is set, SIGINT/SIGTERM
    arrives, or all sessions end; then stop them together and wait for them.
 
-   A session that raises is reported through `on_crash` and the others carry on.
+   A session that raises is reported through `on_crash` and the others carry on. However
+   this returns, cancellation included, every session has been stopped and awaited, so no
+   ssh process outlives it.
    """
 
    async def supervise(label: str, session: NodeSession) -> None:
       try:
          await session.run()
       except Exception as exc:
-         print(f"soak: session for {label} ended with {exc!r}", file=sys.stderr)
          on_crash(label, exc)
 
    loop = asyncio.get_running_loop()
@@ -81,10 +84,10 @@ async def run_sessions(
          installed.append(sig)
       except (NotImplementedError, RuntimeError, ValueError):
          pass
-   tasks = [asyncio.create_task(supervise(lbl, s)) for lbl, s in sessions.items()]
+   tasks = {label: asyncio.create_task(supervise(label, s)) for label, s in sessions.items()}
    try:
       waiter = asyncio.create_task(stop_requested.wait())
-      all_done = asyncio.create_task(asyncio.wait(tasks)) if tasks else None
+      all_done = asyncio.create_task(asyncio.wait(tasks.values())) if tasks else None
       pending = {waiter} if all_done is None else {waiter, all_done}
       try:
          await asyncio.wait(pending, timeout=duration_sec, return_when=asyncio.FIRST_COMPLETED)
@@ -92,10 +95,28 @@ async def run_sessions(
          waiter.cancel()
          if all_done is not None:
             all_done.cancel()
-      # Stop everything first, then wait together: shutdown costs the slowest session.
-      for session in sessions.values():
-         session.stop()
-      await asyncio.gather(*tasks)
    finally:
-      for sig in installed:
-         loop.remove_signal_handler(sig)
+      try:
+         await _stop_all(sessions, tasks)
+      finally:
+         for sig in installed:
+            loop.remove_signal_handler(sig)
+
+
+async def _stop_all(sessions: dict[str, NodeSession], tasks: dict[str, asyncio.Task]) -> None:
+   # Stop everything first, then wait together: shutdown costs the slowest session.
+   for label, session in sessions.items():
+      try:
+         session.stop()
+      except Exception:
+         log.exception("stopping the session for %s failed; cancelling it", label)
+         # Cancelling still runs the session's cleanup, which ends its ssh process group.
+         tasks[label].cancel()
+   if not tasks:
+      return
+   # asyncio.wait, not gather: a second cancellation of the caller must not cancel the
+   # sessions while they are still shutting their processes down.
+   await asyncio.wait(tasks.values())
+   for label, task in tasks.items():
+      if not task.cancelled() and task.exception() is not None:
+         log.error("session task for %s failed: %r", label, task.exception())

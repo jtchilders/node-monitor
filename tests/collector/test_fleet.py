@@ -66,6 +66,61 @@ async def test_run_sessions_reports_a_crashed_session():
    assert sessions["n2"].stopped.is_set()
 
 
+@pytest.mark.asyncio
+async def test_run_sessions_leaves_crash_reporting_to_on_crash(capsys):
+   sessions = {"n1": FakeSession(crash=RuntimeError("boom"))}
+   stop = asyncio.Event()
+   asyncio.get_running_loop().call_later(0.2, stop.set)
+   crashes = []
+   await _run_within(sessions, stop, 2.0, crashes)
+   assert [label for label, _ in crashes] == ["n1"]
+   assert capsys.readouterr().err == ""
+
+
+class TrackedSession(FakeSession):
+   """Records whether its run() has returned, however it ended."""
+
+   def __init__(self) -> None:
+      super().__init__()
+      self.finished = False
+
+   async def run(self) -> None:
+      try:
+         await super().run()
+      finally:
+         self.finished = True
+
+
+@pytest.mark.asyncio
+async def test_cancelling_run_sessions_stops_and_awaits_every_session():
+   sessions = {"n1": TrackedSession(), "n2": TrackedSession()}
+   before = signal.getsignal(signal.SIGTERM)
+   task = asyncio.create_task(run_sessions(sessions, on_crash=lambda label, exc: None))
+   await asyncio.sleep(0.1)
+   task.cancel()
+   done, _ = await asyncio.wait({task}, timeout=2)
+   assert done and task.cancelled()
+   assert all(s.stop_calls == 1 and s.finished for s in sessions.values())
+   assert signal.getsignal(signal.SIGTERM) is before
+
+
+class UnstoppableSession(TrackedSession):
+   """stop() raises without stopping, so only cancelling its task ends it."""
+
+   def stop(self) -> None:
+      self.stop_calls += 1
+      raise RuntimeError("stop failed")
+
+
+@pytest.mark.asyncio
+async def test_a_failing_stop_does_not_leave_sessions_running():
+   sessions = {"n1": UnstoppableSession(), "n2": TrackedSession()}
+   stop = asyncio.Event()
+   asyncio.get_running_loop().call_later(0.1, stop.set)
+   await _run_within(sessions, stop, 2.0)
+   assert all(s.stop_calls == 1 and s.finished for s in sessions.values())
+
+
 def test_build_sessions_suffixes_lock_path_per_node(tmp_path):
    config = config_for_fake_tree(tmp_path, 2, 1, 5)
    sessions = build_sessions(

@@ -174,6 +174,11 @@ async def run_soak(
    out_dir = make_private_dir(out_dir)
    _write_manifest(config, out_dir, probe_source().encode("utf-8"))
    recorder = SoakRecorder(out_dir, full_census)
+
+   def on_crash(label: str, exc: BaseException) -> None:
+      print(f"soak: session for {label} ended with {exc!r}", file=sys.stderr)
+      recorder.on_event(label, "session_crashed", {"error": repr(exc)})
+
    try:
       sessions = build_sessions(
          config,
@@ -185,9 +190,7 @@ async def run_soak(
       await run_sessions(
          sessions,
          duration_sec=duration_sec,
-         on_crash=lambda label, exc: recorder.on_event(
-            label, "session_crashed", {"error": repr(exc)}
-         ),
+         on_crash=on_crash,
       )
    finally:
       recorder.close()
