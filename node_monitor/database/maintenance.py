@@ -32,6 +32,16 @@ PARTITION_KEY = {
 
 _PARTITION_SUFFIX = re.compile(r"_y(\d{4})m(\d{2})$")
 
+# Creating, detaching and dropping a partition take ACCESS EXCLUSIVE on the parent. Waiting
+# for it behind a long reader would queue every writer behind this statement, so the wait
+# is capped: past it the statement fails with LockNotAvailable (55P03).
+LOCK_TIMEOUT = "5s"
+
+
+def _set_local_lock_timeout(conn: psycopg.Connection) -> None:
+   # set_config(..., true) is SET LOCAL, and unlike SET it takes a bound parameter.
+   conn.execute("SELECT set_config('lock_timeout', %s, true)", (LOCK_TIMEOUT,))
+
 
 def _month_floor(ts: datetime) -> datetime:
    """First instant of the UTC month containing `ts`; partitions follow UTC months."""
@@ -54,7 +64,9 @@ def partition_name(table: str, month_start: datetime) -> str:
 def ensure_partition(conn: psycopg.Connection, table: str, month_start: datetime) -> bool:
    """Create `table`'s partition for the UTC month containing `month_start` if it is missing.
 
-   Returns True if this call created it. Runs in the caller's transaction, if any.
+   Returns True if this call created it. Runs in the caller's transaction, if any. Raises
+   LockNotAvailable if the lock on the parent cannot be had within LOCK_TIMEOUT; the
+   writer counts that as unavailable and spools the batch.
    """
    start = _month_floor(month_start)
    name = partition_name(table, start)
@@ -63,6 +75,7 @@ def ensure_partition(conn: psycopg.Connection, table: str, month_start: datetime
    # systems share these tables; without the lock two concurrent CREATE ... PARTITION OF
    # can fail with DuplicateTable or a catalog unique violation despite IF NOT EXISTS.
    with conn.transaction():
+      _set_local_lock_timeout(conn)
       conn.execute(
          "SELECT pg_advisory_xact_lock(hashtext('node_monitor.partition:' || %s))", (table,)
       )
@@ -112,16 +125,20 @@ def _attached_partitions(conn: psycopg.Connection, table: str) -> list[str]:
 
 def apply_retention(
    conn: psycopg.Connection, now: datetime, retention: RetentionConfig
-) -> list[str]:
+) -> dict[str, list[str]]:
    """Detach and drop partitions whose whole month is older than the table's retention.
 
    A partition goes only when its upper bound is <= now - days: a month that still holds
    rows within retention is kept. Only `<table>_yYYYYmMM` children of the known tables are
-   considered, and the current month is never dropped. Returns the dropped names.
+   considered, and the current month is never dropped.
+
+   Returns {"dropped": [...], "skipped": [...]}, partition names in both. A partition is
+   skipped when its parent cannot be locked within LOCK_TIMEOUT (a long reader holds it);
+   it stays attached and is due again on the next run.
    """
    require_aware(now)
    current = _month_floor(now)
-   dropped = []
+   dropped, skipped = [], []
    for table, attr in PARTITIONED.items():
       cutoff = now - timedelta(days=getattr(retention, attr))
       prefix = table + "_y"
@@ -134,15 +151,20 @@ def apply_retention(
          start = datetime(int(match[1]), int(match[2]), 1, tzinfo=timezone.utc)
          if start >= current or _next_month(start) > cutoff:
             continue
-         with conn.transaction():
-            conn.execute(
-               sql.SQL("ALTER TABLE {} DETACH PARTITION {}").format(
-                  sql.Identifier(_SCHEMA, table), sql.Identifier(_SCHEMA, name)
+         try:
+            with conn.transaction():
+               _set_local_lock_timeout(conn)
+               conn.execute(
+                  sql.SQL("ALTER TABLE {} DETACH PARTITION {}").format(
+                     sql.Identifier(_SCHEMA, table), sql.Identifier(_SCHEMA, name)
+                  )
                )
-            )
-            conn.execute(sql.SQL("DROP TABLE {}").format(sql.Identifier(_SCHEMA, name)))
+               conn.execute(sql.SQL("DROP TABLE {}").format(sql.Identifier(_SCHEMA, name)))
+         except psycopg.errors.LockNotAvailable:
+            skipped.append(name)
+            continue
          dropped.append(name)
-   return dropped
+   return {"dropped": dropped, "skipped": skipped}
 
 
 def write_heartbeat(
@@ -169,8 +191,8 @@ def write_heartbeat(
 
 
 def run(conn: psycopg.Connection, now: datetime, retention: RetentionConfig) -> dict:
-   """Daily maintenance: create upcoming partitions, then drop expired ones."""
-   return {
-      "created": ensure_partitions(conn, now),
-      "dropped": apply_retention(conn, now, retention),
-   }
+   """Daily maintenance: create upcoming partitions, then drop expired ones.
+
+   Returns {"created": [...], "dropped": [...], "skipped": [...]}; see apply_retention.
+   """
+   return {"created": ensure_partitions(conn, now), **apply_retention(conn, now, retention)}

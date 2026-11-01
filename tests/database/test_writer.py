@@ -6,6 +6,7 @@ import pytest
 from psycopg.rows import dict_row
 
 from node_monitor.config import RetentionConfig
+from node_monitor.database import maintenance
 from node_monitor.database import writer as writer_mod
 from node_monitor.database.connect import DatabaseUnavailable, connect
 from node_monitor.database.maintenance import ensure_partition, partition_name
@@ -487,10 +488,11 @@ def test_broken_connection_is_replaced_on_next_write(migrated_db, pg_admin_url):
    w = _writer(migrated_db)
    w.write([_event(NOW)], NOW)
    with psycopg.connect(pg_admin_url, autocommit=True) as admin:
-      # The timeout makes it wait until the backend has gone.
+      # Only the writer's own session; the timeout makes it wait until the backend has gone.
       killed = admin.execute(
-         "SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE datname = %s",
-         (migrated_db.rsplit("/", 1)[1],),
+         "SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity"
+         " WHERE datname = %s AND backend_type = 'client backend' AND pid = %s",
+         (migrated_db.rsplit("/", 1)[1], w._conn.info.backend_pid),
       ).fetchall()
    assert killed == [(True,)]
    with pytest.raises(DatabaseUnavailable):
@@ -510,3 +512,70 @@ def test_ensure_partition_reports_creation(migrated_db):
          ("node_metrics_1m_y2026m12",),
       ).fetchone()[0]
    assert "2026-12-01 00:00:00+00" in bounds and "2027-01-01 00:00:00+00" in bounds
+
+
+def test_unstorable_strings_are_cleaned_not_fatal(migrated_db):
+   live = _first(scripted_records(), LIVE_PROCESSES)
+   procs = [
+      {**p, "exe": "/home/u/caf\udcff/bin/app", "cmdline": "app --name a\x00b"}
+      for p in live.row["processes"]
+   ]
+   live = live._replace(row={**live.row, "processes": procs})
+   event = _event(NOW)
+   event = event._replace(
+      row={**event.row, "detail": {"path\udcff": ["x\x00y", "caf\udcff"], "n": 1}}
+   )
+   _write(migrated_db, [live, event])
+   for p in _rows(migrated_db, "SELECT exe, cmdline FROM live_processes"):
+      assert p == {"exe": "/home/u/caf�/bin/app", "cmdline": "app --name ab"}
+   detail = _one(migrated_db, "SELECT detail FROM collection_events")["detail"]
+   assert detail == {"path�": ["xy", "caf�"], "n": 1}
+
+
+@pytest.mark.parametrize("table", ["node_metrics_1m", "user_usage_5m", "node_usage_5m"])
+def test_summary_upsert_never_replaces_a_fuller_interval(migrated_db, table):
+   kind = {
+      "node_metrics_1m": NODE_METRICS_1M,
+      "user_usage_5m": USER_USAGE_5M,
+      "node_usage_5m": NODE_USAGE_5M,
+   }[table]
+   base = _first(scripted_records(), kind).row
+   key = "minute" if table == "node_metrics_1m" else "interval_start"
+   value = "load1" if table == "node_metrics_1m" else "cpu_seconds"
+
+   def write(samples, x):
+      _write(migrated_db, [Record(kind, {**base, "sample_count": samples, value: x})])
+      return _one(migrated_db, f"SELECT sample_count, {value} AS v FROM {table}")
+
+   assert write(5, 1.0) == {"sample_count": 5, "v": 1.0}
+   # Equal or more samples replace the stored values (a replay, or a fuller recount).
+   assert write(5, 2.0) == {"sample_count": 5, "v": 2.0}
+   assert write(6, 3.0) == {"sample_count": 6, "v": 3.0}
+   # Fewer samples, e.g. the partial interval after a restart, are ignored.
+   assert write(2, 9.0) == {"sample_count": 6, "v": 3.0}
+   assert len(_rows(migrated_db, f"SELECT {key} FROM {table}")) == 1
+
+
+def test_writer_session_has_a_lock_timeout(migrated_db):
+   w = _writer(migrated_db)
+   try:
+      w.write([_event(NOW)], NOW)
+      assert w._connection().execute("SHOW lock_timeout").fetchone()[0] == "30s"
+   finally:
+      w.close()
+
+
+def test_partition_creation_blocked_by_a_reader_is_an_outage(migrated_db, monkeypatch):
+   monkeypatch.setattr(maintenance, "LOCK_TIMEOUT", "1s")
+   w = _writer(migrated_db)
+   try:
+      with connect(migrated_db) as reader:
+         reader.execute("LOCK TABLE node_monitor.node_metrics_1m IN ACCESS SHARE MODE")
+         with pytest.raises(DatabaseUnavailable) as info:
+            w.write([_metrics_row(datetime(2026, 11, 1, 12, 0, tzinfo=UTC))], NOW)
+         assert isinstance(info.value.__cause__, psycopg.errors.LockNotAvailable)
+      # Once the reader has gone the same batch goes through.
+      result = w.write([_metrics_row(datetime(2026, 11, 1, 12, 0, tzinfo=UTC))], NOW)
+      assert result.partitions_created == ["node_metrics_1m_y2026m11"]
+   finally:
+      w.close()

@@ -11,6 +11,7 @@ _SESSION_OPTIONS = "-c search_path=node_monitor,public -c TimeZone=UTC"
 
 _PROGRAM_LIMIT_CLASS = "54"
 _QUERY_CANCELED = "57014"
+_READ_ONLY_TRANSACTION = "25006"
 
 
 class DatabaseUnavailable(Exception):
@@ -19,11 +20,20 @@ class DatabaseUnavailable(Exception):
 
 
 def connect(
-   url: str, *, connect_timeout_sec: float = 10, autocommit: bool = False
+   url: str,
+   *,
+   connect_timeout_sec: float = 10,
+   autocommit: bool = False,
+   lock_timeout: str | None = None,
 ) -> psycopg.Connection:
+   """Open a session with search_path and TimeZone set, and `lock_timeout` (e.g. "30s") if
+   given; a lock wait beyond it fails with LockNotAvailable, which is_unavailable accepts."""
    params = conninfo_to_dict(url)
+   options = _SESSION_OPTIONS
+   if lock_timeout is not None:
+      options += f" -c lock_timeout={lock_timeout}"
    # Appended, not replaced, so options already in the URL still apply.
-   params["options"] = " ".join(filter(None, [params.get("options"), _SESSION_OPTIONS]))
+   params["options"] = " ".join(filter(None, [params.get("options"), options]))
    # libpq accepts only whole seconds.
    params["connect_timeout"] = max(1, math.ceil(connect_timeout_sec))
    return psycopg.connect(autocommit=autocommit, **params)
@@ -41,8 +51,13 @@ def is_unavailable(exc: BaseException) -> bool:
    server: a program limit (SQLSTATE class 54, e.g. an index row or jsonb value too large)
    and a statement timeout (QueryCanceled). A batch that hits one fails identically on
    every replay, so treating it as an outage would spool it and block every batch behind it.
+
+   A read-only transaction (25006, an InternalError) is True: it means the server is a
+   standby, e.g. during a failover, and writes will succeed once a primary is back.
    """
    if isinstance(exc, DatabaseUnavailable):
+      return True
+   if isinstance(exc, psycopg.Error) and exc.sqlstate == _READ_ONLY_TRANSACTION:
       return True
    if not isinstance(exc, psycopg.OperationalError):
       return False

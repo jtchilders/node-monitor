@@ -40,6 +40,38 @@ def test_bad_statements_and_data_are_not_unavailable(exc):
    assert not is_unavailable(exc)
 
 
+@pytest.mark.parametrize(
+   "sqlstate, unavailable",
+   [
+      ("40P01", True),  # deadlock detected
+      ("40001", True),  # serialization failure
+      ("55P03", True),  # lock not available, e.g. past lock_timeout
+      ("25006", True),  # read-only transaction: a standby during failover
+      ("54000", False),  # program limit exceeded
+      ("54001", False),  # statement too complex
+      ("57014", False),  # query canceled, e.g. statement_timeout
+   ],
+)
+def test_classification_by_sqlstate(sqlstate, unavailable):
+   exc = psycopg.errors.lookup(sqlstate)()
+   assert exc.sqlstate == sqlstate
+   assert is_unavailable(exc) is unavailable
+
+
+def test_read_only_transaction_is_unavailable(pg_admin_url):
+   with connect(pg_admin_url) as conn:
+      conn.execute("SET TRANSACTION READ ONLY")
+      with pytest.raises(psycopg.Error) as info:
+         conn.execute("CREATE TEMP TABLE nm_ro (a int)")
+   assert isinstance(info.value, psycopg.errors.ReadOnlySqlTransaction)
+   assert is_unavailable(info.value)
+
+
+def test_connect_can_set_a_lock_timeout(pg_admin_url):
+   with connect(pg_admin_url, lock_timeout="30s") as conn:
+      assert conn.execute("SHOW lock_timeout").fetchone()[0] == "30s"
+
+
 def test_unreachable_server_is_unavailable():
    with pytest.raises(psycopg.Error) as info:
       connect("postgresql://localhost:1/x", connect_timeout_sec=2)

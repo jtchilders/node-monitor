@@ -1,5 +1,9 @@
 import threading
+import time
 from datetime import datetime, timezone
+
+import psycopg
+import pytest
 
 from node_monitor.config import RetentionConfig
 from node_monitor.database import maintenance
@@ -55,7 +59,10 @@ def test_apply_retention_drops_only_expired_partitions(migrated_db):
       for month in (4, 5, 6, 11):
          ensure_partition(conn, "collection_events", datetime(2026, month, 1, tzinfo=UTC))
       # Cutoff is 2026-05-19: April is wholly older, May still holds rows within retention.
-      assert apply_retention(conn, NOW, retention) == ["collection_events_y2026m04"]
+      assert apply_retention(conn, NOW, retention) == {
+         "dropped": ["collection_events_y2026m04"],
+         "skipped": [],
+      }
       assert _partitions(conn, "collection_events") == [
          "collection_events_y2026m05",
          "collection_events_y2026m06",
@@ -72,7 +79,8 @@ def test_retention_never_drops_current_month_or_foreign_tables(migrated_db):
       conn.execute("CREATE TABLE node_metrics_1m_old (a int)")
       conn.execute("CREATE TABLE collection_events_y2020m01 (LIKE collection_events)")
       # Zero days of retention still keeps the current month; unattached tables are untouched.
-      assert apply_retention(conn, NOW, RetentionConfig(collection_events_days=0)) == []
+      result = apply_retention(conn, NOW, RetentionConfig(collection_events_days=0))
+      assert result == {"dropped": [], "skipped": []}
       assert _partitions(conn, "collection_events") == ["collection_events_y2026m11"]
       for t in (
          "collection_events_y2020m01_extra",
@@ -87,7 +95,44 @@ def test_run_reports_created_and_dropped(migrated_db):
       ensure_partition(conn, "collection_events", datetime(2026, 1, 1, tzinfo=UTC))
       result = run(conn, NOW, RetentionConfig())
       assert result["dropped"] == ["collection_events_y2026m01"]
+      assert result["skipped"] == []
       assert len(result["created"]) == 12
+
+
+def test_retention_skips_a_partition_whose_parent_is_locked(migrated_db, monkeypatch):
+   monkeypatch.setattr(maintenance, "LOCK_TIMEOUT", "1s")
+   retention = RetentionConfig(node_metrics_days=180, collection_events_days=180)
+   with connect(migrated_db, autocommit=True) as conn, connect(migrated_db) as reader:
+      for table in ("node_metrics_1m", "collection_events"):
+         ensure_partition(conn, table, datetime(2026, 1, 1, tzinfo=UTC))
+      before = conn.execute("SHOW lock_timeout").fetchone()[0]
+      # A long reader transaction on one parent.
+      reader.execute("LOCK TABLE node_monitor.node_metrics_1m IN ACCESS SHARE MODE")
+      started = time.monotonic()
+      result = apply_retention(conn, NOW, retention)
+      assert time.monotonic() - started < 10
+      assert result == {
+         "dropped": ["collection_events_y2026m01"],
+         "skipped": ["node_metrics_1m_y2026m01"],
+      }
+      assert _partitions(conn, "node_metrics_1m") == ["node_metrics_1m_y2026m01"]
+      # Session settings are untouched: the timeout was local to the retention transaction.
+      assert conn.execute("SHOW lock_timeout").fetchone()[0] == before
+      reader.rollback()
+      # Due again on the next run, once the reader is gone.
+      assert apply_retention(conn, NOW, retention)["dropped"] == ["node_metrics_1m_y2026m01"]
+
+
+def test_ensure_partition_gives_up_on_a_locked_parent(migrated_db, monkeypatch):
+   monkeypatch.setattr(maintenance, "LOCK_TIMEOUT", "1s")
+   with connect(migrated_db, autocommit=True) as conn, connect(migrated_db) as reader:
+      reader.execute("LOCK TABLE node_monitor.node_metrics_1m IN ACCESS SHARE MODE")
+      started = time.monotonic()
+      with pytest.raises(psycopg.errors.LockNotAvailable):
+         ensure_partition(conn, "node_metrics_1m", NOW)
+      assert time.monotonic() - started < 10
+      reader.rollback()
+      assert ensure_partition(conn, "node_metrics_1m", NOW) is True
 
 
 def test_concurrent_ensure_partition_creates_once(migrated_db):

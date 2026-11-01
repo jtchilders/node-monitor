@@ -105,6 +105,10 @@ _UNKNOWN_BOOT_ID = "unknown"
 
 _EVENT_COLUMNS = ("ts", "system", "node", "event_type", "detail")
 
+# Creating a partition locks the parent table; behind a long reader transaction every
+# INSERT would queue forever. Past this the write fails as unavailable and is spooled.
+LOCK_TIMEOUT = "30s"
+
 _MISSING_PARTITION_SQLSTATE = "23514"
 _MISSING_PARTITION_TEXT = "no partition of relation"
 
@@ -124,12 +128,17 @@ def _set_excluded(columns):
 
 
 def _summary_upsert(table):
+   # A summary from fewer samples than the stored one, such as the partial interval a
+   # restart produces, never overwrites it; an equal count (a replay) re-applies.
    columns, key = _SUMMARIES[table]
    all_columns = _IDENTITY + columns
-   return sql.SQL("{} ON CONFLICT ({}) DO UPDATE SET {}").format(
+   return sql.SQL(
+      "{} ON CONFLICT ({}) DO UPDATE SET {} WHERE EXCLUDED.sample_count >= {}.sample_count"
+   ).format(
       _insert(table, all_columns),
       sql.SQL(", ").join(map(sql.Identifier, key)),
       _set_excluded([c for c in all_columns if c not in key]),
+      sql.Identifier(table),
    )
 
 
@@ -271,7 +280,10 @@ class DatabaseWriter:
          # Autocommit, with explicit transaction blocks: nothing can leave an implicit
          # transaction open that would turn the next batch's BEGIN into a savepoint.
          self._conn = connect(
-            self.url, connect_timeout_sec=self._connect_timeout_sec, autocommit=True
+            self.url,
+            connect_timeout_sec=self._connect_timeout_sec,
+            autocommit=True,
+            lock_timeout=LOCK_TIMEOUT,
          )
       return self._conn
 
