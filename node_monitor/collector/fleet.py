@@ -60,9 +60,13 @@ async def run_sessions(
    duration_sec: float | None = None,
    stop: asyncio.Event | None = None,
    on_crash: Callable[[str, BaseException], None],
+   handle_signals: bool = True,
 ) -> None:
    """Run every session until `duration_sec` elapses, `stop` is set, SIGINT/SIGTERM
    arrives, or all sessions end; then stop them together and wait for them.
+
+   With `handle_signals` false no signal handler is installed: the caller owns SIGINT and
+   SIGTERM and sets `stop` itself, for work that must outlive the sessions.
 
    A session that raises is reported through `on_crash` and the others carry on. However
    this returns, cancellation included, every session has been stopped and awaited, so no
@@ -77,13 +81,7 @@ async def run_sessions(
 
    loop = asyncio.get_running_loop()
    stop_requested = stop if stop is not None else asyncio.Event()
-   installed = []
-   for sig in (signal.SIGINT, signal.SIGTERM):
-      try:
-         loop.add_signal_handler(sig, stop_requested.set)
-         installed.append(sig)
-      except (NotImplementedError, RuntimeError, ValueError):
-         pass
+   installed = install_signal_handlers(stop_requested.set) if handle_signals else []
    tasks = {label: asyncio.create_task(supervise(label, s)) for label, s in sessions.items()}
    try:
       waiter = asyncio.create_task(stop_requested.wait())
@@ -101,6 +99,23 @@ async def run_sessions(
       finally:
          for sig in installed:
             loop.remove_signal_handler(sig)
+
+
+def install_signal_handlers(callback: Callable[[], None]) -> list[int]:
+   """Run `callback` on the running loop for SIGINT and SIGTERM; returns the signals handled.
+
+   Installing over an existing handler replaces it with no gap in between. Where handlers
+   cannot be installed (not the main thread, no Unix signals), the defaults stay.
+   """
+   loop = asyncio.get_running_loop()
+   installed = []
+   for sig in (signal.SIGINT, signal.SIGTERM):
+      try:
+         loop.add_signal_handler(sig, callback)
+         installed.append(sig)
+      except (NotImplementedError, RuntimeError, ValueError):
+         pass
+   return installed
 
 
 async def _stop_all(sessions: dict[str, NodeSession], tasks: dict[str, asyncio.Task]) -> None:

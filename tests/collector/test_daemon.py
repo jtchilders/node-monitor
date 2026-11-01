@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from collections import Counter
 
@@ -248,7 +249,8 @@ async def test_daemon_survives_kill_reboot_and_outage(
    } <= event_types(migrated_db)
    ((status,),) = query(migrated_db, "SELECT status FROM collector_heartbeat")
    assert status["state"] == "stopped"
-   assert status["sessions"] == {"n1": "up", "n2": "up"}
+   # The last heartbeat tells the truth about the sessions too: none is running any more.
+   assert status["sessions"] == {"n1": "stopped", "n2": "stopped"}
 
 
 async def test_daemon_started_while_database_down_catches_up(tmp_path, monkeypatch, migrated_db):
@@ -305,6 +307,45 @@ async def test_sigterm_during_outage_spools_everything(tmp_path, monkeypatch):
       "database_unavailable",
       "collector_stopped",
    }
+
+
+@pytest.mark.skipif(
+   threading.current_thread() is not threading.main_thread(),
+   reason="signal handlers need the main thread",
+)
+async def test_signals_during_the_writer_drain_do_not_kill_the_process(
+   tmp_path, monkeypatch, caplog
+):
+   rig = Rig(tmp_path, monkeypatch, UNREACHABLE)
+   daemon = rig.daemon()
+   buffered = daemon._writer_thread._buffered
+   real_close = buffered.close
+   signalled = []
+
+   def slow_close():
+      # Shutdown has reached the writer's last step; the event loop is waiting on its join.
+      for sig in (signal.SIGTERM, signal.SIGINT):
+         os.kill(os.getpid(), sig)
+         signalled.append(sig)
+         time.sleep(0.3)
+      real_close()
+
+   monkeypatch.setattr(buffered, "close", slow_close)
+   caplog.set_level(logging.WARNING, logger="node_monitor.collector.daemon")
+   async with running(daemon) as task:
+      await asyncio.sleep(1)
+      rc, _ = await finish(daemon, task)
+   assert rc == 0
+   assert signalled == [signal.SIGTERM, signal.SIGINT]
+   assert "shutdown in progress; waiting for the writer" in caplog.text
+   # Everything queued still reached the spool, the shutdown event included.
+   spooled = [
+      r.row["event_type"]
+      for _, batch in Spool(rig.spool_dir(), max_bytes=10**9).pending()
+      for r in batch
+      if r.kind == COLLECTION_EVENT
+   ]
+   assert "collector_stopped" in spooled
 
 
 async def test_pipeline_errors_and_crashes_become_events(tmp_path, monkeypatch, caplog):

@@ -17,7 +17,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 
 from node_monitor import version
-from node_monitor.collector.fleet import build_sessions, run_sessions
+from node_monitor.collector.fleet import build_sessions, install_signal_handlers, run_sessions
 from node_monitor.collector.record_queue import RecordQueue
 from node_monitor.collector.session import NodeSession
 from node_monitor.collector.upkeep import Upkeep
@@ -112,6 +112,8 @@ class Daemon:
       # Created in run(): an asyncio.Event made outside the loop may bind to the wrong one.
       self._stop: asyncio.Event | None = None
       self._stop_requested = False
+      # Set once the sessions have stopped, for the heartbeats written during shutdown.
+      self._stopping = False
 
    def request_stop(self) -> None:
       """Ask `run` to shut down. Call from the event loop's thread."""
@@ -129,17 +131,34 @@ class Daemon:
          self._stop.set()
       if not await asyncio.to_thread(self._schema_ok):
          return 2
-      self._writer_thread.start()
+      loop = asyncio.get_running_loop()
+      # The daemon, not run_sessions, owns the signals: after the sessions stop, a second
+      # SIGTERM or Ctrl-C must not kill the process while the writer drains the queue.
+      handled = install_signal_handlers(self._stop.set)
       try:
-         detail = {"version": version.describe(), "host": socket.getfqdn(), "pid": os.getpid()}
-         self._queue.put([self._collector_event("collector_started", detail)])
-         # Returns only once every session has stopped, so no callback can still put.
-         await run_sessions(
-            self.sessions, duration_sec=duration_sec, stop=self._stop, on_crash=self._on_crash
-         )
+         self._writer_thread.start()
+         try:
+            detail = {"version": version.describe(), "host": socket.getfqdn(), "pid": os.getpid()}
+            self._queue.put([self._collector_event("collector_started", detail)])
+            # Returns only once every session has stopped, so no callback can still put.
+            await run_sessions(
+               self.sessions,
+               duration_sec=duration_sec,
+               stop=self._stop,
+               on_crash=self._on_crash,
+               handle_signals=False,
+            )
+         finally:
+            if handled:
+               install_signal_handlers(self._late_signal)
+            self._stopping = True
+            for label in self._session_states:
+               self._session_states[label] = "stopped"
+            self._finish_queue()
+            await self._join_writer()
       finally:
-         self._finish_queue()
-         await self._join_writer()
+         for sig in handled:
+            loop.remove_signal_handler(sig)
       return 0
 
    # --- startup and shutdown -----------------------------------------------------------
@@ -173,6 +192,10 @@ class Daemon:
          self._queue.put(records)
       finally:
          self._queue.close()
+
+   @staticmethod
+   def _late_signal() -> None:
+      log.warning("shutdown in progress; waiting for the writer")
 
    async def _join_writer(self) -> None:
       await asyncio.to_thread(self._writer_thread.join, WRITER_JOIN_TIMEOUT_SEC)
@@ -245,7 +268,7 @@ class Daemon:
 
    def _status(self) -> dict:
       return {
-         "state": "running",
+         "state": "stopping" if self._stopping else "running",
          "sessions": dict(self._session_states),
          **self._writer_thread.status(),
       }
