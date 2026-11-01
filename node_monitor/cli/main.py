@@ -16,6 +16,7 @@ from pathlib import Path
 import click
 import psycopg
 
+from node_monitor.cli import live
 from node_monitor.collector.daemon import Daemon
 from node_monitor.collector.instance import (
    AlreadyRunning,
@@ -68,6 +69,10 @@ COLUMNS = (
 @click.group()
 def cli() -> None:
    """Login-node monitor."""
+
+
+cli.add_command(live.status)
+cli.add_command(live.nodes)
 
 
 @cli.group()
