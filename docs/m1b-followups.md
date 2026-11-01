@@ -56,7 +56,8 @@ Each ruling gives the decision, then what it costs if it turns out wrong.
   must keep flowing during a drain.
 - **Autovacuum.** Watch it on `live_processes`: DELETE+INSERT leaves about 1,800 dead tuples per
   node per minute.
-- **Probe idle time.** It is measured from first sight, so a probe restart resets dormancy to zero.
+- **Probe idle time.** It is measured from the last active sample (or first sight), and that
+  state lives in the probe, so a probe restart resets dormancy to zero.
   Long-dormancy queries depend on probe uptime.
 
 ## Deferred minor items
@@ -82,3 +83,4 @@ Each ruling gives the decision, then what it costs if it turns out wrong.
 | Test polish: status exit code, bare `StopIteration`, cross-year cutoff, `SystemExit` idiom, close-on-exit-1, replay round trip skips live/event rows | Test polish. |
 | `SET LOCAL lock_timeout` in `ensure_partition` lasts until the end of an enclosing transaction | The writer is autocommit. |
 | Bootstrap needs a superuser (the REVOKE and `ALTER DATABASE … SET` statements) | The CLI help now says so. |
+| Bootstrap leaves `datcollate`/`datctype` at the server default (`en_US.UTF-8`); only the builtin provider locale is `C.UTF-8` | Default collation and index order use the builtin locale. For Aurora's fresh bootstrap, consider also passing `LC_COLLATE`/`LC_CTYPE 'C.UTF-8'`. |

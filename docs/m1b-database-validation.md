@@ -1,7 +1,7 @@
 # M1b database validation on polaris-login-04
 
 Date: 2026-11-01. Server: PostgreSQL 18.4 on polaris-login-04, shared with pbs_monitor. The data
-directory is on `/lus/eagle` (139 TB free at the time). Branch `feat/m1b-database`.
+directory is on a Lustre project filesystem (139 TB free at the time). Branch `feat/m1b-database`.
 
 ## Setup
 
@@ -28,7 +28,8 @@ Database properties after bootstrap:
 
 | Property | Value |
 |---|---|
-| Locale provider / locale | `builtin` / `C.UTF-8` |
+| Locale provider / locale | `builtin` / `C.UTF-8` (this governs default collation and index order) |
+| `datcollate` / `datctype` | `en_US.UTF-8` (inherited from the server default; unused by the builtin provider's default collation) |
 | Encoding | UTF8 |
 | ACL | owner `CTc`, reader `c`; no PUBLIC entry |
 | Database settings | `search_path=node_monitor, public`, `TimeZone=UTC` |
@@ -43,7 +44,7 @@ Database properties after bootstrap:
 | 15-min `--full-census` capture | full census | 38 s | 16 | 15 census, 4 `node_usage_5m`, 848–972 `user_usage_5m` |
 
 - None of the replays had rows beyond retention or anything spooled.
-- The latest `node_metrics_1m` rows from the M1a capture have `probe_rss_kb` populated (20–26 MB).
+- The latest `node_metrics_1m` rows from the M1a capture have `probe_rss_kb` populated (16.4–26.5 MB across the capture).
 - The census capture was deleted after replay because it holds other users' command lines. After
   validation, `live_processes` was emptied (4,918 rows) for the same reason; the M1c collector
   repopulates it.
@@ -67,21 +68,26 @@ rebooted between the soaks. The same `boot_id` appears in both captures.
 
 | Query | Time | Result |
 |---|---|---|
-| Latest `node_metrics_1m` per node | 220 ms | 3 rows, 2026-10-31 08:09 UTC: load1 178 / 123 / 251, mem_used 336 / 323 / 412 GB |
+| Latest `node_metrics_1m` per node | 122 ms | 3 rows, 2026-11-01 08:37 UTC (census capture's last minute, 4 of 6 samples): load1 168 / 138 / 269, mem_used 333 / 321 / 421 GB (decimal) |
 | Users per 5-min interval | 428 ms | 675 rows per interval (≈225 users per node); 356 distinct users system-wide |
-| Top users by `rss_kb_avg`, last full interval | 130 ms | top 5 (anonymised): 23.6, 23.5, 23.3, 23.3, 15.9 GB across 3 nodes |
+| Top users by `rss_kb_avg`, last full interval | 130 ms | top 5 (anonymised): 23.6, 23.5, 23.3, 23.3, 15.9 GB (decimal, summed across 3 nodes) |
 | Top users by dormant memory (`idle\|1h-1d\|absent`, `idle\|>1d\|absent`) | 417 ms | 0 rows; see note below |
 | Live AI-agent processes by owner presence | 12 ms | absent 271 (84 users), connected 39 (15), interactive 29 (9) |
-| Partition list | 189 ms | 14 monthly partitions (`*_y2026m10` … `*_y2027m01`) |
+| Dormant-query positive control (`idle\|5m-1h\|absent`) | 23 ms | top 5: 24.6, 10.8, 5.6, 4.8, 3.9 GB (decimal; summed over the 4 intervals, like the query above) |
+| Partition list | 189 ms | 14 monthly partitions: `node_metrics_1m` and `collection_events` y2026m10–y2027m01; `user_usage_5m` and `node_usage_5m` y2026m11–y2027m01 |
 | Reader `INSERT` into `collector_heartbeat` | — | denied, SQLSTATE 42501 |
 
-These timings are on a 37 MB database with a cold Python process, so they are not representative
-at scale.
+These timings are on a database of about 37 MB with a cold Python process, so they are not
+representative at scale. Both dormant-memory queries sum over every interval in the table; M2's
+version should restrict them to one interval.
 
-**Dormancy note:** the probe measures `idle_for_sec` from when it first saw a process
-(`probe.py:627`). A 15-minute capture therefore can't produce idle buckets over 1 hour; the
-observed buckets were `<5m` and `5m-1h`, plus `unknown` on first sight. The query is correct but
-needs M1c's long-running collector before it returns rows.
+The reader role also carries the role setting `default_transaction_read_only=on`.
+
+**Dormancy note:** the probe measures `idle_for_sec` from a process's last active sample, or from
+when it first saw the process if it has never been active (`probe.py:627`). A 15-minute capture
+therefore can't produce idle buckets over 1 hour; the observed buckets were `<5m` and `5m-1h`, plus
+`unknown` on first sight. The query is correct (see the positive control) but needs M1c's
+long-running collector before it returns rows.
 
 AI-agent breakdown: 271 of 339 live agent processes (80%) belong to users with no session on the
 node (`absent`).
@@ -129,4 +135,5 @@ before M1c starts accumulating data.
 
 ## Database size
 
-37 MB after all replays (`pg_database_size('node_monitor')`).
+37 MB after all replays, and 32 MB after `live_processes` was emptied
+(`pg_database_size('node_monitor')`).
