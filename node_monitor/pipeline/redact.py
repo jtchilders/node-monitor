@@ -13,11 +13,14 @@ MASK = "***"
 # Long keywords are unambiguous enough to end a glued or camelCase name (`PGPASSWORD`,
 # `keyStorePassword`, `clientSecret`). They must END the name: `--tokenizer`,
 # `TOKENIZERS_PARALLELISM` and `--max-tokens` are not secrets.
-_LONG_KEYWORD = r"(?:passphrase|password|passwd|secret|token|(?:api|access|secret)[-_]?key)"
+_LONG_KEYWORD = (
+   r"(?:passphrase|password|passwd|secret|token|(?:api|access|secret|private|ssh)[-_]?key)"
+)
 # Short keywords are common inside ordinary words (`--author`, `-keyfile`, `classpath`), so
 # they count only as the whole name or its last `-`/`_`/`.` segment (`--oauth-token` but not
-# `--auth-type`).
-_SHORT_KEYWORD = r"(?:pass|pat|pwd|auth|key|credentials?)"
+# `--auth-type`). Bare `key` is absent: `--sort-key name` and `openssl -key file.pem` name
+# a field or a file, and the compound secret forms are long keywords.
+_SHORT_KEYWORD = r"(?:pass|pat|pwd|auth|credentials?)"
 _NAME_CHAR = r"[A-Za-z0-9_.-]"
 # Names starting with `no-`/`no_` negate a feature (`--no-auth`) and are never secrets. A name
 # starts with a letter or digit, so `--no-auth` cannot be re-read as `-` + `-no-auth`.
@@ -38,15 +41,32 @@ _NAME_START = r"(?<![\w.-])"
 # A quoted value is taken whole so that spaces inside it cannot leak the rest of it.
 _VALUE = r"""((?:"[^"]*"|'[^']*'|\S+))"""
 
-# `--opt=value`, `-opt=value` and Java's `-D<prop>=value` (`-D` is tried as a prefix first so
-# that `-Dauth=x` is read as the property `auth`).
-_OPTION_EQ = re.compile(
-   _NAME_START + r"(?:(?-i:-D)|--?)" + _SECRET_NAME + "=" + _VALUE, re.IGNORECASE
-)
+# `-D<x>` is a define or Java property, handled by `_DEFINE_EQ`; the generic option rules
+# must not read it as a single-dash option named `D<x>`.
+_DASHES = r"(?:--|-(?-i:(?!D)))"
+# `--opt=value` and `-opt=value`.
+_OPTION_EQ = re.compile(_NAME_START + _DASHES + _SECRET_NAME + "=" + _VALUE, re.IGNORECASE)
 # `--opt value` and `-opt value`. The value must not itself be a flag.
 _OPTION_SPACE = re.compile(
-   _NAME_START + r"--?" + _SECRET_NAME + r"[ \t]+(?!-)" + _VALUE, re.IGNORECASE
+   _NAME_START + _DASHES + _SECRET_NAME + r"[ \t]+(?!-)" + _VALUE, re.IGNORECASE
 )
+# Java's `-D<prop>=value`. Only a long keyword ending the name counts (`-Ddb.password`,
+# `-Djavax.net.ssl.keyStorePassword`): `-Dauth=basic` is a mode, and an ALL_CAPS name such
+# as `-DUSE_TOKEN=1` or `-DPASSWORD_LEN=8` is a C/CMake build define, never a secret.
+_DEFINE_EQ = re.compile(
+   _NAME_START
+   + r"(?-i:-D)(?!no[-_])(?=[A-Za-z0-9])(?-i:(?![A-Z0-9_]+=))"
+   + _NAME_CHAR
+   + "*"
+   + _LONG_KEYWORD
+   + "="
+   + _VALUE,
+   re.IGNORECASE,
+)
+# keytool passwords are single-dash options whose names end in `pass`.
+_KEYTOOL_PASSWORD = re.compile(r"(?<!\S)-(?:src|dest)?(?:store|key)pass[ \t]+(?!-)" + _VALUE)
+# openssl's `-passin pass:X` / `-passout pass:X`; `env:` and `file:` sources hold no secret.
+_OPENSSL_PASSWORD = re.compile(r"(?<!\S)-pass(?:in|out)[ \t]+pass:" + _VALUE)
 # `KEY=value` assignments. The name-start lookbehind keeps `--opt=` out of this rule.
 _ASSIGNMENT = re.compile(_NAME_START + _SECRET_NAME + "=" + _VALUE, re.IGNORECASE)
 # The password in `scheme://user:password@host`. It runs to the last `@` before the host,
@@ -64,6 +84,10 @@ _BEARER = re.compile(r"\bBearer[ \t]+([^\s'\"]{16,})", re.IGNORECASE)
 # such as `mkdir -p` or `ssh -p 22`.
 _MYSQL_TOOLS = frozenset({"mysql", "mariadb", "mysqldump", "mysqladmin"})
 _MYSQL_PASSWORD = re.compile(r"(?<!\S)-p(\S+)")
+# sshpass takes the password as `-pSecret` or `-p Secret`. Only its own leading options are
+# searched, since a later `-p` belongs to the wrapped command (`sshpass -e ssh -p 22 host`).
+_SSHPASS_OPTIONS = re.compile(r"\s*\S+(?:[ \t]+-[fdPp][ \t]+\S+|[ \t]+-\S*)*")
+_SSHPASS_PASSWORD = re.compile(r"(?<!\S)-p[ \t]*" + _VALUE)
 
 # Applied last, so they never fire inside text another rule has already masked.
 _KNOWN_KEYS = (
@@ -74,7 +98,7 @@ _KNOWN_KEYS = (
 )
 
 
-def _sub(pattern: re.Pattern, text: str) -> str:
+def _sub(pattern: re.Pattern, text: str, count: int = 0) -> str:
    """Mask the first capture group of each match, or the whole match if there is none."""
 
    def repl(m: re.Match) -> str:
@@ -85,7 +109,7 @@ def _sub(pattern: re.Pattern, text: str) -> str:
       end = m.end(1) - m.start(0)
       return whole[:start] + MASK + whole[end:]
 
-   return pattern.sub(repl, text)
+   return pattern.sub(repl, text, count=count)
 
 
 def _argv0_basename(cmdline: str) -> str:
@@ -103,6 +127,12 @@ class Redactor:
       # value is `db`.
       if _argv0_basename(cmdline) in _MYSQL_TOOLS:
          text = _sub(_MYSQL_PASSWORD, text)
+      if _argv0_basename(cmdline) == "sshpass":
+         end = _SSHPASS_OPTIONS.match(text).end()
+         text = _sub(_SSHPASS_PASSWORD, text[:end], count=1) + text[end:]
+      text = _sub(_KEYTOOL_PASSWORD, text)
+      text = _sub(_OPENSSL_PASSWORD, text)
+      text = _sub(_DEFINE_EQ, text)
       text = _sub(_OPTION_EQ, text)
       text = _sub(_OPTION_SPACE, text)
       text = _sub(_ASSIGNMENT, text)
