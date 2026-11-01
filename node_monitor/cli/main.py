@@ -17,7 +17,13 @@ import click
 import psycopg
 
 from node_monitor.collector.daemon import Daemon
-from node_monitor.collector.instance import AlreadyRunning, InstanceLock, is_alive, read_info
+from node_monitor.collector.instance import (
+   AlreadyRunning,
+   InstanceLock,
+   clear_stale,
+   lock_held,
+   running_info,
+)
 from node_monitor.collector.soak import make_private_dir, run_soak, summarize
 from node_monitor.config import ConfigError, load_config
 from node_monitor.database.bootstrap import SCHEMA, bootstrap
@@ -497,9 +503,10 @@ def daemon_start(foreground, config_path) -> None:
       finally:
          lock.release()
       sys.exit(code)
-   info = read_info(config.working_dir)
-   if info and is_alive(info):
+   info = running_info(config.working_dir)
+   if info:
       raise _already_running(info)
+   clear_stale(config.working_dir)
    log_dir = make_private_dir(config.working_dir / "logs")
    log_path = log_dir / "daemon.log"
    argv = [sys.executable, "-m", "node_monitor.cli.main", "daemon", "start", "--foreground"]
@@ -529,17 +536,16 @@ def daemon_start(foreground, config_path) -> None:
 def daemon_stop(timeout, force, config_path) -> None:
    """Send SIGTERM to the running daemon and wait for it to exit."""
    config = _load(config_path)
-   info = read_info(config.working_dir)
+   info = running_info(config.working_dir)
    if not info:
-      click.echo("daemon not running")
+      stale = clear_stale(config.working_dir)
+      suffix = f" (removed stale daemon.json from pid {stale.get('pid')})" if stale else ""
+      click.echo(f"daemon not running{suffix}")
       return
    if info.get("host") != os.uname().nodename:
       raise click.ClickException(
          f"daemon is running on {info.get('host')} (pid {info.get('pid')}); stop it there"
       )
-   if not is_alive(info):
-      click.echo("daemon not running")
-      return
    if info.get("systemd") and not force:
       click.echo("managed by systemd: systemctl --user stop node-monitor-daemon")
       raise SystemExit(1)
@@ -552,7 +558,8 @@ def daemon_stop(timeout, force, config_path) -> None:
    except PermissionError as exc:
       raise click.ClickException(f"cannot signal pid {pid}: {exc}") from exc
    deadline = time.monotonic() + timeout
-   while is_alive(info):
+   # The lock is released when the process exits, even if it is not yet reaped.
+   while lock_held(config.working_dir):
       if time.monotonic() >= deadline:
          raise click.ClickException(f"daemon (pid {pid}) still running after {timeout:g}s")
       time.sleep(0.2)
@@ -579,8 +586,8 @@ def daemon_status(config_path) -> None:
    """Show the local daemon process and the heartbeat; exit 1 if neither is healthy."""
    config = _load(config_path)
    healthy = False
-   info = read_info(config.working_dir)
-   if info and is_alive(info):
+   info = running_info(config.working_dir)
+   if info and info.get("host") == os.uname().nodename:
       healthy = True
       started = datetime.fromisoformat(info["started_at"])
       up = (datetime.now(timezone.utc) - started).total_seconds()
@@ -589,7 +596,9 @@ def daemon_status(config_path) -> None:
          f"systemd: {'yes' if info.get('systemd') else 'no'})"
       )
    else:
-      click.echo("local process: not running")
+      stale = None if info else clear_stale(config.working_dir)
+      note = f" (stale daemon.json from pid {stale.get('pid')} removed)" if stale else ""
+      click.echo(f"local process: not running{note}")
    url = config.web.database_url
    if not url:
       click.echo("heartbeat: unavailable (web.database_url is not configured)")

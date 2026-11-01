@@ -192,3 +192,50 @@ def test_daemon_start_reports_early_exit_with_log_tail(tmp_path, workdir):
    assert "database.url" in result.output
    assert (workdir / "logs").stat().st_mode & 0o777 == 0o700
    assert not (workdir / "state" / "daemon.json").exists()
+
+
+@pytest.fixture
+def stale_info(workdir):
+   """A crashed daemon's leftover daemon.json whose pid now belongs to an unrelated process."""
+   import json
+   import socket
+
+   proc = subprocess.Popen(["sleep", "30"])
+   state = workdir / "state"
+   state.mkdir(parents=True)
+   (state / "daemon.json").write_text(
+      json.dumps(
+         {
+            "pid": proc.pid,
+            "host": socket.gethostname(),
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "systemd": False,
+         }
+      )
+   )
+   yield proc
+   proc.kill()
+   proc.wait(timeout=10)
+
+
+def test_stale_info_with_recycled_pid_is_not_signalled_by_stop(tmp_path, workdir, stale_info):
+   result = run("daemon", "stop", "--config", _config(tmp_path, workdir))
+   assert result.exit_code == 0
+   assert "not running" in result.output
+   assert stale_info.poll() is None
+   assert not (workdir / "state" / "daemon.json").exists()
+
+
+def test_stale_info_does_not_make_status_healthy(tmp_path, workdir, stale_info):
+   result = run("daemon", "status", "--config", _config(tmp_path, workdir))
+   assert result.exit_code == 1
+   assert "not running" in result.output
+   assert stale_info.poll() is None
+
+
+def test_stale_info_does_not_block_start(tmp_path, workdir, stale_info):
+   # The spawned daemon dies at once (no database.url); what matters is that start tried.
+   result = run("daemon", "start", "--config", _config(tmp_path, workdir))
+   assert "already running" not in result.output
+   assert "database.url" in result.output
+   assert stale_info.poll() is None

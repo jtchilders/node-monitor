@@ -27,7 +27,11 @@ def read_info(working_dir: Path) -> dict | None:
 
 
 def is_alive(info: dict) -> bool:
-   """True only for this host and a live, non-zombie pid."""
+   """True only for this host and a live, non-zombie pid.
+
+   A pid alone proves nothing about the daemon: after a crash the pid may be recycled.
+   Use running_info to decide whether the daemon runs; this only answers whether a pid lives.
+   """
    if info.get("host") != socket.gethostname():
       return False
    pid = info.get("pid")
@@ -45,6 +49,57 @@ def is_alive(info: dict) -> bool:
          return f.read().rsplit(")", 1)[1].split()[0] != "Z"
    except (OSError, IndexError):
       return True
+
+
+def _probe(working_dir: Path, on_free=None) -> bool:
+   """True if another process holds the lock. Runs `on_free` while we briefly hold it."""
+   try:
+      fd = os.open(_paths(working_dir)[1], os.O_RDWR)
+   except FileNotFoundError:
+      # Never locked, so nobody holds it.
+      if on_free:
+         on_free()
+      return False
+   except OSError:
+      return False
+   try:
+      try:
+         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      except BlockingIOError:
+         return True
+      if on_free:
+         on_free()
+      return False
+   finally:
+      os.close(fd)  # closing drops our flock
+
+
+def lock_held(working_dir: Path) -> bool:
+   return _probe(working_dir)
+
+
+def running_info(working_dir: Path) -> dict | None:
+   """daemon.json of the running daemon, or None. The kernel lock is the source of truth:
+   a leftover daemon.json after a crash names a pid that may now belong to anyone."""
+   if not lock_held(working_dir):
+      return None
+   return read_info(working_dir)
+
+
+def clear_stale(working_dir: Path) -> dict | None:
+   """Remove a daemon.json left by a dead daemon; returns what it said, or None.
+
+   Done while holding the lock so a daemon starting right now is not clobbered."""
+   found: list[dict] = []
+
+   def remove():
+      info = read_info(working_dir)
+      if info is not None:
+         found.append(info)
+      _paths(working_dir)[2].unlink(missing_ok=True)
+
+   _probe(working_dir, remove)
+   return found[0] if found else None
 
 
 class InstanceLock:
