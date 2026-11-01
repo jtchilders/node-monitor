@@ -132,6 +132,7 @@ def _json_default(value):
 
 
 _BATCH_RECORDS = 500
+_MAX_EVENT_ROUNDS = 3
 
 
 class _DatabaseSink:
@@ -139,12 +140,13 @@ class _DatabaseSink:
 
    def __init__(self, config, now):
       self.now = now
+      self.writer = DatabaseWriter(
+         config.database.url,
+         retention=config.retention,
+         connect_timeout_sec=config.database.connect_timeout_sec,
+      )
       self.buffered = BufferedWriter(
-         DatabaseWriter(
-            config.database.url,
-            retention=config.retention,
-            connect_timeout_sec=config.database.connect_timeout_sec,
-         ),
+         self.writer,
          Spool(config.working_dir / "state" / "spool-replay", max_bytes=config.spool.max_bytes),
          system=config.system,
       )
@@ -159,16 +161,26 @@ class _DatabaseSink:
 
    def submit(self) -> None:
       # The events of one submit ride along with the next, as BufferedWriter expects.
+      # They are tallied here, once handed back, so only submitted events are counted.
+      self._tally(self.events)
       batch, self.pending = self.events + self.pending, []
       self.events = self.buffered.submit(batch, self.now)
-      self._tally()
 
    def finish(self) -> None:
       self.submit()
-      self.submit()  # writes the events the last batch produced
+      # Each submit may itself report events (a retention drop, an outage), which need
+      # one more submit to be written; a few rounds is plenty, so a database that keeps
+      # failing cannot loop forever.
+      for _ in range(_MAX_EVENT_ROUNDS):
+         if not self.events:
+            break
+         self.submit()
 
-   def _tally(self) -> None:
-      for event in self.events:
+   def close(self) -> None:
+      self.writer.close()
+
+   def _tally(self, events) -> None:
+      for event in events:
          if event.row.get("event_type") == "rows_beyond_retention":
             self.beyond.update(event.row.get("detail") or {})
 
@@ -185,10 +197,9 @@ def _check_database(config, now) -> None:
 
    try:
       _run_database(run)
-   except click.ClickException:
-      raise
    except SchemaOutOfDate as exc:
-      raise click.ClickException(f"{exc}; run `node-monitor database migrate`") from exc
+      # The exception text already says to run `database migrate`.
+      raise click.ClickException(str(exc)) from exc
 
 
 @soak.command("replay")
@@ -208,7 +219,10 @@ def soak_replay(directory, config_path, write_records, write_db) -> None:
          raise click.ClickException("database.url is not configured")
       # Real time, not the capture's: retention is measured back from today.
       db = _DatabaseSink(config, datetime.now(timezone.utc))
-      _check_database(config, db.now)
+      try:
+         _check_database(config, db.now)
+      finally:
+         db.close()
    sink = None
    if write_records is not None:
       # Rows hold redacted but still sensitive command lines.
@@ -222,7 +236,7 @@ def soak_replay(directory, config_path, write_records, write_db) -> None:
             line = json.dumps({"kind": record.kind, "row": record.row}, default=_json_default)
             sink.write(line + "\n")
          if db:
-            db.add(record)
+            _run_database(db.add, record)
 
       def skip(label):
          click.echo(f"{label}: not in config, skipped")
@@ -236,6 +250,8 @@ def soak_replay(directory, config_path, write_records, write_db) -> None:
    finally:
       if sink:
          sink.close()
+      if db:
+         db.close()
    for label, counts in result.items():
       detail = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
       click.echo(f"{label}: {detail}")
@@ -246,8 +262,9 @@ def soak_replay(directory, config_path, write_records, write_db) -> None:
       click.echo(f"status: {status}")
       if status["spooled_batches"]:
          click.echo(
-            f"database became unavailable: {status['spooled_batches']} batches remain in "
-            f"{config.working_dir / 'state' / 'spool-replay'}; they were NOT all written",
+            f"spool still holds {status['spooled_batches']} batches in "
+            f"{config.working_dir / 'state' / 'spool-replay'}: the database became unavailable "
+            "and not everything was written",
             err=True,
          )
          raise SystemExit(1)

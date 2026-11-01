@@ -65,3 +65,54 @@ def test_replay_write_db_without_url_is_a_clean_error(tmp_path):
    assert result.exit_code == 1
    assert "database.url" in result.output
    assert "Traceback" not in result.output
+
+
+def _age_capture(soak, label, new_date):
+   """Re-date one node's receipt times, so its records predate retention."""
+   path = soak / f"{label}-20261101.jsonl"
+   text = path.read_text().replace('"recv": "2026-11-01T', f'"recv": "{new_date}T')
+   path.write_text(text)
+
+
+def test_replay_write_db_reports_rows_beyond_retention(migrated_db, tmp_path):
+   soak = build_soak(tmp_path)
+   _age_capture(soak, "n1", "2024-01-01")
+   cfg = _config(tmp_path, migrated_db)
+   result = CliRunner().invoke(cli, ["soak", "replay", str(soak), "--config", cfg, "--write-db"])
+   assert result.exit_code == 0, result.output
+   line = next(x for x in result.output.splitlines() if x.startswith("rows_beyond_retention:"))
+   assert "node_metrics_1m=6" in line
+   # Only n2's minutes were kept.
+   assert _counts(migrated_db)["node_metrics_1m"] == 6
+
+
+def test_replay_write_db_exits_1_when_spool_still_holds_batches(migrated_db, tmp_path, monkeypatch):
+   from node_monitor.cli import main
+
+   soak = build_soak(tmp_path)
+   cfg = _config(tmp_path, migrated_db)
+   real_init = main._DatabaseSink.__init__
+
+   def broken(self, config, now):
+      real_init(self, config, now)
+      # The schema check already passed; the writer then finds the server gone.
+      self.writer.url = "postgresql://nobody@127.0.0.1:1/x"
+
+   monkeypatch.setattr(main._DatabaseSink, "__init__", broken)
+   result = CliRunner().invoke(cli, ["soak", "replay", str(soak), "--config", cfg, "--write-db"])
+   assert result.exit_code == 1
+   assert "spool still holds" in result.output
+   assert _counts(migrated_db)["node_metrics_1m"] == 0
+
+
+def test_replay_write_db_closes_the_writer(migrated_db, tmp_path, monkeypatch):
+   from node_monitor.database.writer import DatabaseWriter
+
+   closed = []
+   real = DatabaseWriter.close
+   monkeypatch.setattr(DatabaseWriter, "close", lambda self: (closed.append(1), real(self)))
+   soak = build_soak(tmp_path)
+   cfg = _config(tmp_path, migrated_db)
+   result = CliRunner().invoke(cli, ["soak", "replay", str(soak), "--config", cfg, "--write-db"])
+   assert result.exit_code == 0, result.output
+   assert closed
