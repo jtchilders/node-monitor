@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,8 +14,19 @@ import psycopg
 from node_monitor.collector.soak import make_private_dir, run_soak, summarize
 from node_monitor.config import ConfigError, load_config
 from node_monitor.database.bootstrap import bootstrap
+from node_monitor.database.buffered import BufferedWriter
 from node_monitor.database.connect import connect, is_unavailable
-from node_monitor.database.migrate import MIGRATIONS, REQUIRED_VERSION, current_version, migrate
+from node_monitor.database.maintenance import ensure_partitions
+from node_monitor.database.migrate import (
+   MIGRATIONS,
+   REQUIRED_VERSION,
+   SchemaOutOfDate,
+   check_schema,
+   current_version,
+   migrate,
+)
+from node_monitor.database.spool import Spool
+from node_monitor.database.writer import DatabaseWriter
 from node_monitor.pipeline.replay import replay
 
 COLUMNS = (
@@ -119,16 +131,84 @@ def _json_default(value):
    raise TypeError(f"not JSON serializable: {type(value).__name__}")
 
 
+_BATCH_RECORDS = 500
+
+
+class _DatabaseSink:
+   """Feeds replayed records to a BufferedWriter in batches."""
+
+   def __init__(self, config, now):
+      self.now = now
+      self.buffered = BufferedWriter(
+         DatabaseWriter(
+            config.database.url,
+            retention=config.retention,
+            connect_timeout_sec=config.database.connect_timeout_sec,
+         ),
+         Spool(config.working_dir / "state" / "spool-replay", max_bytes=config.spool.max_bytes),
+         system=config.system,
+      )
+      self.pending: list = []
+      self.events: list = []
+      self.beyond: Counter = Counter()
+
+   def add(self, record) -> None:
+      self.pending.append(record)
+      if len(self.pending) >= _BATCH_RECORDS:
+         self.submit()
+
+   def submit(self) -> None:
+      # The events of one submit ride along with the next, as BufferedWriter expects.
+      batch, self.pending = self.events + self.pending, []
+      self.events = self.buffered.submit(batch, self.now)
+      self._tally()
+
+   def finish(self) -> None:
+      self.submit()
+      self.submit()  # writes the events the last batch produced
+
+   def _tally(self) -> None:
+      for event in self.events:
+         if event.row.get("event_type") == "rows_beyond_retention":
+            self.beyond.update(event.row.get("detail") or {})
+
+
+def _check_database(config, now) -> None:
+   def run():
+      with connect(
+         config.database.url,
+         connect_timeout_sec=config.database.connect_timeout_sec,
+         autocommit=True,
+      ) as conn:
+         check_schema(conn)
+         ensure_partitions(conn, now)
+
+   try:
+      _run_database(run)
+   except click.ClickException:
+      raise
+   except SchemaOutOfDate as exc:
+      raise click.ClickException(f"{exc}; run `node-monitor database migrate`") from exc
+
+
 @soak.command("replay")
 @click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--config", "config_path", type=click.Path(), default=None)
 @click.option("--write-records", type=click.Path(path_type=Path), default=None)
-def soak_replay(directory, config_path, write_records) -> None:
+@click.option("--write-db", is_flag=True, help="Also write the records to PostgreSQL.")
+def soak_replay(directory, config_path, write_records, write_db) -> None:
    """Replay a soak capture through the pipeline and count the records."""
    try:
       config = load_config(config_path)
    except ConfigError as exc:
       raise click.ClickException(str(exc)) from exc
+   db = None
+   if write_db:
+      if not config.database.url:
+         raise click.ClickException("database.url is not configured")
+      # Real time, not the capture's: retention is measured back from today.
+      db = _DatabaseSink(config, datetime.now(timezone.utc))
+      _check_database(config, db.now)
    sink = None
    if write_records is not None:
       # Rows hold redacted but still sensitive command lines.
@@ -138,22 +218,39 @@ def soak_replay(directory, config_path, write_records) -> None:
    try:
 
       def write(record):
-         line = json.dumps({"kind": record.kind, "row": record.row}, default=_json_default)
-         sink.write(line + "\n")
+         if sink:
+            line = json.dumps({"kind": record.kind, "row": record.row}, default=_json_default)
+            sink.write(line + "\n")
+         if db:
+            db.add(record)
 
       def skip(label):
          click.echo(f"{label}: not in config, skipped")
 
       try:
-         result = replay(directory, config, on_record=write if sink else None, on_skip=skip)
+         result = replay(directory, config, on_record=write if (sink or db) else None, on_skip=skip)
       except (OSError, ValueError, KeyError) as exc:
          raise click.ClickException(f"cannot replay {directory}: {exc}") from exc
+      if db:
+         _run_database(db.finish)
    finally:
       if sink:
          sink.close()
    for label, counts in result.items():
       detail = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
       click.echo(f"{label}: {detail}")
+   if db:
+      beyond = " ".join(f"{k}={v}" for k, v in sorted(db.beyond.items())) or "none"
+      click.echo(f"rows_beyond_retention: {beyond}")
+      status = db.buffered.status()
+      click.echo(f"status: {status}")
+      if status["spooled_batches"]:
+         click.echo(
+            f"database became unavailable: {status['spooled_batches']} batches remain in "
+            f"{config.working_dir / 'state' / 'spool-replay'}; they were NOT all written",
+            err=True,
+         )
+         raise SystemExit(1)
 
 
 @cli.group()
