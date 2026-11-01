@@ -475,3 +475,16 @@ def test_backend_terminated_mid_session(tmp_path, migrated_db, pg_admin_url):
       assert _event_names(migrated_db) == ["A", "B", "C"]
    finally:
       writer.close()
+
+
+def test_close_closes_the_writer_and_never_raises(tmp_path):
+   class Closing(StubWriter):
+      closed = 0
+
+      def close(self):
+         self.closed += 1
+         raise RuntimeError("boom")
+
+   buffered, writer, _ = make(tmp_path, Closing())
+   buffered.close()
+   assert writer.closed == 1

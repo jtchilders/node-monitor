@@ -107,6 +107,13 @@ class BufferedWriter:
          "next_retry": self._next_retry.isoformat() if self._next_retry else None,
       }
 
+   def close(self) -> None:
+      """Close the database connection. Never raises."""
+      try:
+         self._writer.close()
+      except Exception as exc:  # noqa: BLE001 - shutting down regardless
+         log.warning("closing the database writer failed: %s", _describe(exc))
+
    # --- writing ------------------------------------------------------------------------
 
    def _attempt(self, records, now, events, beyond):
