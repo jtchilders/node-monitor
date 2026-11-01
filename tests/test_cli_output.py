@@ -72,3 +72,12 @@ def test_fmt_age_boundaries():
    assert age(4 * 86400) == "4d"
    assert age(-5) == "0s"  # clock skew between collector and reader
    assert fmt_age(None, T) == "-"
+
+
+def test_render_table_shows_bracketed_values_literally():
+   tricky = "[kworker/0:1] [bold]x[/bold] python [a.py]"
+   buf = io.StringIO()
+   render([{"cmd": tricky}], [Column("cmd", "[Cmd]")], "table", title="[T]", file=buf)
+   text = buf.getvalue()
+   assert tricky in text
+   assert "[Cmd]" in text and "[T]" in text

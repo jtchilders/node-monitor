@@ -11,6 +11,7 @@ from typing import Any
 
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 # Wide enough that a piped table does not wrap; a terminal uses its own width.
 _PIPED_WIDTH = 200
@@ -49,9 +50,9 @@ def render(
       for r in rows:
          writer.writerow(["" if r.get(c.key) is None else _raw(r.get(c.key)) for c in columns])
    elif fmt == "table":
-      table = Table(title=title, title_justify="left")
+      table = Table(title=Text(title) if title else None, title_justify="left")
       for c in columns:
-         table.add_column(c.header, justify=c.justify)
+         table.add_column(Text(c.header), justify=c.justify)
       for r in rows:
          table.add_row(*[_cell(c, r.get(c.key)) for c in columns])
       console = Console(file=out)
@@ -62,10 +63,11 @@ def render(
       raise ValueError(f"unknown format {fmt!r}")
 
 
-def _cell(column: Column, value) -> str:
+def _cell(column: Column, value) -> Text:
+   # Text, not str: rich would parse brackets in process names and command lines as markup.
    if column.fmt is not None:
-      return column.fmt(value)
-   return "-" if value is None else str(value)
+      return Text(column.fmt(value))
+   return Text("-" if value is None else str(value))
 
 
 def fmt_kb(kb) -> str:
