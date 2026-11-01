@@ -7,7 +7,9 @@ from click.testing import CliRunner
 from psycopg import sql
 
 from node_monitor.cli.main import cli
+from node_monitor.database.bootstrap import bootstrap
 from tests.database import conftest as pg
+from tests.database.test_bootstrap import _url, names  # noqa: F401
 from tests.test_config import MINIMAL
 
 # The pg fixtures live in tests/database/conftest.py; re-exported for this module.
@@ -80,6 +82,32 @@ def test_status_and_migrate_flow(pg_db, tmp_path):
    )
    assert "2026-11-01" in line and "2026-12-01" in line
    assert "partition node_metrics_1m: none" not in lines
+
+
+def test_migrate_refuses_a_role_that_does_not_own_the_schema(pg_admin_url, names, tmp_path):  # noqa: F811
+   bootstrap(pg_admin_url, **names)
+   # The admin can create tables, but they would be its own, without the reader's grant.
+   admin = run(
+      "migrate", "--config", _config(tmp_path, pg.with_dbname(pg_admin_url, names["database"]))
+   )
+   assert admin.exit_code == 1
+   assert f"owner of schema node_monitor ({names['owner']})" in admin.output
+   assert "Traceback" not in admin.output
+   with psycopg.connect(pg.with_dbname(pg_admin_url, names["database"])) as conn:
+      assert conn.execute("SELECT to_regclass('node_monitor.schema_migrations')").fetchone() == (
+         None,
+      )
+   owner = run("migrate", "--config", _config(tmp_path, _url(pg_admin_url, names, "owner")))
+   assert owner.exit_code == 0 and "applied: 0001" in owner.output
+
+
+def test_migrate_without_the_schema_says_to_bootstrap(pg_db, tmp_path):
+   with psycopg.connect(pg_db, autocommit=True) as conn:
+      conn.execute("DROP SCHEMA node_monitor")
+   result = run("migrate", "--config", _config(tmp_path, pg_db))
+   assert result.exit_code == 1
+   assert "database bootstrap" in result.output
+   assert "Traceback" not in result.output
 
 
 def test_bootstrap_command(pg_admin_url):

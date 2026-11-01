@@ -13,7 +13,7 @@ import psycopg
 
 from node_monitor.collector.soak import make_private_dir, run_soak, summarize
 from node_monitor.config import ConfigError, load_config
-from node_monitor.database.bootstrap import bootstrap
+from node_monitor.database.bootstrap import SCHEMA, bootstrap
 from node_monitor.database.buffered import BufferedWriter
 from node_monitor.database.connect import connect, is_unavailable
 from node_monitor.database.maintenance import ensure_partitions
@@ -307,6 +307,29 @@ def database_bootstrap(admin_url, db_name, owner, reader) -> None:
       click.echo("nothing to do")
 
 
+def _check_schema_owner(conn) -> None:
+   """Refuse unless the session's role owns the schema.
+
+   Tables belong to the role that creates them, and the reader's default privileges cover
+   only those the owner creates; migrated by anyone else, even a superuser, they would be
+   unreadable to the reader.
+   """
+   row = conn.execute(
+      "SELECT pg_get_userbyid(nspowner), current_user FROM pg_namespace WHERE nspname = %s",
+      (SCHEMA,),
+   ).fetchone()
+   if row is None:
+      raise click.ClickException(
+         f"schema {SCHEMA} does not exist; run `node-monitor database bootstrap` first"
+      )
+   owner, user = row
+   if owner != user:
+      raise click.ClickException(
+         f"database migrate must run as the owner of schema {SCHEMA} ({owner}), not {user}:"
+         " use the owner-role URL in database.url"
+      )
+
+
 @database.command("migrate")
 @click.option("--config", "config_path", type=click.Path(), default=None)
 def database_migrate(config_path) -> None:
@@ -315,6 +338,7 @@ def database_migrate(config_path) -> None:
 
    def run():
       with connect(url, connect_timeout_sec=timeout, autocommit=True) as conn:
+         _check_schema_owner(conn)
          return migrate(conn)
 
    applied = _run_database(run)
