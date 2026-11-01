@@ -11,7 +11,7 @@ from node_monitor.database.codec import decode_record
 from node_monitor.database.connect import DatabaseUnavailable, connect
 from node_monitor.database.spool import Spool
 from node_monitor.database.writer import DatabaseWriter, WriteResult
-from node_monitor.pipeline.records import COLLECTION_EVENT, NODE_METRICS_1M, Record
+from node_monitor.pipeline.records import COLLECTION_EVENT, LIVE_NODE, NODE_METRICS_1M, Record
 from tests.database.sessions import scripted_records
 from tests.pipeline import at
 
@@ -38,8 +38,29 @@ def batch(name, t=0):
    ]
 
 
+def live_batch(name, t=0):
+   """A live-only batch (spooled under a live-only name), named by its label."""
+   return [
+      Record(
+         LIVE_NODE,
+         {
+            "system": SYSTEM,
+            "node": "n1.example",
+            "label": name,
+            "updated_at": at(t),
+            "session_state": "up",
+         },
+      )
+   ]
+
+
+def _name(records):
+   row = records[-1].row
+   return row["detail"].get("name") if "detail" in row else row.get("label")
+
+
 def names(batches):
-   return [b[-1].row["detail"]["name"] for b in batches]
+   return [_name(b) for b in batches]
 
 
 def _read(path):
@@ -68,6 +89,8 @@ class StubWriter:
       self.result = WriteResult({}, {}, [])
       # None: the database answers exactly when it is not down.
       self.ping_result = None
+      # Called after each successful write, e.g. to advance a fake clock.
+      self.on_write = None
 
    def ping(self):
       return (not self.down) if self.ping_result is None else self.ping_result
@@ -80,10 +103,12 @@ class StubWriter:
          if self.fail_after == 0:
             raise DatabaseUnavailable("database unavailable: connection reset")
          self.fail_after -= 1
-      name = records[-1].row["detail"].get("name") if records else None
+      name = _name(records) if records else None
       if name in self.poison:
          raise self.poison[name]
       self.written.append(records)
+      if self.on_write is not None:
+         self.on_write()
       return self.result
 
 
@@ -190,6 +215,7 @@ def test_recovery_replays_in_order_then_writes_fresh_batch(tmp_path):
       "outage_sec": 9.0,
       "replayed_batches": 2,
       "replayed_records": 4,
+      "superseded_batches": 0,
    }
 
 
@@ -374,7 +400,133 @@ def test_leftover_spool_is_replayed_before_first_write(tmp_path):
       "outage_sec": None,
       "replayed_batches": 1,
       "replayed_records": 2,
+      "superseded_batches": 0,
    }
+
+
+class FakeClock:
+   def __init__(self):
+      self.now = 0.0
+
+   def __call__(self):
+      return self.now
+
+   def advance(self, sec=10):
+      self.now += sec
+
+
+def test_replay_stops_at_its_time_budget_and_continues_next_submit(tmp_path):
+   clock = FakeClock()
+   bw, w, spool = make(tmp_path, replay_budget_sec=20, clock=clock)
+   w.down = True
+   for i, name in enumerate("ABCDE"):
+      bw.submit(batch(name, i), at(i))
+   w.down = False
+   w.on_write = clock.advance  # every write takes 10 s
+
+   events = bw.submit(batch("F", 10), at(10))
+   assert names(w.written) == ["A", "B"]
+   # The fresh batch waits behind the rest of the spool, so rows still arrive in order.
+   assert spooled_names(spool) == ["C", "D", "E", "F"]
+   assert events_of(events, "database_recovered") == []
+   status = bw.status()
+   assert status["connected"] is True and status["next_retry"] is None
+   assert status["outage_since"] == at(0).isoformat()
+
+   events = bw.submit(batch("G", 11), at(11))
+   assert names(w.written) == ["A", "B", "C", "D"]
+   assert events_of(events, "database_recovered") == []
+   events = bw.submit(batch("H", 12), at(12))
+   assert events_of(events, "database_recovered") == []
+   events = bw.submit(batch("I", 13), at(13))
+   assert names(w.written) == list("ABCDEFGHI")
+   assert spool.batch_count() == 0
+   (recovered,) = events_of(events, "database_recovered")
+   assert recovered.row["detail"] == {
+      "outage_sec": 13.0,
+      "replayed_batches": 8,
+      "replayed_records": 16,
+      "superseded_batches": 0,
+   }
+   assert bw.status()["outage_since"] is None
+
+
+def test_outage_during_a_budgeted_drain_keeps_order(tmp_path):
+   clock = FakeClock()
+   bw, w, spool = make(tmp_path, replay_budget_sec=20, clock=clock)
+   w.down = True
+   for i, name in enumerate("ABCD"):
+      bw.submit(batch(name, i), at(i))
+   w.down = False
+   w.on_write = clock.advance
+   bw.submit(batch("E", 10), at(10))
+   assert spooled_names(spool) == ["C", "D", "E"]
+   w.down = True
+   events = bw.submit(batch("F", 11), at(11))
+   assert events_of(events, "database_unavailable") == []  # still the same outage
+   assert spooled_names(spool) == ["C", "D", "E", "F"]
+   w.down = False
+   next_retry = datetime.fromisoformat(bw.status()["next_retry"])
+   while spool.batch_count():
+      events = bw.submit([], next_retry)
+   assert names(w.written) == list("ABCDEF")
+   assert len(events_of(events, "database_recovered")) == 1
+
+
+def test_superseded_live_only_batches_are_dropped_unwritten(tmp_path):
+   bw, w, spool = make(tmp_path)
+   w.down = True
+   bw.submit(live_batch("L1", 0), at(0))
+   bw.submit(batch("A", 1), at(1))
+   bw.submit(live_batch("L2", 2), at(2))
+   bw.submit(batch("B", 3), at(3))
+   bw.submit(live_batch("L3", 4), at(4))
+   assert spooled_names(spool) == ["L1", "A", "L2", "B", "L3"]
+   w.down = False
+   events = bw.submit(batch("C", 10), at(10))
+   # Only the newest live state is written; durable batches all are, in order.
+   assert names(w.written) == ["A", "B", "L3", "C"]
+   assert spool.batch_count() == 0
+   corrupt = spool.directory / "corrupt"
+   assert not corrupt.exists() or not list(corrupt.iterdir())
+   (recovered,) = events_of(events, "database_recovered")
+   assert recovered.row["detail"]["replayed_batches"] == 3
+   assert recovered.row["detail"]["superseded_batches"] == 2
+
+
+def test_quarantine_events_of_one_submit_get_distinct_times(tmp_path):
+   bw, w, spool = make(tmp_path)
+   for i in range(3):
+      (spool.directory / f"19990101T000000.000000-00000{i}.jsonl").write_text("{not json\n")
+   events = events_of(bw.submit(batch("A"), at(0)), "spool_batch_quarantined")
+   assert len(events) == 3
+   assert [e.row["ts"] for e in events] == [at(0) + timedelta(microseconds=i) for i in range(3)]
+
+
+def test_rejected_live_only_fresh_batch_is_not_kept(tmp_path):
+   bw, w, spool = make(tmp_path)
+   w.poison["L"] = psycopg.errors.DatatypeMismatch("bad live row")
+   with pytest.raises(psycopg.errors.DatatypeMismatch):
+      bw.submit(live_batch("L"), at(0))
+   corrupt = spool.directory / "corrupt"
+   assert not corrupt.exists() or not list(corrupt.iterdir())
+   (event,) = events_of(bw.submit([], at(1)), "spool_batch_quarantined")
+   assert event.row["detail"] == {
+      "file": None,
+      "reason": "live-only batch not kept",
+      "error": "DatatypeMismatch: bad live row",
+   }
+
+
+def test_rejected_mixed_fresh_batch_is_kept(tmp_path):
+   bw, w, spool = make(tmp_path)
+   w.poison["A"] = psycopg.errors.DatatypeMismatch("bad")
+   with pytest.raises(psycopg.errors.DatatypeMismatch):
+      bw.submit(live_batch("L") + batch("A"), at(0))
+   (kept,) = (spool.directory / "corrupt").iterdir()
+   assert names([_read(kept)]) == ["A"]
+   (event,) = events_of(bw.submit([], at(1)), "spool_batch_quarantined")
+   assert event.row["detail"]["file"] == kept.name
 
 
 def test_empty_submit_outside_an_outage_does_not_touch_the_database(tmp_path):
@@ -447,6 +599,24 @@ def test_outage_spools_then_replays_in_order_without_loss(tmp_path, migrated_db)
             " WHERE event_type = 'database_unavailable' AND node IS NULL"
          ).fetchone()
       assert n == 1
+   finally:
+      writer.close()
+
+
+def test_same_type_events_of_one_submit_all_reach_the_database(tmp_path, migrated_db):
+   bw, writer, spool = _real(tmp_path, migrated_db)
+   try:
+      for i in range(3):
+         (spool.directory / f"19990101T000000.000000-00000{i}.jsonl").write_text("{x\n")
+      events = bw.submit(batch("A", 0), at(0))
+      assert len(events_of(events, "spool_batch_quarantined")) == 3
+      bw.submit(events, at(1))
+      with connect(migrated_db) as conn:
+         (n,) = conn.execute(
+            "SELECT count(DISTINCT ts) FROM collection_events"
+            " WHERE event_type = 'spool_batch_quarantined'"
+         ).fetchone()
+      assert n == 3
    finally:
       writer.close()
 

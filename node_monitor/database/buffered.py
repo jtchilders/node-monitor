@@ -4,17 +4,24 @@ The collector must never lose data to a database outage and must never crash bec
 one. During an outage batches go to the spool; once the database answers again the spool
 is replayed oldest first, and only then is the new batch written, so rows reach the
 database in the order they were produced.
+
+A long outage leaves a spool that takes minutes to replay, and the writer thread must not
+stop for that long (no heartbeat, frozen live tables, new data only in memory). So each
+submit replays for at most a time budget; while batches remain, new ones are spooled behind
+them and the next submit carries on.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import time
 from collections import Counter
+from collections.abc import Callable
 from datetime import datetime, timedelta
 
 from node_monitor.database.connect import DatabaseUnavailable
-from node_monitor.database.spool import Spool
+from node_monitor.database.spool import LIVE_KINDS, Spool, is_live_only
 from node_monitor.database.writer import DatabaseWriter, WriteResult
 from node_monitor.pipeline.records import COLLECTION_EVENT, Record
 from node_monitor.pipeline.timestamps import require_aware
@@ -43,7 +50,7 @@ class BufferedWriter:
    caller passes them back in its next `submit`, so they follow the same path as any data.
 
    Not thread-safe and needs no locking: it is driven from a single writer thread. All
-   times come from the `now` passed in, never from the clock.
+   times written come from the `now` passed in; `clock` only measures the replay budget.
    """
 
    def __init__(
@@ -54,12 +61,16 @@ class BufferedWriter:
       system: str,
       backoff: tuple[float, float] = (5, 300),
       max_replay_attempts: int = 3,
+      replay_budget_sec: float = 20.0,
+      clock: Callable[[], float] = time.monotonic,
    ):
       self._writer = writer
       self._spool = spool
       self._system = system
       self._backoff = backoff
       self._max_replay_attempts = max_replay_attempts
+      self._replay_budget_sec = replay_budget_sec
+      self._clock = clock
       # path -> outage-class failures of that spooled batch while the database answered.
       self._replay_failures: dict = {}
       # True once a write has succeeded, until the next outage.
@@ -70,6 +81,9 @@ class BufferedWriter:
       # Replayed during the current outage, which may take several attempts to drain.
       self._replayed_batches = 0
       self._replayed_records = 0
+      self._superseded_batches = 0
+      # Events of the current submit by type, so same-type events get distinct times.
+      self._event_counts: Counter = Counter()
       # Events of a submit that raised, returned by the next one so they are not lost.
       self._carried: list[Record] = []
       # Spool files that could be neither removed after replay nor quarantined: skipped
@@ -86,6 +100,7 @@ class BufferedWriter:
       never allowed to raise.
       """
       require_aware(now)
+      self._event_counts = Counter()
       events, self._carried = self._carried, []
       beyond = Counter()
       try:
@@ -118,7 +133,15 @@ class BufferedWriter:
 
    def _attempt(self, records, now, events, beyond):
       try:
-         wrote = self._replay(now, events, beyond)
+         wrote, drained = self._replay(now, events, beyond)
+         if not drained:
+            # Out of time with batches left: these records go behind them, keeping the
+            # order, and the outage is over only once the spool is empty.
+            if wrote:
+               self._connected = True
+               self._next_retry = None
+            self._store(records, now, events)
+            return
          # With nothing replayed, an empty write still tells whether the outage is over.
          if records or (self._outage_since is not None and not wrote):
             try:
@@ -140,14 +163,28 @@ class BufferedWriter:
       if wrote:
          self._recover(now, events)
 
-   def _replay(self, now, events, beyond) -> bool:
-      """Write every spooled batch, oldest first; True if any was written.
+   def _replay(self, now, events, beyond) -> tuple[bool, bool]:
+      """Write spooled batches, oldest first, until none is left or the budget is spent.
 
-      Raises DatabaseUnavailable, leaving the batches not yet written on disk in order.
+      Returns (whether any was written, whether the spool was drained). Raises
+      DatabaseUnavailable, leaving the batches not yet written on disk in order.
       """
+      started = self._clock()
+      files = [p for p in self._spool.batch_files() if p not in self._skip]
+      # A live-only batch holds nothing but live state, which each node's newer batch
+      # replaces wholesale (and the writer's ts/updated_at guards would refuse anyway): all
+      # but the newest are dropped unwritten, which makes a long live backlog cheap.
+      live_only = [p for p in files if is_live_only(p)]
+      superseded = set(live_only[:-1])
       wrote = False
-      for path, batch in self._spool.pending():
-         if path in self._skip:
+      for path in files:
+         if self._clock() - started >= self._replay_budget_sec:
+            return wrote, False
+         if path in superseded:
+            self._drop_superseded(path)
+            continue
+         batch = self._spool.read(path)
+         if batch is None:
             continue
          try:
             result: WriteResult = self._writer.write(batch, now)
@@ -185,7 +222,15 @@ class BufferedWriter:
          self._replayed_batches += 1
          self._replayed_records += len(batch)
          beyond.update(result.rows_beyond_retention)
-      return wrote
+      return wrote, True
+
+   def _drop_superseded(self, path):
+      self._replay_failures.pop(path, None)
+      self._spool.remove(path)
+      if _exists(path):
+         self._skip.add(path)
+         return
+      self._superseded_batches += 1
 
    def _quarantine_spooled(self, path, now, events, detail):
       self._replay_failures.pop(path, None)
@@ -196,6 +241,13 @@ class BufferedWriter:
 
    def _quarantine_fresh(self, records, exc, now, events):
       if not records:
+         return
+      if all(r.kind in LIVE_KINDS for r in records):
+         # Live state is superseded within a minute, and a deterministic error would keep
+         # about a megabyte per node per minute in corrupt/; the event is the record.
+         log.error("dropping %d rejected live records: %s", len(records), _describe(exc))
+         detail = {"file": None, "reason": "live-only batch not kept", "error": _describe(exc)}
+         events.append(self._event(now, "spool_batch_quarantined", detail))
          return
       name = self._spool.quarantine_records(records, _describe(exc))
       events.append(
@@ -233,11 +285,15 @@ class BufferedWriter:
       self._store(records, now, events)
 
    def _recover(self, now, events):
-      if self._outage_since is not None or self._replayed_batches:
+      if self._outage_since is not None or self._replayed_batches or self._superseded_batches:
          # A spool left by an earlier process means an outage of unknown length.
          since = self._outage_since
          outage_sec = (now - since).total_seconds() if since is not None else None
-         log.info("database recovered; replayed %d spooled batches", self._replayed_batches)
+         log.info(
+            "database recovered; replayed %d spooled batches, dropped %d superseded",
+            self._replayed_batches,
+            self._superseded_batches,
+         )
          events.append(
             self._event(
                now,
@@ -246,6 +302,7 @@ class BufferedWriter:
                   "outage_sec": outage_sec,
                   "replayed_batches": self._replayed_batches,
                   "replayed_records": self._replayed_records,
+                  "superseded_batches": self._superseded_batches,
                },
             )
          )
@@ -255,16 +312,21 @@ class BufferedWriter:
       self._delay = None
       self._replayed_batches = 0
       self._replayed_records = 0
+      self._superseded_batches = 0
 
    # --- events -------------------------------------------------------------------------
 
    def _event(self, now, event_type, detail):
+      # Events of one submit share `now`, and the natural key (system, node, ts, type) would
+      # keep only the first of a type: the i-th of a type is stamped i microseconds later.
+      nth = self._event_counts[event_type]
+      self._event_counts[event_type] += 1
       return Record(
          COLLECTION_EVENT,
          {
             "system": self._system,
             "node": None,
-            "ts": now,
+            "ts": now + timedelta(microseconds=nth),
             "event_type": event_type,
             "detail": detail,
          },

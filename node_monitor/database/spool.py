@@ -27,7 +27,8 @@ _SUFFIX = ".jsonl"
 # existed have none and count as not live-only. Either way names sort in write order.
 _LIVE_MARK = "-L"
 _NAME_RE = re.compile(r"^\d{8}T\d{6}\.\d{6}-(\d{6})(?:-L)?\.jsonl$")
-_LIVE_KINDS = frozenset({LIVE_PROCESSES, LIVE_NODE})
+# Live rows only ever describe a node's current state, so a newer batch supersedes them.
+LIVE_KINDS = frozenset({LIVE_PROCESSES, LIVE_NODE})
 _ERROR_CHARS = 200
 
 
@@ -35,7 +36,8 @@ def _describe(exc: BaseException) -> str:
    return f"{type(exc).__name__}: {str(exc)[:_ERROR_CHARS]}"
 
 
-def _is_live_only(path: Path) -> bool:
+def is_live_only(path: Path) -> bool:
+   """True for a batch written with nothing but LIVE_KINDS records."""
    return path.name.endswith(_LIVE_MARK + _SUFFIX)
 
 
@@ -103,6 +105,10 @@ class Spool:
    def batch_count(self) -> int:
       return len(self._batch_files())
 
+   def batch_files(self) -> list[Path]:
+      """The stored batches, oldest first. Only names are read."""
+      return self._batch_files()
+
    @staticmethod
    def _count_records(path: Path) -> int:
       """Lines in a batch, one record each; 0 if it cannot be read."""
@@ -133,8 +139,8 @@ class Spool:
       batches = records = 0
       if total + needed <= self.max_bytes:
          return batches, records
-      live_only = [p for p in files if _is_live_only(p)]
-      for p in live_only + [p for p in files if not _is_live_only(p)]:
+      live_only = [p for p in files if is_live_only(p)]
+      for p in live_only + [p for p in files if not is_live_only(p)]:
          if total + needed <= self.max_bytes:
             break
          n = self._drop(p)
@@ -168,7 +174,7 @@ class Spool:
             if err:
                return SpoolResult(False, error=err)
          dropped_b, dropped_r = self._make_room(len(data))
-         live_only = all(r.kind in _LIVE_KINDS for r in records)
+         live_only = all(r.kind in LIVE_KINDS for r in records)
          for attempt in (1, 2):
             try:
                self._write(self.directory, data, live_only)
@@ -236,7 +242,7 @@ class Spool:
          payload = "".join(
             json.dumps(encode_record(r), separators=(",", ":")) + "\n" for r in records
          )
-         live_only = all(r.kind in _LIVE_KINDS for r in records)
+         live_only = all(r.kind in LIVE_KINDS for r in records)
          with self._lock:
             name = self._write(self._corrupt_directory(), payload.encode("utf-8"), live_only)
       except Exception as e:  # noqa: BLE001 - the collector must survive any spool failure
@@ -257,21 +263,29 @@ class Spool:
       An unreadable batch is moved to `corrupt/` and reported by take_quarantined().
       """
       for path in self._batch_files():
-         if path in self._stuck:
-            continue
-         try:
-            with open(path, encoding="utf-8") as f:
-               batch = [decode_record(json.loads(line)) for line in f if line.strip()]
-         except Exception as e:  # noqa: BLE001 - e.g. RecursionError on hostile JSON
-            log.error("quarantining unreadable spool file %s: %s", path.name, e)
-            reason = _describe(e)
-            if not self.quarantine(path):
-               self._stuck.add(path)
-               reason += " (could not be moved to corrupt/)"
-            with self._lock:
-               self._quarantined.append((path.name, reason))
-            continue
-         yield path, batch
+         batch = self.read(path)
+         if batch is not None:
+            yield path, batch
+
+   def read(self, path: Path) -> list[Record] | None:
+      """The records of one stored batch, or None if it cannot be read. Never raises.
+
+      An unreadable batch is moved to `corrupt/` and reported by take_quarantined().
+      """
+      if path in self._stuck:
+         return None
+      try:
+         with open(path, encoding="utf-8") as f:
+            return [decode_record(json.loads(line)) for line in f if line.strip()]
+      except Exception as e:  # noqa: BLE001 - e.g. RecursionError on hostile JSON
+         log.error("quarantining unreadable spool file %s: %s", path.name, e)
+         reason = _describe(e)
+         if not self.quarantine(path):
+            self._stuck.add(path)
+            reason += " (could not be moved to corrupt/)"
+         with self._lock:
+            self._quarantined.append((path.name, reason))
+         return None
 
    def remove(self, path: Path) -> None:
       try:
