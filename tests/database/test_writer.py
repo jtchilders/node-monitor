@@ -452,6 +452,10 @@ def test_only_outages_become_database_unavailable(migrated_db, monkeypatch, exc,
    def boom(self, conn, plan):
       raise exc
 
+   def backend_pid():
+      return w._connection().info.backend_pid
+
+   before = backend_pid()
    monkeypatch.setattr(writer_mod.DatabaseWriter, "_apply", boom)
    if outage:
       with pytest.raises(DatabaseUnavailable) as info:
@@ -462,6 +466,8 @@ def test_only_outages_become_database_unavailable(migrated_db, monkeypatch, exc,
          w.write([_event(NOW)], NOW)
       assert info.value is exc
    monkeypatch.undo()
+   # An outage drops the session; a bad statement rolls back and keeps it.
+   assert (backend_pid() != before) is outage
    w.write([_event(NOW)], NOW)
    w.close()
    assert _counts(migrated_db)["collection_events"] == 1

@@ -250,8 +250,10 @@ class DatabaseWriter:
             created = self._create_partitions(conn, plan)
             written = self._apply(conn, plan)
       except BaseException as exc:
-         self._discard_if_unusable()
-         if is_unavailable(exc):
+         outage = is_unavailable(exc)
+         # After an outage the session is suspect even if psycopg has not marked it broken.
+         self._discard_if_unusable(force=outage)
+         if outage:
             raise DatabaseUnavailable(f"database unavailable: {exc}") from exc
          raise
       return WriteResult(
@@ -276,11 +278,16 @@ class DatabaseWriter:
          )
       return self._conn
 
-   def _discard_if_unusable(self):
+   def _discard_if_unusable(self, *, force=False):
       conn = self._conn
       if conn is None:
          return
-      if conn.closed or conn.broken or conn.info.transaction_status != TransactionStatus.IDLE:
+      if (
+         force
+         or conn.closed
+         or conn.broken
+         or conn.info.transaction_status != TransactionStatus.IDLE
+      ):
          self._conn = None
          try:
             conn.close()
