@@ -124,3 +124,104 @@ def test_cli_missing_web_url_exit_1(tmp_path):
       result = run(command, "--config", cfg)
       assert result.exit_code == 1
       assert f"web.database_url is not set in {cfg}" in result.output
+
+
+def _json(*args):
+   result = run(*args, "--format", "json")
+   assert result.exit_code == 0, result.output
+   return json.loads(result.output)
+
+
+def test_top_default_sort_and_limit(live):
+   _, _, cfg = live
+   assert [r["pid"] for r in _json("top", "--config", cfg)] == [1, 3, 4, 2, 5]
+   assert [r["pid"] for r in _json("top", "--config", cfg, "--limit", "2")] == [1, 3]
+   assert len(_json("top", "--config", cfg, "--limit", "0")) == 5
+   assert [r["pid"] for r in _json("top", "--config", cfg, "--sort", "rss", "--reverse")][0] == 5
+   table = run("top", "--config", cfg)
+   assert table.exit_code == 0, table.output
+   assert "N1" in table.output and "root" not in table.output
+
+
+def test_top_user_filter(live):
+   _, _, cfg = live
+   rows = _json("top", "--config", cfg, "-u", "bob")
+   assert {r["username"] for r in rows} == {"bob"}
+   assert _json("top", "--config", cfg, "-n", "N2", "-c", "editor")[0]["pid"] == 4
+
+
+def test_top_json_keeps_full_command(live):
+   _, _, cfg = live
+   by_pid = {r["pid"]: r for r in _json("top", "--config", cfg)}
+   assert by_pid[2]["cmdline"] == "x" * 80
+   assert by_pid[3]["idle_for_sec"] == 100 and by_pid[3]["idle_for_is_lower_bound"] is True
+   table = run("top", "--config", cfg).output
+   assert "x" * 59 + "…" in table and "x" * 61 not in table
+   assert "≥1m" in table
+   csv_out = run("top", "--config", cfg, "--format", "csv").output
+   assert "x" * 80 in csv_out and "idle_for_is_lower_bound" in csv_out.splitlines()[0]
+
+
+def test_users_sorted_by_rss(live):
+   _, _, cfg = live
+   rows = _json("users", "--config", cfg)
+   assert [r["username"] for r in rows] == ["alice", "bob", "carol"]
+   assert rows[0]["processes"] == 2 and rows[0]["top_category"] == "ml"
+   assert [r["username"] for r in _json("users", "--config", cfg, "--sort", "procs")][0] in (
+      "alice",
+      "bob",
+   )
+   assert "alice" in run("users", "--config", cfg).output
+
+
+def test_user_shows_all_categories_and_summary(live):
+   _, _, cfg = live
+   result = run("user", "bob", "--config", cfg)
+   assert result.exit_code == 0, result.output
+   assert "2 processes" in result.output and "2 nodes" in result.output
+   assert "1.5 GiB" in result.output
+   rows = _json("user", "alice", "--config", cfg)
+   assert {r["category"] for r in rows} == {"ml", "shell"}
+   assert [r["pid"] for r in _json("user", "root", "--config", cfg)] == [6]
+
+
+def test_user_unknown_exit_1(live):
+   _, _, cfg = live
+   result = run("user", "nobody", "--config", cfg)
+   assert result.exit_code == 1
+   assert result.output.strip().splitlines() == ["Error: no live processes for nobody"]
+
+
+def test_idle_threshold_and_absent_only(live):
+   _, _, cfg = live
+   # pid 2: idle 2h, owner absent. pid 4: idle 1h but its owner is present.
+   assert [r["pid"] for r in _json("idle", "--config", cfg)] == [2]
+   assert [r["pid"] for r in _json("idle", "--config", cfg, "--min-idle", "3h")] == []
+   table = run("idle", "--config", cfg).output
+   assert "2h00m" in table and "absent" in table
+
+
+def test_idle_any_presence(live):
+   _, _, cfg = live
+   rows = _json("idle", "--config", cfg, "--any-presence", "--min-idle", "1h")
+   assert [r["pid"] for r in rows] == [4, 2]
+   rows = _json("idle", "--config", cfg, "--any-presence", "--min-idle", "90s")
+   assert [r["pid"] for r in rows] == [3, 4, 2]
+
+
+@pytest.mark.parametrize("value", ["soon", "-5m", "1.5h", "", "10x"])
+def test_min_idle_parsing_rejects_garbage(live, value):
+   _, _, cfg = live
+   result = run("idle", "--config", cfg, "--min-idle", value)
+   assert result.exit_code == 2
+   assert "min-idle" in result.output.lower()
+
+
+@pytest.mark.parametrize(
+   "value,seconds", [("30m", 1800), ("2h", 7200), ("1d", 86400), ("90s", 90), ("45", 45)]
+)
+def test_min_idle_accepts_units(live, value, seconds):
+   _, _, cfg = live
+   from node_monitor.cli.live import IdleDuration
+
+   assert IdleDuration().convert(value, None, None) == seconds

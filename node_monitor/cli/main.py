@@ -73,6 +73,8 @@ def cli() -> None:
 
 cli.add_command(live.status)
 cli.add_command(live.nodes)
+for _command in (live.top, live.users, live.user, live.idle):
+   cli.add_command(_command)
 
 
 @cli.group()

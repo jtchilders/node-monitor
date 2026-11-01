@@ -65,6 +65,31 @@ replays the spool first.
 - `redaction.extra_patterns` (default `[]`): extra regexes applied after the built-in
   command-line redaction rules; the first capture group (or the whole match) is masked.
 
+## CLI
+
+Read commands query the live tables through `web.database_url`; every one takes
+`--config PATH` and `--format table|json|csv` (JSON and CSV carry raw values and full
+command lines).
+
+| Command | Shows |
+| --- | --- |
+| `node-monitor status` | collector heartbeat and per-node session state (exit 1 if stale or missing) |
+| `node-monitor nodes` | per-node load, memory, process counts, census age |
+| `node-monitor top [-u USER]` | user processes, busiest first |
+| `node-monitor users` | per-user totals |
+| `node-monitor user USERNAME` | every process of one user, with a summary line |
+| `node-monitor idle [--min-idle 1h] [--any-presence]` | processes idle that long whose owner is absent |
+| `node-monitor daemon start\|stop\|status` | run and control the collector daemon |
+
+`top`, `users`, `user` and `idle` also take `-n/--node`, `-c/--category`, `--sort`,
+`--reverse` and `--limit` (default 20, 0 for all). `--min-idle` accepts `30m`, `2h`, `1d`,
+`90s` or plain seconds.
+
+```bash
+node-monitor top --sort rss --limit 10
+node-monitor idle --min-idle 2h --format csv
+```
+
 ## Database
 
 The collector writes to PostgreSQL (database and schema `node_monitor`). Two roles are

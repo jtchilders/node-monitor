@@ -29,6 +29,7 @@ def proc(pid, username, category, **kw):
       cpu_state="busy",
       idle_for_is_lower_bound=False,
       is_user_process=True,
+      owner_presence="interactive",
       cmdline=f"cmd{pid}",
    )
    base.update(kw)
@@ -36,8 +37,12 @@ def proc(pid, username, category, **kw):
 
 
 N1 = [
-   proc(1, "alice", "ml", cpu_seconds=500, rss_kb=4194304, gpu_mem_mb=1000, threads=8),
-   proc(2, "alice", "shell", cpu_seconds=5, rss_kb=10240, cpu_state="idle", idle_for_sec=7200),
+   proc(1, "alice", "ml", cpu_seconds=500, rss_kb=4194304, gpu_mem_mb=1000, threads=8,
+        owner_presence="absent"),
+   proc(
+      2, "alice", "shell", cpu_seconds=5, rss_kb=10240, cpu_state="idle", idle_for_sec=7200,
+      owner_presence="absent", cmdline="x" * 80,
+   ),
    proc(
       3, "bob", "ml", cpu_seconds=50, rss_kb=1048576, gpu_mem_mb=500, threads=4,
       cpu_state="idle", idle_for_sec=100, idle_for_is_lower_bound=True,

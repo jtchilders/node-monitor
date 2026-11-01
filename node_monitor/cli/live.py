@@ -10,6 +10,7 @@ import psycopg
 from node_monitor.cli.output import (
    Column,
    fmt_age,
+   fmt_duration,
    fmt_kb,
    fmt_pct,
    json_default,
@@ -168,3 +169,215 @@ def nodes(config_path, fmt) -> None:
       ],
       fmt,
    )
+
+
+COMMAND_WIDTH = 60
+_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+class IdleDuration(click.ParamType):
+   """30m, 2h, 1d, 90s, or plain integer seconds."""
+
+   name = "duration"
+
+   def convert(self, value, param, ctx):
+      text = str(value).strip().lower()
+      unit = _UNIT_SECONDS.get(text[-1:], None)
+      digits = text[:-1] if unit else text
+      if not (digits.isascii() and digits.isdigit()):
+         self.fail(f"{value!r} is not a duration such as 30m, 2h, 1d, 90s or 45", param, ctx)
+      return int(digits) * (unit or 1)
+
+
+def _truncate(text, width=COMMAND_WIDTH):
+   if text is None or len(text) <= width:
+      return text
+   return text[: width - 1] + "…"
+
+
+def _display_rows(rows):
+   """Adds the table-only `idle` and `command` keys; the raw keys stay for JSON and CSV."""
+   return [
+      {
+         **r,
+         "idle": fmt_duration(r["idle_for_sec"], r["idle_for_is_lower_bound"]),
+         "command": _truncate(r["cmdline"]),
+      }
+      for r in rows
+   ]
+
+
+def _cols(fmt, table, raw):
+   """Table columns carry the display keys; JSON and CSV use `raw`, which has the full
+   command and the idle value with its lower-bound flag."""
+   return table if fmt == "table" else raw
+
+
+def _process_options(func, *, sorts, default_sort):
+   func = common_options(func)
+   func = click.option(
+      "--limit",
+      type=click.IntRange(min=0),
+      default=20,
+      show_default=True,
+      help="Rows to show; 0 shows all.",
+   )(func)
+   func = click.option("--reverse", is_flag=True, help="Sort ascending.")(func)
+   func = click.option("--sort", type=click.Choice(sorts), default=default_sort, show_default=True)(
+      func
+   )
+   func = click.option("-c", "--category", default=None, help="Only this category.")(func)
+   return click.option("-n", "--node", default=None, help="Only this node (host or label).")(func)
+
+
+def _limit(limit):
+   return limit or None
+
+
+def process_options(default_sort):
+   return lambda f: _process_options(
+      f, sorts=list(queries._PROCESS_SORTS), default_sort=default_sort
+   )
+
+
+_ID = [Column("label", "Node"), Column("username", "User"), Column("pid", "PID", justify="right")]
+_CPU = Column("cpu_seconds", "CPU s/min", lambda v: "-" if v is None else f"{v:.0f}", "right")
+_RSS = Column("rss_kb", "RSS", fmt_kb, "right")
+_TOP_RAW = [
+   *_ID,
+   Column("category", "Category"),
+   Column("activity", "Activity"),
+   _CPU,
+   _RSS,
+   Column("state", "State"),
+   Column("idle_for_sec", "Idle"),
+   Column("idle_for_is_lower_bound", "Idle lower bound"),
+   Column("owner_presence", "Presence"),
+   Column("cmdline", "Command"),
+]
+_TOP_TABLE = [
+   *_ID,
+   Column("category", "Category"),
+   Column("activity", "Activity"),
+   _CPU,
+   _RSS,
+   Column("state", "State"),
+   Column("idle", "Idle", justify="right"),
+   Column("owner_presence", "Presence"),
+   Column("command", "Command"),
+]
+_IDLE_RAW = [
+   *_ID,
+   Column("category", "Category"),
+   Column("activity", "Activity"),
+   Column("idle_for_sec", "Idle"),
+   Column("idle_for_is_lower_bound", "Idle lower bound"),
+   _RSS,
+   Column("owner_presence", "Presence"),
+   Column("cmdline", "Command"),
+]
+_IDLE_TABLE = [
+   *_ID,
+   Column("category", "Category"),
+   Column("activity", "Activity"),
+   Column("idle", "Idle", justify="right"),
+   _RSS,
+   Column("owner_presence", "Presence"),
+   Column("command", "Command"),
+]
+
+
+@click.command()
+@process_options("cpu")
+@click.option("-u", "--user", default=None, help="Only this user.")
+def top(config_path, fmt, node, category, sort, reverse, limit, user) -> None:
+   """User processes, busiest first."""
+   config = _load(config_path)
+   with _reader(config) as conn:
+      rows = queries.processes(
+         conn, config.system, user=user, node=node, category=category,
+         sort=sort, reverse=reverse, limit=_limit(limit),
+      )  # fmt: skip
+   render(_display_rows(rows), _cols(fmt, _TOP_TABLE, _TOP_RAW), fmt)
+
+
+@click.command()
+@common_options
+@click.option(
+   "--limit",
+   type=click.IntRange(min=0),
+   default=20,
+   show_default=True,
+   help="Rows to show; 0 shows all.",
+)
+@click.option("--reverse", is_flag=True, help="Sort ascending.")
+@click.option(
+   "--sort", type=click.Choice(list(queries._USER_SORTS)), default="rss", show_default=True
+)
+@click.option("-c", "--category", default=None, help="Only this category.")
+@click.option("-n", "--node", default=None, help="Only this node (host or label).")
+def users(config_path, fmt, node, category, sort, reverse, limit) -> None:
+   """Per-user totals over user processes."""
+   config = _load(config_path)
+   with _reader(config) as conn:
+      rows = queries.users(
+         conn, config.system, node=node, category=category,
+         sort=sort, reverse=reverse, limit=_limit(limit),
+      )  # fmt: skip
+   render(
+      rows,
+      [
+         Column("username", "User"),
+         Column("processes", "Procs", justify="right"),
+         Column("nodes", "Nodes", justify="right"),
+         _CPU,
+         _RSS,
+         Column("gpu_mem_mb", "GPU MiB", justify="right"),
+         Column("idle_processes", "Idle procs", justify="right"),
+         Column("top_category", "Top category"),
+      ],
+      fmt,
+   )
+
+
+@click.command()
+@click.argument("username")
+@process_options("cpu")
+def user(config_path, fmt, node, category, sort, reverse, limit, username) -> None:
+   """Every process of USERNAME, whatever its category."""
+   config = _load(config_path)
+   with _reader(config) as conn:
+      rows = queries.processes(
+         conn, config.system, user=username, node=node, category=category, user_only=False,
+         sort=sort, reverse=reverse, limit=None,
+      )  # fmt: skip
+   if not rows:
+      raise click.ClickException(f"no live processes for {username}")
+   if fmt == "table":
+      total = sum(r["rss_kb"] or 0 for r in rows)
+      n_nodes = len({r["node"] for r in rows})
+      click.echo(f"{username}: {len(rows)} processes on {n_nodes} nodes, total RSS {fmt_kb(total)}")
+   shown = rows[: _limit(limit)]
+   render(_display_rows(shown), _cols(fmt, _TOP_TABLE, _TOP_RAW), fmt)
+
+
+@click.command()
+@process_options("rss")
+@click.option(
+   "--min-idle",
+   type=IdleDuration(),
+   default="1h",
+   show_default=True,
+   help="Idle at least this long: 30m, 2h, 1d, 90s or seconds.",
+)
+@click.option("--any-presence", is_flag=True, help="Include processes whose owner is present.")
+def idle(config_path, fmt, node, category, sort, reverse, limit, min_idle, any_presence) -> None:
+   """User processes idle for a while, by default only those whose owner is absent."""
+   config = _load(config_path)
+   with _reader(config) as conn:
+      rows = queries.processes(
+         conn, config.system, node=node, category=category, idle_min_sec=min_idle,
+         presence=None if any_presence else "absent",
+         sort=sort, reverse=reverse, limit=_limit(limit),
+      )  # fmt: skip
+   render(_display_rows(rows), _cols(fmt, _IDLE_TABLE, _IDLE_RAW), fmt)

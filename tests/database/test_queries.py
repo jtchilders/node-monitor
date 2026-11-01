@@ -65,7 +65,9 @@ def test_processes_idle_filter_requires_idle_state(conn):
    conn.execute("UPDATE live_processes SET idle_for_sec = 9000 WHERE pid = 5")  # busy
    rows = queries.processes(conn, SYSTEM, idle_min_sec=3600, sort="idle")
    assert pids(rows) == [2, 4]
-   assert pids(queries.processes(conn, SYSTEM, presence="absent")) == []
+   absent = queries.processes(conn, SYSTEM, presence="absent", sort="rss")
+   assert pids(absent) == [1, 2]
+   assert pids(queries.processes(conn, SYSTEM, presence="absent", idle_min_sec=3600)) == [2]
 
 
 def test_users_aggregates_and_top_category(conn):
