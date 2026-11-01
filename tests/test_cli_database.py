@@ -1,8 +1,10 @@
 import secrets
 
+import psycopg
 import pytest
 import yaml
 from click.testing import CliRunner
+from psycopg import sql
 
 from node_monitor.cli.main import cli
 from tests.database import conftest as pg
@@ -63,7 +65,21 @@ def test_status_and_migrate_flow(pg_db, tmp_path):
    after = run("status", "--config", cfg)
    assert after.exit_code == 0
    assert "pending: none" in after.output
-   assert "partition node_metrics_1m." in after.output or "partition" not in after.output
+   assert "partition node_metrics_1m: none" in after.output.splitlines()
+
+   with psycopg.connect(pg_db, autocommit=True) as conn:
+      conn.execute(
+         "CREATE TABLE node_monitor.node_metrics_1m_y2026m11"
+         " PARTITION OF node_monitor.node_metrics_1m"
+         " FOR VALUES FROM ('2026-11-01') TO ('2026-12-01')"
+      )
+   with_partition = run("status", "--config", cfg)
+   lines = with_partition.output.splitlines()
+   line = next(
+      x for x in lines if x.startswith("partition node_metrics_1m.node_metrics_1m_y2026m11")
+   )
+   assert "2026-11-01" in line and "2026-12-01" in line
+   assert "partition node_metrics_1m: none" not in lines
 
 
 def test_bootstrap_command(pg_admin_url):
@@ -91,5 +107,5 @@ def test_bootstrap_command(pg_admin_url):
    finally:
       pg._drop_test_db(pg_admin_url, db)
       with pg._admin_connect(pg_admin_url) as conn:
-         conn.execute(f"DROP ROLE IF EXISTS {owner}")
-         conn.execute(f"DROP ROLE IF EXISTS {reader}")
+         for role in (owner, reader):
+            conn.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))

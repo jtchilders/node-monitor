@@ -211,11 +211,11 @@ def database_migrate(config_path) -> None:
 
 
 _PARTITIONS = """
-SELECT p.relname AS parent, c.relname AS child, pg_get_expr(c.relpartbound, c.oid)
-FROM pg_inherits i
-JOIN pg_class c ON c.oid = i.inhrelid
-JOIN pg_class p ON p.oid = i.inhparent
+SELECT p.relname, c.relname, pg_get_expr(c.relpartbound, c.oid)
+FROM pg_class p
 JOIN pg_namespace n ON n.oid = p.relnamespace
+LEFT JOIN pg_inherits i ON i.inhparent = p.oid
+LEFT JOIN pg_class c ON c.oid = i.inhrelid
 WHERE n.nspname = 'node_monitor' AND p.relkind = 'p'
 ORDER BY p.relname, c.relname
 """
@@ -237,6 +237,10 @@ def database_status(config_path) -> None:
    pending = [name for v, name in MIGRATIONS if v > version]
    click.echo("pending: " + (", ".join(pending) if pending else "none"))
    for parent, child, bound in partitions:
-      click.echo(f"partition {parent}.{child}: {bound}")
+      if child is None:
+         # Said outright so a missing partition is not mistaken for broken output.
+         click.echo(f"partition {parent}: none")
+      else:
+         click.echo(f"partition {parent}.{child}: {bound}")
    if pending:
       raise SystemExit(1)
