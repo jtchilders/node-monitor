@@ -3,7 +3,9 @@
 
 Accepts ssh's shape (`[options] target command...`). Environment knobs:
 FAKE_SSH_STDERR_BYTES  write that many bytes of "x" to stderr before running the command;
-FAKE_SSH_FAIL=1        print "Permission denied" to stderr and exit 255, as ssh does.
+FAKE_SSH_FAIL=1        print "Permission denied" to stderr and exit 255, as ssh does;
+FAKE_SSH_CHDIR=<dir>   run the command in <dir>/<target>, so relative probe paths give each
+                       node its own fake tree.
 """
 
 import os
@@ -33,6 +35,9 @@ def main(argv):
       sys.stderr.flush()
       return 255
 
+   base = os.environ.get("FAKE_SSH_CHDIR")
+   if base:
+      os.chdir(os.path.join(base, argv[i]))
    os.execvp("/bin/sh", ["sh", "-c", command])
 
 
