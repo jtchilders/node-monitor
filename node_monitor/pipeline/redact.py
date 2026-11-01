@@ -14,7 +14,9 @@ MASK = "***"
 # `keyStorePassword`, `clientSecret`). They must END the name: `--tokenizer`,
 # `TOKENIZERS_PARALLELISM` and `--max-tokens` are not secrets.
 _LONG_KEYWORD = (
-   r"(?:passphrase|password|passwd|secret|token|(?:api|access|secret|private|ssh)[-_]?key)"
+   r"(?:passphrase|password|passwd|secret|token|"
+   r"(?:api|access|secret|private|ssh|sse[-_]c|sse[-_]customer|customer|encryption|signing)"
+   r"[-_]?key)"
 )
 # Short keywords are common inside ordinary words (`--author`, `-keyfile`, `classpath`), so
 # they count only as the whole name or its last `-`/`_`/`.` segment (`--oauth-token` but not
@@ -86,7 +88,10 @@ _MYSQL_TOOLS = frozenset({"mysql", "mariadb", "mysqldump", "mysqladmin"})
 _MYSQL_PASSWORD = re.compile(r"(?<!\S)-p(\S+)")
 # sshpass takes the password as `-pSecret` or `-p Secret`. Only its own leading options are
 # searched, since a later `-p` belongs to the wrapped command (`sshpass -e ssh -p 22 host`).
-_SSHPASS_OPTIONS = re.compile(r"\s*\S+(?:[ \t]+-[fdPp][ \t]+\S+|[ \t]+-\S*)*")
+_SSHPASS_OPTIONS = re.compile(
+   r"\s*\S+(?:[ \t]+-[fdPp][ \t]+(?:\"[^\"]*\"|'[^']*'|\S+)"
+   r"|[ \t]+-(?:\"[^\"]*\"|'[^']*'|[^\s'\"])*)*"
+)
 _SSHPASS_PASSWORD = re.compile(r"(?<!\S)-p[ \t]*" + _VALUE)
 
 # Applied last, so they never fire inside text another rule has already masked.

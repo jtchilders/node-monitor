@@ -52,6 +52,17 @@ MASKED = [
       "openssl pkcs12 -passout pass:*** -in a",
    ),
    ("openssl rsa -passin pass:hunter2 -in a", "openssl rsa -passin pass:*** -in a"),
+   ("sshpass -p 'a b' ssh h", "sshpass -p *** ssh h"),
+   ('sshpass -p "a b c" ssh h', "sshpass -p *** ssh h"),
+   ("sshpass -P prompt -p y ssh h", "sshpass -P prompt -p *** ssh h"),
+   ("sshpass -d 3 -p x ssh h", "sshpass -d 3 -p *** ssh h"),
+   ("java -Dspring.datasource.password=x X", "java -Dspring.datasource.password=*** X"),
+   ("java -DclientSecret=x X", "java -DclientSecret=*** X"),
+   ("aws s3 cp --sse-c-key x", "aws s3 cp --sse-c-key ***"),
+   ("tool --encryption-key=abc", "tool --encryption-key=***"),
+   ("tool --signing_key k", "tool --signing_key ***"),
+   ("tool --customer-key k", "tool --customer-key ***"),
+   ("tool --sse-customer-key k", "tool --sse-customer-key ***"),
    ("sshpass -pSecret ssh h", "sshpass -p*** ssh h"),
    ("sshpass -p Secret ssh h", "sshpass -p *** ssh h"),
    ("/usr/bin/sshpass -p Secret ssh -p 22 h", "/usr/bin/sshpass -p *** ssh -p 22 h"),
@@ -82,6 +93,8 @@ UNTOUCHED = [
    "java -Dfile.encoding=UTF-8 X",
    "java -Dmy.auth=pw X",
    "java -Dauth=pw X",
+   "java -DDB_PASSWORD=x X",
+   "java -Dpass=x X",
    "tool --sort-key name",
    "tool --key path/obj",
    "openssl req -key file.pem",
@@ -164,6 +177,22 @@ def test_long_and_non_ascii_cmdlines():
    ],
 )
 def test_pathological_inputs_stay_fast(cmdline):
+   t = time.perf_counter()
+   R.redact(cmdline)
+   assert time.perf_counter() - t < 0.5
+
+
+@pytest.mark.parametrize(
+   "cmdline",
+   [
+      "java -D" + "a." * 50000,
+      "keytool" + " -storepass " * 10000,
+      "sshpass" + " -p " * 25000,
+      "sshpass" + " -P '" * 20000,
+      "x " + "-passin pass:" * 8000,
+   ],
+)
+def test_new_patterns_stay_fast(cmdline):
    t = time.perf_counter()
    R.redact(cmdline)
    assert time.perf_counter() - t < 0.5
