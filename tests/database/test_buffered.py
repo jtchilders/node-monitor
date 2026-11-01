@@ -1,3 +1,4 @@
+import json
 from datetime import timedelta
 
 import psycopg
@@ -6,6 +7,7 @@ from psycopg.rows import dict_row
 
 from node_monitor.config import RetentionConfig
 from node_monitor.database.buffered import BufferedWriter
+from node_monitor.database.codec import decode_record
 from node_monitor.database.connect import DatabaseUnavailable, connect
 from node_monitor.database.spool import Spool
 from node_monitor.database.writer import DatabaseWriter, WriteResult
@@ -38,6 +40,10 @@ def batch(name, t=0):
 
 def names(batches):
    return [b[-1].row["detail"]["name"] for b in batches]
+
+
+def _read(path):
+   return [decode_record(json.loads(line)) for line in path.read_text().splitlines()]
 
 
 def events_of(events, event_type):
@@ -267,6 +273,41 @@ def test_poisoned_fresh_batch_propagates_and_keeps_its_events(tmp_path):
    events = bw.submit(batch("C"), at(11))
    (recovered,) = events_of(events, "database_recovered")
    assert recovered.row["detail"]["replayed_batches"] == 1
+   assert len(events_of(events, "spool_batch_quarantined")) == 1
+
+
+def test_rejected_fresh_batch_is_kept_in_corrupt(tmp_path):
+   bw, w, spool = make(tmp_path)
+   bw.submit(batch("A"), at(0))
+   w.poison["B"] = psycopg.errors.UntranslatableCharacter("y" * 500)
+   with pytest.raises(psycopg.errors.UntranslatableCharacter):
+      bw.submit(batch("B"), at(10))
+   # Not spooled, so it is not retried, but not lost either.
+   assert spool.batch_count() == 0
+   (kept,) = (spool.directory / "corrupt").iterdir()
+   assert names([_read(kept)]) == ["B"]
+   events = bw.submit(batch("C"), at(11))
+   (quarantined,) = events_of(events, "spool_batch_quarantined")
+   assert quarantined.row["detail"] == {
+      "file": kept.name,
+      "error": "UntranslatableCharacter: " + "y" * 200,
+   }
+   assert names(w.written) == ["A", "C"]
+
+
+def test_unreadable_spool_file_is_reported(tmp_path):
+   bw, w, spool = make(tmp_path)
+   spool.append(batch("A"))
+   bad = spool.directory / "19990101T000000.000000-000001.jsonl"
+   bad.write_text("{not json\n")
+   events = bw.submit(batch("B"), at(0))
+   assert names(w.written) == ["A", "B"]
+   (quarantined,) = events_of(events, "spool_batch_quarantined")
+   assert quarantined.row["detail"]["file"] == bad.name
+   assert quarantined.row["detail"]["error"].startswith("JSONDecodeError: ")
+   assert (spool.directory / "corrupt" / bad.name).exists()
+   # Reported once.
+   assert events_of(bw.submit(batch("C"), at(1)), "spool_batch_quarantined") == []
 
 
 def test_rows_beyond_retention_event(tmp_path):
@@ -372,10 +413,12 @@ def test_backend_terminated_mid_session(tmp_path, migrated_db, pg_admin_url):
    try:
       assert bw.submit(batch("A", 0), at(0)) == []
       with psycopg.connect(pg_admin_url, autocommit=True) as admin:
-         # Only this test's own database; the timeout waits until the backend has gone.
+         # Only the writer's own session in this test's database; the timeout waits until
+         # the backend has gone.
          killed = admin.execute(
-            "SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE datname = %s",
-            (migrated_db.rsplit("/", 1)[1],),
+            "SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity"
+            " WHERE datname = %s AND backend_type = 'client backend' AND pid = %s",
+            (migrated_db.rsplit("/", 1)[1], writer._conn.info.backend_pid),
          ).fetchall()
       assert killed == [(True,)]
       events = bw.submit(batch("B", 60), at(60))

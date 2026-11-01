@@ -22,8 +22,21 @@ from node_monitor.pipeline.records import LIVE_NODE, LIVE_PROCESSES, Record
 log = logging.getLogger(__name__)
 
 _SUFFIX = ".jsonl"
-_NAME_RE = re.compile(r"^\d{8}T\d{6}\.\d{6}-(\d{6})\.jsonl$")
+# `<stamp>-<seq>.jsonl`, or `<stamp>-<seq>-L.jsonl` for a batch of live records only, so
+# eviction can tell them apart without reading files. Names written before the marker
+# existed have none and count as not live-only. Either way names sort in write order.
+_LIVE_MARK = "-L"
+_NAME_RE = re.compile(r"^\d{8}T\d{6}\.\d{6}-(\d{6})(?:-L)?\.jsonl$")
 _LIVE_KINDS = frozenset({LIVE_PROCESSES, LIVE_NODE})
+_ERROR_CHARS = 200
+
+
+def _describe(exc: BaseException) -> str:
+   return f"{type(exc).__name__}: {str(exc)[:_ERROR_CHARS]}"
+
+
+def _is_live_only(path: Path) -> bool:
+   return path.name.endswith(_LIVE_MARK + _SUFFIX)
 
 
 @dataclass(frozen=True)
@@ -40,6 +53,10 @@ class Spool:
       self.max_bytes = max_bytes
       self._lock = threading.Lock()
       self._seq = 0
+      # (file name, reason) of each batch pending() quarantined, until take_quarantined().
+      self._quarantined: list[tuple[str, str]] = []
+      # Unreadable batches that could not be moved to corrupt/: reported once, then skipped.
+      self._stuck: set[Path] = set()
       self._ensure_directory()
 
    def _ensure_directory(self) -> str | None:
@@ -86,35 +103,38 @@ class Spool:
    def batch_count(self) -> int:
       return len(self._batch_files())
 
-   def _read_kinds(self, path: Path) -> list[str] | None:
+   @staticmethod
+   def _count_records(path: Path) -> int:
+      """Lines in a batch, one record each; 0 if it cannot be read."""
       try:
-         with open(path, encoding="utf-8") as f:
-            return [json.loads(line)["kind"] for line in f if line.strip()]
-      except Exception:  # noqa: BLE001 - unreadable counts as not live-only
-         return None
+         with open(path, "rb") as f:
+            return sum(1 for line in f if line.strip())
+      except OSError:
+         return 0
 
    def _drop(self, path: Path) -> int | None:
       """Delete a batch and return its record count, or None if it could not be deleted."""
-      kinds = self._read_kinds(path)
+      count = self._count_records(path)
       try:
          path.unlink()
       except OSError:
          return None
-      return len(kinds) if kinds is not None else 0
+      return count
 
    def _make_room(self, needed: int) -> tuple[int, int]:
-      """Delete batches until `needed` more bytes fit; superseded live-only batches go first."""
+      """Delete batches until `needed` more bytes fit; superseded live-only batches go first.
+
+      Only file names and sizes are consulted, so an append costs the same however much is
+      spooled; just the batches being dropped are read, to count their records.
+      """
       files = self._batch_files()
       sizes = {p: self._size(p) for p in files}
       total = sum(sizes.values())
       batches = records = 0
-      live_only = []
-      for p in files:
-         kinds = self._read_kinds(p)
-         if kinds and all(k in _LIVE_KINDS for k in kinds):
-            live_only.append(p)
-      live_set = set(live_only)
-      for p in live_only + [p for p in files if p not in live_set]:
+      if total + needed <= self.max_bytes:
+         return batches, records
+      live_only = [p for p in files if _is_live_only(p)]
+      for p in live_only + [p for p in files if not _is_live_only(p)]:
          if total + needed <= self.max_bytes:
             break
          n = self._drop(p)
@@ -148,9 +168,10 @@ class Spool:
             if err:
                return SpoolResult(False, error=err)
          dropped_b, dropped_r = self._make_room(len(data))
+         live_only = all(r.kind in _LIVE_KINDS for r in records)
          for attempt in (1, 2):
             try:
-               self._write(data)
+               self._write(self.directory, data, live_only)
                break
             except FileNotFoundError as e:
                if attempt == 2 or self._ensure_directory():
@@ -159,11 +180,12 @@ class Spool:
                return SpoolResult(False, dropped_b, dropped_r, f"{type(e).__name__}: {e}")
       return SpoolResult(True, dropped_b, dropped_r)
 
-   def _write(self, data: bytes) -> None:
+   def _write(self, directory: Path, data: bytes, live_only: bool) -> str:
+      """Write a batch atomically under the next name in sequence; returns that name."""
       self._seq += 1
       stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
-      name = f"{stamp}-{self._seq:06d}{_SUFFIX}"
-      tmp = self.directory / f".{name}.tmp"
+      name = f"{stamp}-{self._seq:06d}{_LIVE_MARK if live_only else ''}{_SUFFIX}"
+      tmp = directory / f".{name}.tmp"
       try:
          fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
          try:
@@ -174,37 +196,80 @@ class Spool:
          except BaseException:
             tmp.unlink(missing_ok=True)
             raise
-         os.replace(tmp, self.directory / name)
+         os.replace(tmp, directory / name)
       except OSError:
          try:
             tmp.unlink(missing_ok=True)
          except OSError:
             pass
          raise
+      return name
 
-   def quarantine(self, path: Path) -> None:
+   def _corrupt_directory(self) -> Path:
+      corrupt = self.directory / "corrupt"
+      corrupt.mkdir(mode=0o700, exist_ok=True)
+      os.chmod(corrupt, 0o700)
+      return corrupt
+
+   def quarantine(self, path: Path) -> bool:
       """Move a batch into `corrupt/`, out of pending, size and count. Never raises.
 
       For a batch that can never be written; it is kept for inspection, not replayed.
+      Returns whether it was moved.
       """
-      corrupt = self.directory / "corrupt"
       try:
          path = Path(path)
-         corrupt.mkdir(mode=0o700, exist_ok=True)
-         os.chmod(corrupt, 0o700)
-         os.replace(path, corrupt / path.name)
+         os.replace(path, self._corrupt_directory() / path.name)
+         return True
       except Exception as e:  # noqa: BLE001 - the collector must survive any spool failure
          log.error("could not quarantine %s: %s", path, e)
+         return False
+
+   def quarantine_records(self, records: list[Record], reason: str) -> str | None:
+      """Store a batch that was never spooled directly in `corrupt/`. Never raises.
+
+      For a fresh batch the database rejected. It takes the next name in the spool's
+      sequence, so moved back into the spool directory it replays in its original place.
+      Returns the file name, or None if it could not be stored.
+      """
+      try:
+         payload = "".join(
+            json.dumps(encode_record(r), separators=(",", ":")) + "\n" for r in records
+         )
+         live_only = all(r.kind in _LIVE_KINDS for r in records)
+         with self._lock:
+            name = self._write(self._corrupt_directory(), payload.encode("utf-8"), live_only)
+      except Exception as e:  # noqa: BLE001 - the collector must survive any spool failure
+         log.error("could not quarantine %d records (%s): %s", len(records), reason, e)
+         return None
+      log.error("quarantined %d records as corrupt/%s: %s", len(records), name, reason)
+      return name
+
+   def take_quarantined(self) -> list[tuple[str, str]]:
+      """(file name, reason) of each batch pending() quarantined since the last call."""
+      with self._lock:
+         taken, self._quarantined = self._quarantined, []
+      return taken
 
    def pending(self) -> Iterator[tuple[Path, list[Record]]]:
-      """Yield (path, records) for each stored batch, oldest first."""
+      """Yield (path, records) for each stored batch, oldest first.
+
+      An unreadable batch is moved to `corrupt/` and reported by take_quarantined().
+      """
       for path in self._batch_files():
+         if path in self._stuck:
+            continue
          try:
             with open(path, encoding="utf-8") as f:
                batch = [decode_record(json.loads(line)) for line in f if line.strip()]
          except Exception as e:  # noqa: BLE001 - e.g. RecursionError on hostile JSON
             log.error("quarantining unreadable spool file %s: %s", path.name, e)
-            self.quarantine(path)
+            reason = _describe(e)
+            if not self.quarantine(path):
+               self._stuck.add(path)
+               reason += " (could not be moved to corrupt/)"
+            with self._lock:
+               self._quarantined.append((path.name, reason))
             continue
          yield path, batch
 

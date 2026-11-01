@@ -76,8 +76,10 @@ class BufferedWriter:
       """Write `records`, or spool them during an outage; return the events generated.
 
       Raises only for an error that is not an outage while writing `records` themselves
-      (a bug: the batch would fail the same way on every retry). The spool is never
-      allowed to raise.
+      (a bug: the batch would fail the same way on every retry). The batch is first kept
+      in the spool's `corrupt/` directory, so it is not lost, and a
+      spool_batch_quarantined event saying so is returned by the next call. The spool is
+      never allowed to raise.
       """
       require_aware(now)
       events, self._carried = self._carried, []
@@ -88,9 +90,9 @@ class BufferedWriter:
          else:
             self._attempt(records, now, events, beyond)
       except Exception:
-         self._carried = events + self._beyond_event(beyond, now)
+         self._carried = self._finish(events, beyond, now)
          raise
-      return events + self._beyond_event(beyond, now)
+      return self._finish(events, beyond, now)
 
    def status(self) -> dict:
       return {
@@ -112,11 +114,12 @@ class BufferedWriter:
                result = self._writer.write(records, now)
             except DatabaseUnavailable:
                raise
-            except Exception:
+            except Exception as exc:
                # A successful replay proves the database is back even though this batch
                # is bad; without one the outage state is left for the next call to settle.
                if wrote:
                   self._recover(now, events)
+               self._quarantine_fresh(records, exc, now, events)
                raise
             beyond.update(result.rows_beyond_retention)
             wrote = True
@@ -158,6 +161,14 @@ class BufferedWriter:
          self._replayed_records += len(batch)
          beyond.update(result.rows_beyond_retention)
       return wrote
+
+   def _quarantine_fresh(self, records, exc, now, events):
+      if not records:
+         return
+      name = self._spool.quarantine_records(records, _describe(exc))
+      events.append(
+         self._event(now, "spool_batch_quarantined", {"file": name, "error": _describe(exc)})
+      )
 
    def _store(self, records, now, events):
       if not records:
@@ -226,6 +237,12 @@ class BufferedWriter:
             "detail": detail,
          },
       )
+
+   def _finish(self, events, beyond, now):
+      """`events` plus those for spool files found unreadable and the retention drops."""
+      for name, reason in self._spool.take_quarantined():
+         events.append(self._event(now, "spool_batch_quarantined", {"file": name, "error": reason}))
+      return events + self._beyond_event(beyond, now)
 
    def _beyond_event(self, beyond, now):
       if not beyond:

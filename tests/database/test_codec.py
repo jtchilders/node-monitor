@@ -77,3 +77,24 @@ def test_to_db_value_does_not_mutate_its_input():
    original = {"a": [math.nan]}
    to_db_value(original)
    assert math.isnan(original["a"][0])
+
+
+def test_to_db_value_makes_strings_storable():
+   # A lone surrogate (a non-UTF-8 path read with surrogateescape) and a NUL character are
+   # both rejected by PostgreSQL; they become a replacement character and nothing.
+   assert to_db_value("/opt/caf\udce9/bin") == "/opt/caf�/bin"
+   assert to_db_value("a\x00b\x00") == "ab"
+   # A surrogate surrogateescape cannot map back to a byte is replaced too.
+   assert "\ud800" not in to_db_value("x\ud800y")
+   to_db_value("x\ud800y").encode("utf-8")
+
+
+def test_to_db_value_cleans_strings_at_any_depth_including_keys():
+   value = to_db_value({"k\udcff": ["a\x00", ("b\udcff", {"c\x00": "d"})]})
+   assert isinstance(value, Jsonb)
+   assert value.obj == {"k�": ["a", ["b�", {"c": "d"}]]}
+
+
+def test_to_db_value_stores_tuples_as_jsonb():
+   value = to_db_value((1, math.nan, "x\x00"))
+   assert isinstance(value, Jsonb) and value.obj == [1, None, "x"]

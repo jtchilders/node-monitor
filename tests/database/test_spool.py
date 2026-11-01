@@ -169,3 +169,122 @@ def test_quarantine_never_raises(tmp_path):
    spool = Spool(tmp_path, max_bytes=10**6)
    spool.quarantine(tmp_path / "missing.jsonl")
    spool.quarantine("not even a path object")
+
+
+def test_live_only_batches_are_marked_in_their_name(tmp_path):
+   spool = Spool(tmp_path, max_bytes=10**6)
+   spool.append([rec(LIVE_PROCESSES, 1), rec(LIVE_NODE, 1)])
+   spool.append([rec(LIVE_NODE, 2), rec("node_metrics", 2)])
+   live, mixed = [p.name for p, _ in spool.pending()]
+   assert live.endswith("-000001-L.jsonl")
+   assert mixed.endswith("-000002.jsonl")
+
+
+def test_append_that_fits_opens_no_existing_file(tmp_path, monkeypatch):
+   import builtins
+   import io
+
+   spool = Spool(tmp_path, max_bytes=10**7)
+   for i in range(50):
+      spool.append([rec(LIVE_NODE if i % 2 else "node_metrics", i, pad=100)])
+   existing = {str(p) for p, _ in spool.pending()}
+   assert len(existing) == 50
+   opened = []
+   real_builtin_open, real_io_open, real_os_open = builtins.open, io.open, os.open
+
+   def spy(real):
+      def wrapper(file, *args, **kwargs):
+         opened.append(str(file))
+         return real(file, *args, **kwargs)
+
+      return wrapper
+
+   monkeypatch.setattr(builtins, "open", spy(real_builtin_open))
+   monkeypatch.setattr(io, "open", spy(real_io_open))
+   monkeypatch.setattr(os, "open", spy(real_os_open))
+   assert spool.append([rec(n=99)]).stored
+   monkeypatch.undo()
+   assert opened, "the spy saw no open at all"
+   assert existing.isdisjoint(opened)
+
+
+def test_eviction_opens_no_batch_it_keeps(tmp_path, monkeypatch):
+   spool = Spool(tmp_path, max_bytes=2500)
+   spool.append([rec("node_metrics", 1, pad=1000)])
+   spool.append([rec(LIVE_PROCESSES, 2, pad=1000), rec(LIVE_NODE, 2)])
+   kept = [str(p) for p, _ in spool.pending()][0]
+   opened = []
+   real_open = open
+
+   def spy(file, *args, **kwargs):
+      opened.append(str(file))
+      return real_open(file, *args, **kwargs)
+
+   monkeypatch.setattr("builtins.open", spy)
+   res = spool.append([rec("node_metrics", 3, pad=1000)])
+   monkeypatch.undo()
+   assert res.dropped_batches == 1 and res.dropped_records == 2
+   assert kept not in opened
+
+
+def test_old_names_without_marker_are_kept_in_order_and_dropped_last(tmp_path):
+   # Written by an earlier version: live-only, but its name does not say so.
+   old = tmp_path / "19990101T000000.000000-000007.jsonl"
+   spool_tmp = Spool(tmp_path / "w", max_bytes=10**6)
+   spool_tmp.append([rec(LIVE_NODE, 0, pad=1000)])
+   ((written, _),) = spool_tmp.pending()
+   os.replace(written, old)
+   # A new spool continues the sequence past the old name.
+   spool = Spool(tmp_path, max_bytes=2500)
+   spool.append([rec(LIVE_NODE, 1, pad=1000)])
+   names = [p.name for p, _ in spool.pending()]
+   assert names[0] == old.name and names[1].endswith("-000008-L.jsonl")
+   # The marked live-only batch goes first; the unmarked one counts as ordinary data.
+   res = spool.append([rec("node_metrics", 2, pad=1000)])
+   assert res.dropped_batches == 1
+   assert [b[0].row["n"] for _, b in spool.pending()] == [0, 2]
+
+
+def test_pending_reports_quarantined_files_once(tmp_path):
+   spool = Spool(tmp_path, max_bytes=10**6)
+   spool.append([rec(n=1)])
+   bad = tmp_path / "19990101T000000.000000-000001.jsonl"
+   bad.write_text("{not json\n")
+   assert spool.take_quarantined() == []
+   list(spool.pending())
+   ((name, reason),) = spool.take_quarantined()
+   assert name == bad.name
+   assert reason.startswith("JSONDecodeError: ")
+   assert spool.take_quarantined() == []
+   list(spool.pending())
+   assert spool.take_quarantined() == []
+
+
+def test_quarantine_records_writes_into_corrupt_in_spool_order(tmp_path):
+   spool = Spool(tmp_path, max_bytes=10**6)
+   spool.append([rec(n=1)])
+   name = spool.quarantine_records([rec(n=2), rec(LIVE_NODE, 2)], "DataError: bad")
+   spool.append([rec(n=3)])
+   path = tmp_path / "corrupt" / name
+   assert stat.S_IMODE(path.stat().st_mode) == 0o600
+   assert stat.S_IMODE((tmp_path / "corrupt").stat().st_mode) == 0o700
+   # Out of the spool, but moved back it replays in its original place.
+   assert spool.batch_count() == 2
+   os.replace(path, tmp_path / name)
+   assert [b[0].row["n"] for _, b in spool.pending()] == [1, 2, 3]
+
+
+def test_quarantine_records_never_raises(tmp_path):
+   spool = Spool(tmp_path, max_bytes=10**6)
+   (tmp_path / "corrupt").write_text("a file where the directory should be")
+   assert spool.quarantine_records([rec()], "x") is None
+   assert spool.quarantine_records([Record("x", {"bad": object()})], "x") is None
+
+
+def test_unstorable_strings_round_trip_through_the_spool(tmp_path):
+   # Lone surrogates and NULs are cleaned only when written to the database.
+   spool = Spool(tmp_path, max_bytes=10**6)
+   value = "caf\udcff a\x00b"
+   assert spool.append([Record("node_metrics", {"exe": value})]).stored
+   ((_, (got,)),) = spool.pending()
+   assert got.row["exe"] == value
