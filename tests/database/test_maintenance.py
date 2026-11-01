@@ -42,7 +42,7 @@ def test_ensure_partitions_creates_three_months_per_table_idempotently(migrated_
 def test_month_boundaries_are_utc(migrated_db):
    with connect(migrated_db, autocommit=True) as conn:
       ensure_partitions(conn, NOW)
-      for ts in ("2026-11-30T23:59:59Z", "2026-12-01T00:00:00Z"):
+      for ts in ("2026-11-30T23:59:59+00:00", "2026-12-01T00:00:00+00:00"):
          conn.execute(
             "INSERT INTO collection_events (ts, system, event_type, detail)"
             " VALUES (%s, 's', 'e', '{}')",
