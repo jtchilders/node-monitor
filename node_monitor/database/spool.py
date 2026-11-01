@@ -40,19 +40,27 @@ class Spool:
       self.max_bytes = max_bytes
       self._lock = threading.Lock()
       self._seq = 0
-      self._init_error: str | None = None
+      self._ensure_directory()
+
+   def _ensure_directory(self) -> str | None:
+      """Create the directory if needed and re-seed the sequence; returns an error or None.
+
+      Called again at write time because the directory can vanish or be uncreatable at
+      startup, and the spool must recover once it is available rather than stay disabled.
+      """
       try:
          self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
          # mkdir's mode is masked by umask and ignored for an existing directory.
          os.chmod(self.directory, 0o700)
       except OSError as e:
-         self._init_error = str(e)
          log.error("spool directory %s unusable: %s", self.directory, e)
+         return f"{type(e).__name__}: {e}"
       # Continue past any existing file so a restart never reuses a name.
       for p in self._batch_files():
          m = _NAME_RE.match(p.name)
          if m:
             self._seq = max(self._seq, int(m.group(1)))
+      return None
 
    def _batch_files(self) -> list[Path]:
       try:
@@ -82,7 +90,7 @@ class Spool:
       try:
          with open(path, encoding="utf-8") as f:
             return [json.loads(line)["kind"] for line in f if line.strip()]
-      except (OSError, ValueError, KeyError, TypeError):
+      except Exception:  # noqa: BLE001 - unreadable counts as not live-only
          return None
 
    def _drop(self, path: Path) -> int | None:
@@ -126,8 +134,6 @@ class Spool:
          return SpoolResult(False, error=f"{type(e).__name__}: {e}")
 
    def _append(self, records: list[Record]) -> SpoolResult:
-      if self._init_error:
-         return SpoolResult(False, error=self._init_error)
       if not records:
          return SpoolResult(True)
       payload = "".join(json.dumps(encode_record(r), separators=(",", ":")) + "\n" for r in records)
@@ -137,30 +143,44 @@ class Spool:
             False, error=f"batch of {len(data)} bytes exceeds spool max_bytes {self.max_bytes}"
          )
       with self._lock:
+         if not self.directory.is_dir():
+            err = self._ensure_directory()
+            if err:
+               return SpoolResult(False, error=err)
          dropped_b, dropped_r = self._make_room(len(data))
-         self._seq += 1
-         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
-         name = f"{stamp}-{self._seq:06d}{_SUFFIX}"
-         tmp = self.directory / f".{name}.tmp"
-         final = self.directory / name
-         try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+         for attempt in (1, 2):
             try:
-               with os.fdopen(fd, "wb") as f:
-                  f.write(data)
-                  f.flush()
-                  os.fsync(f.fileno())
-            except BaseException:
-               tmp.unlink(missing_ok=True)
-               raise
-            os.replace(tmp, final)
-         except OSError as e:
-            try:
-               tmp.unlink(missing_ok=True)
-            except OSError:
-               pass
-            return SpoolResult(False, dropped_b, dropped_r, f"{type(e).__name__}: {e}")
+               self._write(data)
+               break
+            except FileNotFoundError as e:
+               if attempt == 2 or self._ensure_directory():
+                  return SpoolResult(False, dropped_b, dropped_r, f"{type(e).__name__}: {e}")
+            except OSError as e:
+               return SpoolResult(False, dropped_b, dropped_r, f"{type(e).__name__}: {e}")
       return SpoolResult(True, dropped_b, dropped_r)
+
+   def _write(self, data: bytes) -> None:
+      self._seq += 1
+      stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
+      name = f"{stamp}-{self._seq:06d}{_SUFFIX}"
+      tmp = self.directory / f".{name}.tmp"
+      try:
+         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+         try:
+            with os.fdopen(fd, "wb") as f:
+               f.write(data)
+               f.flush()
+               os.fsync(f.fileno())
+         except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+         os.replace(tmp, self.directory / name)
+      except OSError:
+         try:
+            tmp.unlink(missing_ok=True)
+         except OSError:
+            pass
+         raise
 
    def _quarantine(self, path: Path) -> None:
       corrupt = self.directory / "corrupt"
@@ -177,7 +197,7 @@ class Spool:
          try:
             with open(path, encoding="utf-8") as f:
                batch = [decode_record(json.loads(line)) for line in f if line.strip()]
-         except (OSError, ValueError, KeyError, TypeError) as e:
+         except Exception as e:  # noqa: BLE001 - e.g. RecursionError on hostile JSON
             log.error("quarantining unreadable spool file %s: %s", path.name, e)
             self._quarantine(path)
             continue

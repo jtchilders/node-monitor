@@ -115,3 +115,37 @@ def test_restart_never_reuses_a_name(tmp_path):
    b.append([rec(n=2)])
    assert b.batch_count() == 2
    assert [x[0].row["n"] for _, x in b.pending()] == [1, 2]
+
+
+def test_recovers_when_directory_deleted(tmp_path):
+   import shutil
+
+   d = tmp_path / "spool"
+   spool = Spool(d, max_bytes=10**6)
+   assert spool.append([rec(n=1)]).stored
+   shutil.rmtree(d)
+   assert spool.append([rec(n=2)]).stored
+   assert [b[0].row["n"] for _, b in spool.pending()] == [2]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permission bits")
+def test_recovers_when_directory_uncreatable_at_startup(tmp_path):
+   parent = tmp_path / "ro"
+   parent.mkdir()
+   os.chmod(parent, 0o500)
+   try:
+      spool = Spool(parent / "sub" / "spool", max_bytes=10**6)
+      assert not spool.append([rec()]).stored
+   finally:
+      os.chmod(parent, 0o700)
+   assert spool.append([rec(n=1)]).stored
+   assert [b[0].row["n"] for _, b in spool.pending()] == [1]
+
+
+def test_deeply_nested_corrupt_file_quarantined_once(tmp_path):
+   spool = Spool(tmp_path, max_bytes=10**6)
+   bad = tmp_path / "19990101T000000.000000-000001.jsonl"
+   bad.write_text("[" * 100000 + "\n")
+   assert list(spool.pending()) == []
+   assert list(spool.pending()) == []
+   assert [p.name for p in (tmp_path / "corrupt").iterdir()] == [bad.name]
