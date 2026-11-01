@@ -6,7 +6,8 @@
 --
 -- Column sets follow the pipeline's record tuples (LIVE_PROCESS_COLUMNS,
 -- NODE_METRICS_COLUMNS, USER_USAGE_COLUMNS, NODE_USAGE_COLUMNS); a test keeps them equal.
--- Counters that can grow are bigint; pid, ppid and uid fit integer.
+-- Counters that can grow are bigint, and so is uid: uid_t is unsigned 32-bit
+-- (nfsnobody is 4294967294). pid fits integer.
 --
 -- Time-series parents are range-partitioned by month on their time column. They get no
 -- partitions here and deliberately no DEFAULT partition: a row for a month with no
@@ -22,13 +23,13 @@ CREATE TABLE node_monitor.live_processes (
    ts timestamptz NOT NULL,
    pid integer NOT NULL,
    start_time bigint NOT NULL,
-   uid integer,
+   uid bigint,
    username text,
    comm text,
    exe text,
    argv0 text,
    cmdline text,
-   ppid integer,
+   ppid bigint,
    parent_comm text,
    parent_exe text,
    parent_kind text,

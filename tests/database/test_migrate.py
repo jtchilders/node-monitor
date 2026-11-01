@@ -289,11 +289,10 @@ def test_column_types(migrated_db):
    allowed.add("timestamp with time zone")
    assert {d for d in types.values()} <= allowed
    integer = {k for k, d in types.items() if d == "integer"}
-   assert {
-      ("live_processes", "pid"),
-      ("live_processes", "ppid"),
-      ("live_processes", "uid"),
-   } <= integer
+   assert ("live_processes", "pid") in integer
+   # uid_t is unsigned 32-bit (nfsnobody is 4294967294); ppid is bigint as well.
+   assert types[("live_processes", "uid")] == "bigint"
+   assert types[("live_processes", "ppid")] == "bigint"
    assert all(
       t in ("live_processes", "node_hardware", "live_nodes", "schema_migrations")
       for t, _ in integer
@@ -372,3 +371,12 @@ def test_collection_events_generate_ids_and_allow_collector_level_rows(migrated_
          for _ in range(2)
       ]
    assert len(set(ids)) == 2 and all(isinstance(i, int) for i in ids)
+
+
+def test_live_processes_stores_an_unsigned_32_bit_uid(migrated_db):
+   with connect(migrated_db) as conn:
+      conn.execute(
+         "INSERT INTO live_processes (system, node, ts, pid, start_time, uid, ppid)"
+         " VALUES ('s', 'n', now(), 1, 1, 4294967294, 1)"
+      )
+      assert conn.execute("SELECT uid FROM live_processes").fetchone() == (4294967294,)
