@@ -47,6 +47,36 @@ def test_bootstrap_is_idempotent(pg_admin_url, names):
    assert bootstrap(pg_admin_url, **names) == []
 
 
+def test_database_uses_builtin_c_utf8_collation(pg_admin_url, names):
+   bootstrap(pg_admin_url, **names)
+   with _admin_connect(pg_admin_url) as conn:
+      row = conn.execute(
+         "SELECT datlocprovider, datlocale, pg_encoding_to_char(encoding)"
+         " FROM pg_database WHERE datname = %s",
+         (names["database"],),
+      ).fetchone()
+   assert row == ("b", "C.UTF-8", "UTF8")
+
+
+def test_database_settings_and_public_privileges(pg_admin_url, names):
+   bootstrap(pg_admin_url, **names)
+   with connect(_url(pg_admin_url, names, "owner")) as conn:
+      migrate(conn)
+   # A plain connection, without the session options connect() adds, still finds the
+   # tables unqualified and reads times in UTC.
+   with psycopg.connect(_url(pg_admin_url, names, "reader")) as conn:
+      assert conn.execute("SELECT count(*) FROM live_nodes").fetchone()[0] == 0
+      assert conn.execute("SHOW TimeZone").fetchone()[0] == "UTC"
+   with _admin_connect(pg_admin_url) as conn:
+      for privilege in ("CONNECT", "TEMP"):
+         assert not conn.execute(
+            "SELECT has_database_privilege('public', %s, %s)", (names["database"], privilege)
+         ).fetchone()[0]
+      assert conn.execute(
+         "SELECT has_database_privilege(%s, %s, 'CONNECT')", (names["owner"], names["database"])
+      ).fetchone()[0]
+
+
 def test_rejects_bad_names(pg_admin_url):
    with pytest.raises(ValueError):
       bootstrap(pg_admin_url, database='x"; DROP DATABASE postgres; --')

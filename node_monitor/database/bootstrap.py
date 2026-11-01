@@ -50,8 +50,9 @@ def bootstrap(
 ) -> list[str]:
    """Create what is missing and return a description of each change made.
 
-   Existing roles and databases are never altered. Grants are idempotent and are
-   re-applied every run, but reported only when something was created.
+   Existing roles are never altered and an existing database is never re-created. Grants
+   and the database's search_path and timezone settings are idempotent and are re-applied
+   every run, but reported only when something was created.
    """
    for kind, name in (("database", database), ("owner", owner), ("reader", reader)):
       _check_name(kind, name)
@@ -63,11 +64,25 @@ def bootstrap(
          if _create_role(conn, name):
             actions.append(f"created role {name}")
       if not conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,)).fetchone():
-         conn.execute(sql.SQL("CREATE DATABASE {} OWNER {}").format(db, own))
+         # template0 with the builtin C.UTF-8 locale: indexes on text do not depend on the
+         # host's glibc collation (an upgrade would force a reindex), and template1 cannot
+         # be copied while anyone is connected to it, as happens on a shared server.
+         conn.execute(
+            sql.SQL(
+               "CREATE DATABASE {} OWNER {} TEMPLATE template0 ENCODING 'UTF8'"
+               " LOCALE_PROVIDER builtin BUILTIN_LOCALE 'C.UTF-8'"
+            ).format(db, own)
+         )
          actions.append(f"created database {database}")
 
    with psycopg.connect(_with_dbname(admin_url, database), autocommit=True) as conn:
+      # Only the two roles may connect, and clients that set no options of their own still
+      # find the tables unqualified and read times in UTC.
+      conn.execute(sql.SQL("REVOKE CONNECT, TEMP ON DATABASE {} FROM PUBLIC").format(db))
+      conn.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(db, own))
       conn.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(db, rd))
+      conn.execute(sql.SQL("ALTER DATABASE {} SET search_path = node_monitor, public").format(db))
+      conn.execute(sql.SQL("ALTER DATABASE {} SET timezone = 'UTC'").format(db))
       if not conn.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (SCHEMA,)).fetchone():
          conn.execute(
             sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(sql.Identifier(SCHEMA), own)
