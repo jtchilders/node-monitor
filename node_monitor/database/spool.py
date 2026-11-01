@@ -182,13 +182,18 @@ class Spool:
             pass
          raise
 
-   def _quarantine(self, path: Path) -> None:
+   def quarantine(self, path: Path) -> None:
+      """Move a batch into `corrupt/`, out of pending, size and count. Never raises.
+
+      For a batch that can never be written; it is kept for inspection, not replayed.
+      """
       corrupt = self.directory / "corrupt"
       try:
+         path = Path(path)
          corrupt.mkdir(mode=0o700, exist_ok=True)
          os.chmod(corrupt, 0o700)
          os.replace(path, corrupt / path.name)
-      except OSError as e:
+      except Exception as e:  # noqa: BLE001 - the collector must survive any spool failure
          log.error("could not quarantine %s: %s", path, e)
 
    def pending(self) -> Iterator[tuple[Path, list[Record]]]:
@@ -199,7 +204,7 @@ class Spool:
                batch = [decode_record(json.loads(line)) for line in f if line.strip()]
          except Exception as e:  # noqa: BLE001 - e.g. RecursionError on hostile JSON
             log.error("quarantining unreadable spool file %s: %s", path.name, e)
-            self._quarantine(path)
+            self.quarantine(path)
             continue
          yield path, batch
 

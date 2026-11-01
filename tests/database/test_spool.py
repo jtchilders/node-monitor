@@ -149,3 +149,23 @@ def test_deeply_nested_corrupt_file_quarantined_once(tmp_path):
    assert list(spool.pending()) == []
    assert list(spool.pending()) == []
    assert [p.name for p in (tmp_path / "corrupt").iterdir()] == [bad.name]
+
+
+def test_quarantine_moves_batch_out_of_the_spool(tmp_path):
+   spool = Spool(tmp_path, max_bytes=10**6)
+   spool.append([rec(n=1)])
+   spool.append([rec(n=2)])
+   path, _ = next(spool.pending())
+   spool.quarantine(path)
+   assert not path.exists()
+   assert (tmp_path / "corrupt" / path.name).exists()
+   assert [b[0].row["n"] for _, b in spool.pending()] == [2]
+   assert spool.batch_count() == 1
+   ((remaining, _),) = spool.pending()
+   assert spool.size_bytes() == remaining.stat().st_size
+
+
+def test_quarantine_never_raises(tmp_path):
+   spool = Spool(tmp_path, max_bytes=10**6)
+   spool.quarantine(tmp_path / "missing.jsonl")
+   spool.quarantine("not even a path object")
