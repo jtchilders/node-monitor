@@ -631,8 +631,13 @@ def daemon_status(config_path) -> None:
       else:
          if row is None:
             click.echo(f"heartbeat: none recorded for system {config.system}")
-         elif _print_heartbeat(row, datetime.now(timezone.utc)) < _HEARTBEAT_FRESH_SEC:
-            healthy = True
+         else:
+            age = _print_heartbeat(row, datetime.now(timezone.utc))
+            if (row.get("status") or {}).get("state") == "stopped":
+               # A clean shutdown's last heartbeat is fresh for a while yet means no collector.
+               click.echo("  collector stopped: the last heartbeat was written at shutdown")
+            elif age < _HEARTBEAT_FRESH_SEC:
+               healthy = True
    if not healthy:
       raise SystemExit(1)
 

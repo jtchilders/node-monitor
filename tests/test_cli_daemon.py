@@ -138,14 +138,14 @@ def test_daemon_status_reports_unreachable_database(tmp_path, workdir):
    assert "database unreachable" in result.output
 
 
-def test_daemon_status_shows_heartbeat(tmp_path, workdir, migrated_db):
+def _put_heartbeat(url, state):
    from datetime import datetime, timezone
 
    from node_monitor.database.connect import connect
    from node_monitor.database.maintenance import write_heartbeat
 
    now = datetime.now(timezone.utc)
-   with connect(migrated_db, autocommit=True) as conn:
+   with connect(url, autocommit=True) as conn:
       write_heartbeat(
          conn,
          system="polaris",
@@ -154,12 +154,24 @@ def test_daemon_status_shows_heartbeat(tmp_path, workdir, migrated_db):
          started_at=now,
          now=now,
          status={
-            "state": "running",
-            "sessions": {"login-01": "up"},
+            "state": state,
+            "sessions": {"login-01": "up" if state == "running" else "stopped"},
             "connected": 1,
             "spooled_batches": 3,
          },
       )
+
+
+def test_daemon_status_fresh_but_stopped_heartbeat_exits_1(tmp_path, workdir, migrated_db):
+   _put_heartbeat(migrated_db, "stopped")
+   cfg = _config(tmp_path, workdir, web={"database_url": migrated_db})
+   result = run("daemon", "status", "--config", cfg)
+   assert result.exit_code == 1, result.output
+   assert "collector stopped" in result.output
+
+
+def test_daemon_status_shows_heartbeat(tmp_path, workdir, migrated_db):
+   _put_heartbeat(migrated_db, "running")
    cfg = _config(tmp_path, workdir, web={"database_url": migrated_db})
    result = run("daemon", "status", "--config", cfg)
    assert result.exit_code == 0, result.output  # fresh heartbeat, though no local process

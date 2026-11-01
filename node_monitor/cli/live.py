@@ -90,6 +90,8 @@ def _collector(row: dict | None, now: datetime) -> dict | None:
       "last_seen": row["last_seen"],
       "age_sec": age,
       "stale": age > HEARTBEAT_STALE_SEC,
+      # Written by a clean shutdown: however fresh, no collector is running.
+      "stopped": status.get("state") == "stopped",
       "state": status.get("state"),
       "connected": status.get("connected"),
       "spooled_batches": status.get("spooled_batches"),
@@ -100,7 +102,8 @@ def _collector(row: dict | None, now: datetime) -> dict | None:
 @click.command()
 @common_options
 def status(config_path, fmt) -> None:
-   """Collector health and per-node session state; exit 1 if the heartbeat is missing or stale."""
+   """Collector health and per-node session state; exit 1 if the heartbeat is missing or
+   stale, or the collector stopped."""
    config = _load(config_path)
    with _reader(config) as conn:
       hb = queries.heartbeat(conn, config.system)
@@ -125,7 +128,9 @@ def status(config_path, fmt) -> None:
       if collector is None:
          click.echo(f"collector: no heartbeat recorded for system {config.system}")
       elif fmt == "table":
-         flag = "  STALE" if collector["stale"] else ""
+         flag = ("  STALE" if collector["stale"] else "") + (
+            "  STOPPED" if collector["stopped"] else ""
+         )
          click.echo(
             f"collector: {visible(str(collector['host']))}  "
             f"version {visible(str(collector['version']))}  "
@@ -139,7 +144,7 @@ def status(config_path, fmt) -> None:
       if fmt == "table":
          click.echo("")
       render(nodes, columns, fmt)
-   if collector is None or collector["stale"]:
+   if collector is None or collector["stale"] or collector["stopped"]:
       raise SystemExit(1)
 
 

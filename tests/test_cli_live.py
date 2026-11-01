@@ -57,6 +57,16 @@ def test_status_stale_heartbeat_exit_1(live):
    assert "STALE" in result.output
 
 
+def test_status_fresh_but_stopped_heartbeat_exit_1(live):
+   url, now, cfg = live
+   put_heartbeat(url, now, status={"state": "stopped", "sessions": {"N1": "stopped"}})
+   result = run("status", "--config", cfg)
+   assert result.exit_code == 1
+   assert "STOPPED" in result.output and "STALE" not in result.output
+   data = json.loads(run("status", "--config", cfg, "--format", "json").output)
+   assert data["collector"]["stopped"] is True and data["collector"]["stale"] is False
+
+
 def test_status_missing_heartbeat_exit_1(live):
    _, _, cfg = live
    result = run("status", "--config", cfg)
@@ -71,6 +81,7 @@ def test_status_json(live):
    assert result.exit_code == 0, result.output
    data = json.loads(result.output)
    assert data["collector"]["host"] == "collector-1" and data["collector"]["stale"] is False
+   assert data["collector"]["stopped"] is False
    assert [n["label"] for n in data["nodes"]] == ["N1", "N2"]
 
 
