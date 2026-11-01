@@ -36,7 +36,7 @@ check. `--format json` adds the per-session RSS series and rotations by reason.
 
 ```bash
 node-monitor soak replay ~/node-monitor/logs/soak/<timestamp> [--config PATH] \
-   [--write-records /tmp/records.jsonl]
+   [--write-records /tmp/records.jsonl] [--write-db]
 ```
 
 `soak replay` feeds every recorded line through the per-node pipeline (classification,
@@ -45,6 +45,14 @@ redaction, minute and 5-minute aggregation) and prints the storage record counts
 but still sensitive command lines, so the file is owner-only. A capture recorded without
 `--full-census` has no process rows, so it yields node metrics but no process or usage
 records.
+
+`--write-db` also writes the records to PostgreSQL through `database.url`, exactly as the
+collector will. The schema must be migrated first (see [Database](#database)); missing
+monthly partitions are created. Retention is measured back from the current time, not the
+capture's, so rows older than `retention.*_days` are counted as `rows_beyond_retention`
+and not written. If the database becomes unavailable partway, the remaining batches are
+spooled to `<working_dir>/state/spool-replay` and the command exits 1; running it again
+replays the spool first.
 
 ## Configuration keys added for M1
 
@@ -65,6 +73,8 @@ used: `node_monitor_owner` (owns the schema; the collector and migrations) and
 
 - `database.url`: owner-role URL, e.g. `postgresql://node_monitor_owner@localhost/node_monitor`
 - `web.database_url`: reader-role URL
+- `database.connect_timeout_sec` (default 10): connection timeout, rounded up to whole
+  seconds; must be a finite positive number
 - `retention.*_days` (defaults 730 / 730 / 180) and `spool.max_bytes` (default 1 GiB)
 
 `NODE_MONITOR_DB_URL` and `NODE_MONITOR_WEB_DB_URL` override the two URLs. If a URL in
@@ -79,4 +89,24 @@ node-monitor database status     # schema version and connectivity
 ```
 
 `database migrate` must run with the owner-role URL (`database.url`), so that tables and
-partitions get the reader's default privilege.
+partitions get the reader's default privilege; it refuses to run as any other role.
+`database bootstrap` creates the database from `template0` with the builtin `C.UTF-8`
+locale (PostgreSQL 17+), so its text indexes do not depend on the host's glibc.
+
+### Spool
+
+While PostgreSQL is unreachable, record batches are written to an on-disk spool and
+replayed, oldest first, once it answers again. The collector daemon (M1c) spools to
+`<working_dir>/state/spool`; `soak replay --write-db` uses `<working_dir>/state/spool-replay`
+so a replay never mixes with live data. Each batch is one owner-only
+`<UTC time>-<sequence>.jsonl` file (`-L` before `.jsonl` marks a batch of live records
+only). Above `spool.max_bytes`, live-only batches, which newer ones supersede, are dropped
+first, then the oldest; every drop is recorded as a `spool_dropped` collection event.
+
+A batch that can never be written goes to the spool's `corrupt/` subdirectory, with a
+`spool_batch_quarantined` collection event naming the file and the error: an unreadable
+spool file, a spooled batch the database rejects, or a fresh batch the database rejects
+(the collector then also logs and raises the error). `corrupt/` is not counted towards
+`spool.max_bytes` and is never cleaned up automatically. To retry a batch once the cause is
+fixed, move its file back into the spool directory; names sort in write order, so it is
+replayed in its original place on the next write.

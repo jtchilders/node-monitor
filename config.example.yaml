@@ -22,6 +22,7 @@ working_dir: ~/node-monitor          # logs/ and state/ live here
 # Env overrides: NODE_MONITOR_DB_URL, NODE_MONITOR_WEB_DB_URL.
 database:
   url: postgresql://node_monitor_owner@localhost/node_monitor
+  connect_timeout_sec: 10            # libpq rounds up to whole seconds
 web:
   database_url: postgresql://node_monitor_reader@localhost/node_monitor
   host: 127.0.0.1
