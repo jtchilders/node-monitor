@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import node_monitor
 from node_monitor.config import ConfigError, find_config_path, load_config
 
 MINIMAL = {
@@ -46,7 +47,7 @@ def test_spec_sections_not_used_yet_are_accepted(tmp_path):
 
 
 def test_example_config_loads(tmp_path):
-   cfg = load_config(str(Path(__file__).parent.parent / "config.example.yaml"))
+   cfg = load_config(str(Path(node_monitor.__file__).parent / "config_template.yaml"))
    assert [n.label for n in cfg.nodes] == ["login-01", "login-02", "login-04"]
    assert cfg.nodes[0].ssh_target == "polaris-login-01.head"
    assert cfg.ssh.identity_file == str(Path("~/.ssh/id_ed25519_polaris").expanduser())

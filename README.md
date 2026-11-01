@@ -24,7 +24,7 @@ node-monitor soak report ~/node-monitor/logs/soak/<timestamp> [--format json]
 `soak run` writes `manifest.json` and one `<label>-<YYYYMMDD>.jsonl` per node per UTC day
 into the out dir (default `<working_dir>/logs/soak/<UTC timestamp>`, or `--out-dir`).
 Censuses are stored as summaries unless `--full-census` is given. The config comes from
-`--config` or the usual search path (see `config.example.yaml`).
+`--config` or the usual search path (`node-monitor config --create` writes a commented template).
 
 `soak report` prints one row per node: coverage of expected counter messages, largest gap,
 sessions, losses, rotations, reboots, probe CPU per hour, peak probe RSS, census scan p95

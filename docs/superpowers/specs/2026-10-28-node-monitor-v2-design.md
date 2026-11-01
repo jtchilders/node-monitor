@@ -403,10 +403,11 @@ pattern:
 - `node-monitor-daemon.service`: `ExecStart=… node-monitor daemon start
   --foreground`, `Restart=always`, `RestartSec=15`,
   `StartLimitIntervalSec=0`, explicit `PATH`, logs appended under
-  `~/node-monitor/logs/`. It waits for PostgreSQL reachability in
-  `ExecStartPre` with a bounded loop but does **not** `Requires=` pbs_monitor's
+  `~/node-monitor/logs/`. `ExecStartPre=-… node-monitor database wait
+  --timeout 60` bounds the wait for PostgreSQL (the `-` means a database that stays down
+  never blocks the start); the unit does **not** `Requires=` pbs_monitor's
   Postgres unit, and the daemon itself tolerates DB absence.
-- `node-monitor-web.service` (optional).
+- `node-monitor-web.service` (optional) arrives with M2.
 - `rearm.sh`: re-enables linger and restarts units after maintenance.
 
 Units are installed into `~/.config/systemd/user/` (on `$HOME`, which
