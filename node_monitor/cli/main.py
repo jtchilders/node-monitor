@@ -15,6 +15,7 @@ from pathlib import Path
 
 import click
 import psycopg
+import uvicorn
 
 from node_monitor.cli import live
 from node_monitor.collector.daemon import Daemon
@@ -633,6 +634,24 @@ def daemon_status(config_path) -> None:
                healthy = True
    if not healthy:
       raise SystemExit(1)
+
+
+@cli.command("web")
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", type=int, default=9998, show_default=True)
+@click.option("--config", "config_path", type=click.Path(), default=None)
+def web_command(host, port, config_path) -> None:
+   """Run the web dashboard (loopback by default)."""
+   try:
+      config = load_config(config_path)
+   except ConfigError as exc:
+      raise click.ClickException(str(exc)) from exc
+   if not config.web.database_url:
+      raise click.ClickException(f"web.database_url is not set in {config.source_path}")
+   from node_monitor.web.app import create_app
+
+   app = create_app(config)
+   uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
