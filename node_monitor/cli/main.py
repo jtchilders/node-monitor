@@ -15,7 +15,6 @@ from pathlib import Path
 
 import click
 import psycopg
-import uvicorn
 
 from node_monitor.cli import live
 from node_monitor.collector.daemon import Daemon
@@ -648,6 +647,8 @@ def web_command(host, port, config_path) -> None:
       raise click.ClickException(str(exc)) from exc
    if not config.web.database_url:
       raise click.ClickException(f"web.database_url is not set in {config.source_path}")
+   import uvicorn
+
    from node_monitor.web.app import create_app
 
    app = create_app(config)

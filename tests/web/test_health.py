@@ -155,12 +155,11 @@ def test_web_unreachable_db_still_starts(tmp_path):
    # request time. The CLI only validates that web.database_url is present.
    cfg = _config(tmp_path, "postgresql://localhost:1/x")
    # We patch uvicorn.run so the test does not actually start a server.
-   with mock.patch("node_monitor.cli.main.uvicorn") as m:
-      m.run = mock.MagicMock()
+   with mock.patch("uvicorn.run") as m:
       result = CliRunner().invoke(cli, ["web", "--config", cfg, "--port", "19999"])
       assert result.exit_code == 0, result.output
-      assert m.run.called
-      kwargs = m.run.call_args
+      assert m.called
+      kwargs = m.call_args
       # uvicorn.run(app, host=..., port=...)
       assert kwargs is not None
 

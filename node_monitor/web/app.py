@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from node_monitor.config import Config, find_config_path, load_config
+from node_monitor.database.connect import DatabaseUnavailable
 
 _HEARTBEAT_STALE_SEC = 180
 _NODE_STALE_SEC = 120
@@ -38,14 +39,12 @@ def create_app(config: Config | None = None) -> FastAPI:
          }
       try:
          from node_monitor.database import queries
-         from node_monitor.database.connect import connect
+         from node_monitor.web.deps import web_reader
 
-         with connect(
-            url, connect_timeout_sec=cfg.database.connect_timeout_sec, autocommit=True
-         ) as conn:
+         with web_reader(cfg) as conn:
             hb = queries.heartbeat(conn, cfg.system)
             rows = queries.node_states(conn, cfg.system)
-      except (psycopg.Error, Exception):
+      except (psycopg.Error, DatabaseUnavailable, OSError):
          return {
             "ok": False,
             "heartbeat_age_s": None,
@@ -70,7 +69,7 @@ def create_app(config: Config | None = None) -> FastAPI:
          if updated_age_s > _NODE_STALE_SEC:
             state = "stale"
          else:
-            state = row["session_state"]
+            state = row["session_state"] or "unknown"
          nodes.append({"label": row["label"], "state": state, "updated_age_s": updated_age_s})
 
       return {
