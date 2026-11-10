@@ -5,6 +5,7 @@ import { renderProcessTable, filterProcesses } from "./list.js";
 let allProcesses = [];
 let filtered = [];
 let mode = "process"; // process | user
+let selectedNode = "__all";
 let dotsCanvas = null;
 let pollTimer = null;
 let abortCtrl = null;
@@ -84,7 +85,11 @@ async function refresh() {
 
 function applyFilter() {
    const q = document.getElementById("process-filter")?.value || "";
-   filtered = filterProcesses(allProcesses, q);
+   let base = allProcesses;
+   if (selectedNode !== "__all") {
+      base = base.filter(p => (p.label || p.node) === selectedNode || p.node === selectedNode);
+   }
+   filtered = filterProcesses(base, q);
    const dotsEl = document.getElementById("dots-container");
    if (dotsEl && dotsCanvas) dotsCanvas.setProcesses(filtered);
    const tableEl = document.getElementById("process-table-container");
@@ -130,6 +135,27 @@ function init() {
          applyFilter();
       });
    }
+   // node tabs — also link to detail on double-click
+   const tabs = document.getElementById("node-tabs");
+   if (tabs) {
+      tabs.addEventListener("click", (ev) => {
+         const btn = ev.target.closest("[data-node]");
+         if (!btn) return;
+         selectedNode = btn.dataset.node;
+         tabs.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b === btn));
+         applyFilter();
+      });
+      tabs.addEventListener("dblclick", (ev) => {
+         const btn = ev.target.closest("[data-node]");
+         if (!btn || btn.dataset.node === "__all") return;
+         window.location.href = "/node/" + encodeURIComponent(btn.dataset.node);
+      });
+   }
+   // make per-node cards clickable to node detail
+   document.getElementById("per-node-cards")?.addEventListener("click", (ev) => {
+      const card = ev.target.closest("[data-node]");
+      if (card) window.location.href = "/node/" + encodeURIComponent(card.dataset.node);
+   });
 
    // initial from server-rendered initial data if present
    if (window.__INITIAL_DATA__ && window.__INITIAL_DATA__.processes) {

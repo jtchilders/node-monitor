@@ -40,6 +40,10 @@
       {% endfor %}
       </div>
     </div>
+    <div class="tab-bar" id="node-tabs" style="margin: 0.5rem 0 0.5rem 0.75rem;">
+      <button class="tab-btn active" data-node="__all">All nodes</button>
+      {% for n in nodes %}<button class="tab-btn" data-node="{{ n.label }}">{{ n.label }}</button>{% endfor %}
+    </div>
     <div id="dots-container" class="canvas-container"></div>
   </section>
 
