@@ -54,6 +54,16 @@ node-monitor daemon start
 
 A daemon started while PostgreSQL is still down is fine: it spools and catches up.
 
+## Web
+
+```bash
+node-monitor web --port 9998 &
+curl -s http://127.0.0.1:9998/api/health | python3 -m json.tool
+# stop: kill %1  or  pkill -f "node-monitor web"
+```
+
+Loopback only, read-only role (`web.database_url`). Vendor pins `vue@3.4.38` + `chart.js@4.4.9` (no CDN).
+
 ## Pitfalls
 
 - Do not run a soak and the daemon at the same time: they take over each other's probes on

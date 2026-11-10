@@ -90,6 +90,16 @@ node-monitor top --sort rss --limit 10
 node-monitor idle --min-idle 2h --format csv
 ```
 
+## Web dashboard
+
+```bash
+node-monitor web --port 9998   # loopback only, read-only role
+```
+
+Opens `http://127.0.0.1:9998/` — live overview (`/`), per-node (`/node/{node}`), per-user (`/user/{username}`), all polling every 30 s with a disconnected banner on failure. `web.database_url` must be set (reader role). Reach it from your laptop via `ssh -L 9998:localhost:9998 polaris-login-04`.
+
+Vendor: Vue `3.4.38` + Chart.js `4.4.9` under `node_monitor/web/static/vendor/` (no CDN).
+
 ## Database
 
 The collector writes to PostgreSQL (database and schema `node_monitor`). Two roles are
