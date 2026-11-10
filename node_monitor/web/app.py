@@ -25,6 +25,10 @@ def create_app(config: Config | None = None) -> FastAPI:
    static_dir = Path(__file__).parent / "static"
    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
+   from node_monitor.web.routers.live import router as live_router
+
+   app.include_router(live_router)
+
    @app.get("/api/health")
    def health():
       cfg: Config = app.state.config

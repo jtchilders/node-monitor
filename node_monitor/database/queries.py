@@ -203,3 +203,18 @@ def users(
       " FROM p GROUP BY username ORDER BY {order}, username{limit}"
    ).format(where=sql.SQL(" AND ").join(where), order=order, limit=limit_sql)
    return _rows(conn, query, params + limit_params)
+
+
+def events(
+   conn: psycopg.Connection,
+   system: str,
+   *,
+   limit: int | None = None,
+) -> list[dict]:
+   """Most recent rows from `collection_events` for `system`, newest first."""
+   limit_sql, limit_params = _limit(limit)
+   query = sql.SQL(
+      "SELECT ts, system, node, event_type, detail"
+      " FROM collection_events WHERE system = %s ORDER BY ts DESC{limit}"
+   ).format(limit=limit_sql)
+   return _rows(conn, query, [system] + limit_params)
