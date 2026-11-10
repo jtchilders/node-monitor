@@ -1,5 +1,9 @@
 """Read queries over the node_monitor schema, for the CLI and later the web UI."""
 
+from __future__ import annotations
+
+from datetime import datetime
+
 import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
@@ -218,6 +222,73 @@ def events(
       " FROM collection_events WHERE system = %s ORDER BY ts DESC{limit}"
    ).format(limit=limit_sql)
    return _rows(conn, query, [system] + limit_params)
+
+
+def node_history(
+   conn: psycopg.Connection,
+   system: str,
+   node: str,
+   from_ts: "datetime",
+   to_ts: "datetime",
+   bucket: str,
+) -> list[dict]:
+   trunc = {"1m": None, "1h": "hour", "1d": "day"}[bucket]
+   node_where = "(m.node = %s OR COALESCE(ln.label, n.label) = %s)"
+   params: list = [system, node, node, from_ts, to_ts]
+   if trunc is None:
+      query = sql.SQL(
+         "SELECT m.minute as minute, m.load1, m.mem_used_kb,"
+         " m.procs_total, m.sample_count, m.expected_count"
+         " FROM node_metrics_1m m"
+         " LEFT JOIN live_nodes ln ON ln.system=m.system AND ln.node=m.node"
+         " LEFT JOIN nodes n ON n.system=m.system AND n.node=m.node"
+         " WHERE m.system=%s AND {nw} AND m.minute >= %s AND m.minute < %s"
+         " ORDER BY minute"
+      ).format(nw=sql.SQL(node_where))
+   else:
+      query = sql.SQL(
+         "SELECT date_trunc(%s, m.minute) as minute, avg(m.load1) as load1,"
+         " avg(m.mem_used_kb) as mem_used_kb,"
+         " avg(m.procs_total) as procs_total,"
+         " sum(m.sample_count) as sample_count,"
+         " sum(m.expected_count) as expected_count"
+         " FROM node_metrics_1m m"
+         " LEFT JOIN live_nodes ln ON ln.system=m.system AND ln.node=m.node"
+         " LEFT JOIN nodes n ON n.system=m.system AND n.node=m.node"
+         " WHERE m.system=%s AND {nw} AND m.minute >= %s AND m.minute < %s"
+         " GROUP BY 1 ORDER BY 1"
+      ).format(nw=sql.SQL(node_where))
+      params = [trunc, system, node, node, from_ts, to_ts]
+   return _rows(conn, query, params)
+
+
+def user_history(
+   conn: psycopg.Connection,
+   system: str,
+   username: str,
+   from_ts: "datetime",
+   to_ts: "datetime",
+   bucket: str,
+) -> list[dict]:
+   trunc = {"5m": None, "1h": "hour", "1d": "day"}[bucket]
+   if trunc is None:
+      query = sql.SQL(
+         "SELECT interval_start as minute, cpu_seconds, rss_kb_avg,"
+         " process_count_avg, sample_count, expected_count"
+         " FROM user_usage_5m WHERE system=%s AND username=%s"
+         " AND interval_start >= %s AND interval_start < %s ORDER BY minute"
+      )
+      return _rows(conn, query, [system, username, from_ts, to_ts])
+   query = sql.SQL(
+      "SELECT date_trunc(%s, interval_start) as minute,"
+      " avg(cpu_seconds) as cpu_seconds, avg(rss_kb_avg) as rss_kb_avg,"
+      " avg(process_count_avg) as process_count_avg,"
+      " sum(sample_count) as sample_count,"
+      " sum(expected_count) as expected_count"
+      " FROM user_usage_5m WHERE system=%s AND username=%s"
+      " AND interval_start >= %s AND interval_start < %s GROUP BY 1 ORDER BY 1"
+   )
+   return _rows(conn, query, [trunc, system, username, from_ts, to_ts])
 
 
 def process_by_key(
