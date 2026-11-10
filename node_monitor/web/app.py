@@ -265,4 +265,57 @@ def create_app(config: Config | None = None) -> FastAPI:
          return HTMLResponse(f"error: {exc}", status_code=500)
       return HTMLResponse("not found", status_code=404)
 
+   @app.get("/user/{username}", response_class=HTMLResponse)
+   def user_page(username: str, request: Request):
+      cfg: Config = app.state.config
+      # sanitize username for display - autoescape will handle
+      try:
+         from node_monitor.database import queries
+         from node_monitor.web.deps import web_reader
+
+         with web_reader(cfg) as conn:
+            # check live processes
+            procs = []
+            try:
+               procs = queries.processes(conn, cfg.system, user=username, limit=2000)
+            except Exception:
+               procs = []
+            # also check history
+            has_history = False
+            try:
+               hist = queries.user_history(
+                  conn,
+                  cfg.system,
+                  username,
+                  from_ts=datetime(2000, 1, 1, tzinfo=timezone.utc),
+                  to_ts=datetime.now(timezone.utc),
+                  bucket="5m",
+               )
+               has_history = len(hist) > 0
+            except Exception:
+               pass
+            if not procs and not has_history:
+               from fastapi.responses import JSONResponse
+
+               return JSONResponse(status_code=404, content={"detail": "Not Found"})
+            nodes = sorted({p.get("node") for p in procs if p.get("node")})
+            user_json = json.dumps({"username": username})
+            processes_json = json.dumps(
+               procs[:2000], default=lambda o: o.isoformat() if hasattr(o, "isoformat") else str(o)
+            )
+            tmpl = _templates.get_template("user.html")
+            html = tmpl.render(
+               username=username,
+               process_count=len(procs),
+               nodes=nodes,
+               user_json=user_json,
+               processes_json=processes_json,
+            )
+            return HTMLResponse(html)
+      except Exception as exc:
+         if "Not Found" in str(exc):
+            raise
+         return HTMLResponse(f"error: {exc}", status_code=500)
+      return HTMLResponse("not found", status_code=404)
+
    return app

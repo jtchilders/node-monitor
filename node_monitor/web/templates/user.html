@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}user {{ username }} — node-monitor{% endblock %}
+{% block head %}
+<style>
+.user-header { padding: 12px; background: #f3f4f6; }
+.chart-container { height: 240px; margin: 12px 0; }
+.dormancy-bar { height: 24px; display: flex; margin: 12px 0; }
+.paged-list { margin: 12px 0; }
+</style>
+{% endblock %}
+{% block content %}
+<div class="user-header">
+<h1>{{ username }}</h1>
+<div>{{ process_count }} processes — {{ nodes|length }} nodes</div>
+</div>
+
+<div class="chart-container"><canvas id="cpu-history" data-chart="cpu"></canvas></div>
+<div class="chart-container"><canvas id="mem-history" data-chart="mem"></canvas></div>
+<div class="chart-container"><canvas id="count-history" data-chart="count"></canvas></div>
+
+<div class="dormancy-profile" data-dormancy-profile>
+<h3>Dormancy profile</h3>
+<div class="dormancy-bar" data-dormancy-bar></div>
+</div>
+
+<div class="paged-list" data-paged-list data-page-size="50" data-cap="2000">
+<h3>Live processes (paged, 50/page, cap 2000)</h3>
+<div id="user-process-table"></div>
+<button data-show-more>show more</button>
+</div>
+
+<div class="tags-placeholder" data-tags>
+<h3>Tags seen (placeholder until M3)</h3>
+<span>—</span>
+</div>
+
+<script>
+window.__USER__ = {{ user_json | safe }};
+window.__PROCESSES__ = {{ processes_json | safe }};
+</script>
+{% endblock %}
+{% block scripts %}
+<script type="module" src="/static/js/user.js"></script>
+{% endblock %}
