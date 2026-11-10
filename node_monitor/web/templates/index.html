@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}node-monitor — overview{% endblock %}
+{% block head %}
+<style>
+#disconnected-banner { display:none; background:#fee2e2; color:#991b1b; padding:8px; text-align:center; }
+#disconnected-banner.visible { display:block; }
+.health-strip { padding:8px; background:#f3f4f6; }
+.node-cards { display:flex; gap:12px; flex-wrap:wrap; }
+.node-card { border:1px solid #e5e7eb; padding:12px; min-width:200px; }
+.category-bar { display:flex; height:16px; }
+.category-seg { height:100%; }
+</style>
+{% endblock %}
+{% block content %}
+<div id="disconnected-banner" role="alert">web server disconnected</div>
+<header id="health-strip" data-heartbeat-age="{{ heartbeat_age_s if heartbeat_age_s is not none else '' }}" data-ok="{{ ok }}">
+{% if heartbeat_age_s is not none %}
+<span class="heartbeat">heartbeat {{ heartbeat_age_s }}s ago{% if heartbeat_state %} — {{ heartbeat_state }}{% endif %}</span>
+{% else %}
+<span class="heartbeat heartbeat-missing">no heartbeat</span>
+{% endif %}
+{% for n in nodes %}
+<span class="node-state" data-label="{{ n.label }}" data-state="{{ n.state }}" data-age="{{ n.updated_age_s }}">{{ n.label }}:{{ n.state }} {{ n.updated_age_s }}s</span>
+{% endfor %}
+{% if last_gap %}
+<span class="last-gap">last gap {{ last_gap }}</span>
+{% endif %}
+</header>
+
+<section id="per-node-cards" class="node-cards">
+{% for n in nodes %}
+<div class="node-card" data-node="{{ n.label }}">
+<h3>{{ n.label }}</h3>
+<div>CPU load {{ n.load1 if n.load1 is not none else "-" }}</div>
+<div>Mem {{ n.mem_used_kb }} / {{ n.mem_total_kb }}</div>
+<div>Users {{ n.users }} Procs {{ n.procs_total }} UserProcs {{ n.user_processes }}</div>
+<div>Probe {{ n.probe_version }} State {{ n.state }}</div>
+</div>
+{% endfor %}
+</section>
+
+<div id="category-mix" class="category-bar" data-total="{{ total_processes }}">
+{% for cat, cnt in category_counts.items() %}
+<div class="category-seg" data-category="{{ cat }}" data-count="{{ cnt }}" style="width: {{ (cnt * 100 / total_processes) if total_processes else 0 }}%; background: {{ category_colors[cat] if cat in category_colors else '#9ca3af' }}"></div>
+{% endfor %}
+</div>
+
+<section id="dormancy-panel">
+<h3>Dormant unattended (idle&gt;1h|absent)</h3>
+{% for cat, cnt in dormancy_by_category.items() %}
+<div data-cat="{{ cat }}" data-count="{{ cnt.count }}" data-rss="{{ cnt.rss_kb }}">{{ cat }}: {{ cnt.count }} ({{ cnt.rss_kb }} KiB)</div>
+{% else %}
+<div>No dormant processes</div>
+{% endfor %}
+</section>
+
+<div id="dots-container"></div>
+
+<div>
+<label>Filter <input id="process-filter" type="text" placeholder="filter processes"></label>
+<button id="toggle-mode" data-mode="process">Toggle to user</button>
+</div>
+
+<div id="process-table-container">
+{% include "_process_table.html" %}
+</div>
+
+<section id="recent-events">
+<h3>Recent events</h3>
+<ul>
+{% for ev in events %}
+<li data-type="{{ ev.event_type }}">{{ ev.event_type }} {{ ev.ts }} {{ ev.node }}</li>
+{% else %}
+<li>No events</li>
+{% endfor %}
+</ul>
+</section>
+
+<script>
+window.__INITIAL_DATA__ = {{ initial_json | safe }};
+</script>
+{% endblock %}
+{% block scripts %}
+<script type="module" src="/static/js/index.js"></script>
+{% endblock %}
