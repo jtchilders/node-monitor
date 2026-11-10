@@ -1,85 +1,121 @@
 {% extends "base.html" %}
-{% block title %}node-monitor — overview{% endblock %}
-{% block head %}
-<style>
-#disconnected-banner { display:none; background:#fee2e2; color:#991b1b; padding:8px; text-align:center; }
-#disconnected-banner.visible { display:block; }
-.health-strip { padding:8px; background:#f3f4f6; }
-.node-cards { display:flex; gap:12px; flex-wrap:wrap; }
-.node-card { border:1px solid #e5e7eb; padding:12px; min-width:200px; }
-.category-bar { display:flex; height:16px; }
-.category-seg { height:100%; }
-</style>
-{% endblock %}
+{% block title %}node-monitor — live overview{% endblock %}
 {% block content %}
-<div id="disconnected-banner" role="alert">web server disconnected</div>
-<header id="health-strip" data-heartbeat-age="{{ heartbeat_age_s if heartbeat_age_s is not none else '' }}" data-ok="{{ ok }}">
-{% if heartbeat_age_s is not none %}
-<span class="heartbeat">heartbeat {{ heartbeat_age_s }}s ago{% if heartbeat_state %} — {{ heartbeat_state }}{% endif %}</span>
-{% else %}
-<span class="heartbeat heartbeat-missing">no heartbeat</span>
-{% endif %}
-{% for n in nodes %}
-<span class="node-state" data-label="{{ n.label }}" data-state="{{ n.state }}" data-age="{{ n.updated_age_s }}">{{ n.label }}:{{ n.state }} {{ n.updated_age_s }}s</span>
-{% endfor %}
-{% if last_gap %}
-<span class="last-gap">last gap {{ last_gap }}</span>
-{% endif %}
+<div class="dashboard-container">
+<div id="disconnected-banner" class="error-overlay" style="display:none; position:static; padding:0.5rem; background:#7f1d1d; color:#fecaca; text-align:center;" role="alert">⚠ Web server disconnected — data may be stale</div>
+
+<header class="header-bar">
+  <div class="header-left">
+    <h1>Polaris Login Nodes</h1>
+    <div class="freshness-indicator" id="health-strip" data-heartbeat-age="{{ heartbeat_age_s if heartbeat_age_s is not none else '' }}" data-ok="{{ ok }}">
+      <span class="dot"></span>
+      <span id="health-text">
+      {% if heartbeat_age_s is not none %}heartbeat {{ heartbeat_age_s }}s ago{% if heartbeat_state %} — {{ heartbeat_state }}{% endif %}{% else %}no heartbeat{% endif %}
+      · <span id="node-states">{% for n in nodes %}{{ n.label }}:{{ n.state }} {% endfor %}</span>
+      </span>
+    </div>
+  </div>
+  <div class="header-stats">
+    <div class="stat-item"><span class="label">Nodes</span><span class="value">{{ nodes|length }}</span></div>
+    <div class="stat-item"><span class="label">Total Procs</span><span class="value">{{ total_processes }}</span></div>
+  </div>
+  <div class="header-right">
+    <div class="stat-item"><span class="label">Heartbeat</span><span class="value" style="font-size:0.9rem">{{ heartbeat_age_s if heartbeat_age_s is not none else "—" }}s</span></div>
+  </div>
 </header>
 
-<section id="per-node-cards" class="node-cards">
-{% for n in nodes %}
-<div class="node-card" data-node="{{ n.label }}">
-<h3>{{ n.label }}</h3>
-<div>CPU load {{ n.load1 if n.load1 is not none else "-" }}</div>
-<div>Mem {{ n.mem_used_kb }} / {{ n.mem_total_kb }}</div>
-<div>Users {{ n.users }} Procs {{ n.procs_total }} UserProcs {{ n.user_processes }}</div>
-<div>Probe {{ n.probe_version }} State {{ n.state }}</div>
+<main class="main-content">
+  <section class="panel node-map-panel">
+    <div class="panel-header"><h2>Process Map</h2>
+      <div class="legend" id="category-legend">
+      {% for cat, cnt in category_counts.items() %}
+        <span class="legend-item"><i class="color-box" style="background: {{ category_colors[cat] if cat in category_colors else '#9ca3af' }}"></i>{{ cat }} {{ cnt }}</span>
+      {% endfor %}
+      </div>
+    </div>
+    <div id="category-mix" class="canvas-container" style="padding:0">
+      <div class="category-bar" data-total="{{ total_processes }}" style="display:flex; height:14px; width:100%">
+      {% for cat, cnt in category_counts.items() %}
+        <div class="category-seg" data-category="{{ cat }}" data-count="{{ cnt }}" style="width: {{ (cnt * 100 / total_processes) if total_processes else 0 }}%; background: {{ category_colors[cat] if cat in category_colors else '#9ca3af' }}"></div>
+      {% endfor %}
+      </div>
+    </div>
+    <div id="dots-container" class="canvas-container"></div>
+  </section>
+
+  <section class="panel jobs-panel">
+    <div class="panel-header">
+      <h2>Live Processes</h2>
+      <div class="tab-bar">
+        <button class="tab-btn active" id="toggle-mode" data-mode="process">By Process</button>
+        <button class="tab-btn" id="toggle-mode-user" data-mode="user">By User</button>
+      </div>
+    </div>
+    <div class="filter-bar">
+      <div class="filter-input-wrap">
+        <input id="process-filter" type="text" placeholder="Filter by user, category, cmdline…">
+        <button class="filter-clear" onclick="document.getElementById('process-filter').value=''; document.getElementById('process-filter').dispatchEvent(new Event('input'))">×</button>
+      </div>
+      <span class="filter-count" id="filter-count"></span>
+    </div>
+    <div class="table-wrapper" id="process-table-container">
+      {% include "_process_table.html" %}
+    </div>
+  </section>
+</main>
+
+<div class="footer-section" style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; padding:1rem;">
+  <section class="panel">
+    <div class="panel-header"><h2>Per-Node Cards</h2></div>
+    <div style="padding:1rem; display:flex; flex-wrap:wrap; gap:0.75rem;" id="per-node-cards">
+    {% for n in nodes %}
+      <div class="node-card" data-node="{{ n.label }}" style="background:#0f172a; border:1px solid #2d3748; border-radius:6px; padding:0.75rem; min-width:180px;">
+        <div style="font-weight:600; color:#e2e8f0;">{{ n.label }} <span style="font-size:0.7rem; text-transform:uppercase; color:#94a3b8;">{{ n.state }}</span></div>
+        <div style="font-size:0.8rem; color:#94a3b8;">Load {{ n.load1 if n.load1 is not none else "—" }} · Probe v{{ n.probe_version }}</div>
+        <div style="font-size:0.8rem;">Mem {{ (n.mem_used_kb//1024) if n.mem_used_kb else "—" }} MB / {{ (n.mem_total_kb//1024) if n.mem_total_kb else "—" }} MB</div>
+        <div style="font-size:0.8rem;">{{ n.users }} users · {{ n.procs_total }} procs ({{ n.user_processes }} user)</div>
+      </div>
+    {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel" id="dormancy-panel">
+    <div class="panel-header"><h2>Dormant Unattended (idle&gt;1h|absent)</h2></div>
+    <div style="padding:0.75rem;">
+    {% for cat, cnt in dormancy_by_category.items() %}
+      <div data-cat="{{ cat }}" data-count="{{ cnt.count }}" data-rss="{{ cnt.rss_kb }}" style="display:flex; justify-content:space-between; font-size:0.85rem; padding:0.25rem 0; border-bottom:1px solid #1e293b;"><span>{{ cat }}</span><span>{{ cnt.count }} · {{ cnt.rss_kb }} KiB</span></div>
+    {% else %}
+      <div style="color:var(--text-dim); font-style:italic;">No dormant processes</div>
+    {% endfor %}
+    </div>
+  </section>
 </div>
-{% endfor %}
+
+<section class="panel" style="margin:0 1rem 1rem;">
+  <div class="panel-header"><h2>Recent Events</h2></div>
+  <div class="table-wrapper" style="max-height:200px;">
+  <table class="jobs-table">
+    <thead><tr><th>Type</th><th>Time</th><th>Node</th></tr></thead>
+    <tbody>
+    {% for ev in events %}
+      <tr><td><span class="queue-badge" style="background:#334155;">{{ ev.event_type }}</span></td><td style="font-family:monospace; font-size:0.8rem;">{{ ev.ts }}</td><td>{{ ev.node }}</td></tr>
+    {% else %}
+      <tr><td colspan="3" style="text-align:center; color:var(--text-dim);">No events</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
 </section>
 
-<div id="category-mix" class="category-bar" data-total="{{ total_processes }}">
-{% for cat, cnt in category_counts.items() %}
-<div class="category-seg" data-category="{{ cat }}" data-count="{{ cnt }}" style="width: {{ (cnt * 100 / total_processes) if total_processes else 0 }}%; background: {{ category_colors[cat] if cat in category_colors else '#9ca3af' }}"></div>
-{% endfor %}
-</div>
+</div><!-- dashboard-container -->
 
-<section id="dormancy-panel">
-<h3>Dormant unattended (idle&gt;1h|absent)</h3>
-{% for cat, cnt in dormancy_by_category.items() %}
-<div data-cat="{{ cat }}" data-count="{{ cnt.count }}" data-rss="{{ cnt.rss_kb }}">{{ cat }}: {{ cnt.count }} ({{ cnt.rss_kb }} KiB)</div>
-{% else %}
-<div>No dormant processes</div>
-{% endfor %}
-</section>
-
-<div id="dots-container"></div>
-
-<div>
-<label>Filter <input id="process-filter" type="text" placeholder="filter processes"></label>
-<button id="toggle-mode" data-mode="process">Toggle to user</button>
-</div>
-
-<div id="process-table-container">
-{% include "_process_table.html" %}
-</div>
-
-<section id="recent-events">
-<h3>Recent events</h3>
-<ul>
-{% for ev in events %}
-<li data-type="{{ ev.event_type }}">{{ ev.event_type }} {{ ev.ts }} {{ ev.node }}</li>
-{% else %}
-<li>No events</li>
-{% endfor %}
-</ul>
-</section>
-
-<script>
-window.__INITIAL_DATA__ = {{ initial_json | safe }};
-</script>
+<script>window.__INITIAL_DATA__ = {{ initial_json | safe }};</script>
 {% endblock %}
 {% block scripts %}
 <script type="module" src="/static/js/index.js"></script>
+<script>
+// simple toggle for disconnected banner visibility (index.js will manage)
+const banner = document.getElementById('disconnected-banner');
+if (banner) { window.showDisconnected = (show) => banner.style.display = show ? 'block' : 'none'; }
+</script>
 {% endblock %}
