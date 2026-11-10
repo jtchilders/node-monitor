@@ -1,0 +1,35 @@
+{# Shared process table partial — rendered server-side or enhanced client-side via list.js #}
+<table class="process-table" aria-label="Processes">
+<thead>
+<tr>
+<th>Node</th>
+<th>User</th>
+<th>PID</th>
+<th>Category</th>
+<th>Activity</th>
+<th>RSS</th>
+<th>CPU</th>
+<th>Idle</th>
+<th>Presence</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+{% for proc in processes %}
+<tr data-pid="{{ proc.pid }}" data-node="{{ proc.node }}" data-start-time="{{ proc.start_time }}">
+<td>{{ proc.label or proc.node }}</td>
+<td>{{ proc.username }}</td>
+<td>{{ proc.pid }}</td>
+<td><span class="badge badge-category">{{ proc.category }}</span></td>
+<td>{{ proc.activity or "-" }}</td>
+<td>{{ proc.rss_kb }}</td>
+<td>{{ proc.cpu_seconds }}</td>
+<td>{{ proc.idle_for_sec if proc.idle_for_sec is not none else "-" }}</td>
+<td>{{ proc.owner_presence }}</td>
+<td class="cmdline-cell">{{ proc.cmdline }}</td>
+</tr>
+{% else %}
+<tr><td colspan="10" class="empty-state">No processes to display</td></tr>
+{% endfor %}
+</tbody>
+</table>

@@ -218,3 +218,74 @@ def events(
       " FROM collection_events WHERE system = %s ORDER BY ts DESC{limit}"
    ).format(limit=limit_sql)
    return _rows(conn, query, [system] + limit_params)
+
+
+def process_by_key(
+   conn: psycopg.Connection,
+   system: str,
+   node: str,
+   pid: int,
+   start_time: int,
+) -> dict | None:
+   """Single live process by its primary key, or None if not present.
+
+   ``node`` matches a host or a label, like :func:`processes`.
+   """
+   query = (
+      "SELECT p.node, COALESCE(ln.label, n.label, p.node) AS label, p.username, p.pid,"
+      " p.start_time, p.uid, p.comm, p.exe, p.argv0, p.cmdline, p.ppid,"
+      " p.parent_comm, p.parent_exe, p.parent_kind, p.category, p.activity,"
+      " p.state, p.threads, p.rss_kb, p.cpu_seconds, p.cpu_state, p.gpu_mem_mb,"
+      " p.interactive, p.under_screen_or_tmux, p.idle_for_sec,"
+      " p.idle_for_is_lower_bound, p.idle_bucket, p.owner_presence,"
+      " p.is_user_process, p.ts"
+      " FROM live_processes p"
+      " LEFT JOIN live_nodes ln ON ln.system = p.system AND ln.node = p.node"
+      " LEFT JOIN nodes n ON n.system = p.system AND n.node = p.node"
+      " WHERE p.system = %s AND (p.node = %s OR COALESCE(ln.label, n.label) = %s)"
+      " AND p.pid = %s AND p.start_time = %s"
+   )
+   rows = _rows(conn, query, [system, node, node, pid, start_time])
+   return rows[0] if rows else None
+
+
+def parent_chain(
+   conn: psycopg.Connection,
+   system: str,
+   node: str,
+   ppid: int | None,
+   *,
+   max_depth: int = 5,
+) -> list[dict]:
+   """Walk ``ppid`` links within the same ``system``/``node``, returning ancestors."""
+   chain: list[dict] = []
+   seen: set[int] = set()
+   cur = ppid
+   for _ in range(max_depth):
+      if cur is None or cur in seen:
+         break
+      seen.add(cur)
+      rows = _rows(
+         conn,
+         "SELECT pid, comm, exe, cmdline, category, activity, username"
+         " FROM live_processes WHERE system = %s AND node = %s AND pid = %s",
+         [system, node, cur],
+      )
+      if not rows:
+         chain.append({"pid": cur})
+         break
+      row = rows[0]
+      chain.append(row)
+      cur = None
+      try:
+         with conn.cursor(row_factory=dict_row) as cur2:
+            cur2.execute(
+               "SELECT ppid FROM live_processes WHERE system = %s AND node = %s AND pid = %s",
+               (system, node, row["pid"]),
+            )
+            r = cur2.fetchone()
+            if r:
+               cur = r["ppid"]
+      except Exception:
+         break
+   return chain

@@ -29,6 +29,10 @@ def create_app(config: Config | None = None) -> FastAPI:
 
    app.include_router(live_router)
 
+   from node_monitor.web.routers.process import router as process_router
+
+   app.include_router(process_router)
+
    @app.get("/api/health")
    def health():
       cfg: Config = app.state.config
