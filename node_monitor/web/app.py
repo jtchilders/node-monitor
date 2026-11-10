@@ -216,4 +216,53 @@ def create_app(config: Config | None = None) -> FastAPI:
       )
       return HTMLResponse(html)
 
+   @app.get("/node/{node}", response_class=HTMLResponse)
+   def node_page(node: str, request: Request):
+      cfg: Config = app.state.config
+      try:
+         from node_monitor.database import queries
+         from node_monitor.web.deps import web_reader
+
+         with web_reader(cfg) as conn:
+            rows = queries.node_states(conn, cfg.system)
+            # find matching node by label or host
+            match = None
+            for r in rows:
+               if r["label"] == node or r["node"] == node:
+                  match = r
+                  break
+            if match is None:
+               from fastapi.responses import JSONResponse
+
+               return JSONResponse(status_code=404, content={"detail": "Not Found"})
+            now2 = datetime.now(timezone.utc)
+            updated_age_s = int((now2 - match["updated_at"]).total_seconds())
+            updated_age_s = max(0, updated_age_s)
+            state = (
+               "stale" if updated_age_s > _NODE_STALE_SEC else (match["session_state"] or "unknown")
+            )
+            node_label = match["label"]
+            # live processes for this node for table
+            try:
+               procs = queries.processes(conn, cfg.system, node=node, limit=200)
+            except Exception:
+               procs = []
+            node_json = json.dumps({"label": node_label, "node": match["node"]})
+            tmpl2 = _templates.get_template("node.html")
+            html2 = tmpl2.render(
+               node=node,
+               node_label=node_label,
+               state=state,
+               updated_age_s=updated_age_s,
+               node_json=node_json,
+               processes=procs,
+            )
+            return HTMLResponse(html2)
+      except Exception as exc:
+         # if we already returned 404 above, don't swallow
+         if "Not Found" in str(exc):
+            raise
+         return HTMLResponse(f"error: {exc}", status_code=500)
+      return HTMLResponse("not found", status_code=404)
+
    return app

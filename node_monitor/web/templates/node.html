@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}node {{ node_label }} — node-monitor{% endblock %}
+{% block head %}
+<style>
+.range-picker { margin: 12px 0; }
+.chart-container { height: 240px; margin: 12px 0; }
+.node-header { padding: 12px; background: #f3f4f6; }
+</style>
+{% endblock %}
+{% block content %}
+<div class="node-header">
+<h1>{{ node_label }}</h1>
+<div>State {{ state }} — updated {{ updated_age_s }}s ago</div>
+</div>
+
+<!-- bucket param driven by range picker --><div class="range-picker" data-range-picker data-bucket="1h">
+<button data-range="1h">1h</button>
+<button data-range="24h">24h</button>
+<button data-range="7d">7d</button>
+<button data-range="30d">30d</button>
+<button data-range="1y">1y</button>
+<button data-range="2y">2y</button>
+</div>
+
+<div class="chart-container"><canvas id="cpu-chart" data-chart="cpu"></canvas></div>
+<div class="chart-container"><canvas id="mem-chart" data-chart="mem"></canvas></div>
+<div class="chart-container"><canvas id="load-chart" data-chart="load"></canvas></div>
+<div class="chart-container"><canvas id="category-chart" data-chart="category"></canvas></div>
+<div class="chart-container"><canvas id="users-chart" data-chart="users"></canvas></div>
+
+<h3>Live processes on {{ node_label }}</h3>
+<div id="process-table-container">
+{% include "_process_table.html" %}
+</div>
+
+<script>
+window.__NODE__ = {{ node_json | safe }};
+</script>
+{% endblock %}
+{% block scripts %}
+<script type="module" src="/static/js/node.js"></script>
+{% endblock %}
