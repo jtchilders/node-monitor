@@ -45,6 +45,10 @@ def create_app(config: Config | None = None) -> FastAPI:
 
    app.include_router(history_router)
 
+   from node_monitor.web.routers.analytics import router as analytics_router
+
+   app.include_router(analytics_router)
+
    @app.get("/api/health")
    def health():
       cfg: Config = app.state.config
