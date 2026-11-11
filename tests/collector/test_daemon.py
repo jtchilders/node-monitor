@@ -29,11 +29,13 @@ from node_monitor.database.spool import Spool
 from node_monitor.pipeline.node_pipeline import NodePipeline
 from node_monitor.pipeline.records import (
    COLLECTION_EVENT,
+   COMMAND_LINES,
    LIVE_NODE,
    LIVE_PROCESSES,
    NODE_HARDWARE,
    NODE_METRICS_1M,
    NODE_USAGE_5M,
+   PROCESS_SAMPLES,
    USER_USAGE_5M,
 )
 from tests.collector.test_soak import FAKE_SSH
@@ -54,6 +56,8 @@ _KEY_FIELDS = {
    NODE_USAGE_5M: ("system", "node", "interval_start"),
    NODE_HARDWARE: ("system", "node", "boot_id"),
    COLLECTION_EVENT: ("system", "node", "ts", "event_type"),
+   PROCESS_SAMPLES: ("system", "node", "ts", "pid", "start_time"),
+   COMMAND_LINES: ("system", "username", "cmdline_hash"),
 }
 _SUMMARY_TABLES = (NODE_METRICS_1M, USER_USAGE_5M, NODE_USAGE_5M)
 

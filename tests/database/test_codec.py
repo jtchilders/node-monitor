@@ -7,11 +7,13 @@ from psycopg.types.json import Jsonb
 from node_monitor.database.codec import decode_record, encode_record, to_db_value
 from node_monitor.pipeline.records import (
    COLLECTION_EVENT,
+   COMMAND_LINES,
    LIVE_NODE,
    LIVE_PROCESSES,
    NODE_HARDWARE,
    NODE_METRICS_1M,
    NODE_USAGE_5M,
+   PROCESS_SAMPLES,
    USER_USAGE_5M,
    Record,
 )
@@ -29,6 +31,8 @@ def test_codec_round_trip():
       NODE_METRICS_1M,
       NODE_USAGE_5M,
       USER_USAGE_5M,
+      PROCESS_SAMPLES,
+      COMMAND_LINES,
    }
    for rec in recs:
       # Strict JSON: the spool must be readable by any JSON parser.
