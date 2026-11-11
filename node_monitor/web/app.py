@@ -49,6 +49,16 @@ def create_app(config: Config | None = None) -> FastAPI:
 
    app.include_router(analytics_router)
 
+   from node_monitor.web.routers.commands import router as commands_router
+
+   app.include_router(commands_router)
+
+   @app.get("/commands", response_class=HTMLResponse)
+   def commands_page(request: Request):
+      tmpl = _templates.get_template("commands.html")
+      html = tmpl.render()
+      return HTMLResponse(html)
+
    @app.get("/api/health")
    def health():
       cfg: Config = app.state.config
