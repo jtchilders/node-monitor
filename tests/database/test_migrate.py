@@ -35,6 +35,8 @@ PRIMARY_KEYS = {
    "collection_events": ["id", "ts"],
    "collector_heartbeat": ["system"],
    "schema_migrations": ["version"],
+   "process_samples": ["system", "node", "ts", "pid", "start_time"],
+   "command_lines": ["system", "username", "cmdline_hash"],
 }
 
 PARTITION_KEYS = {
@@ -42,6 +44,7 @@ PARTITION_KEYS = {
    "user_usage_5m": "interval_start",
    "node_usage_5m": "interval_start",
    "collection_events": "ts",
+   "process_samples": "ts",
 }
 
 
@@ -69,8 +72,9 @@ def test_migrations_are_discovered_from_package_data():
    assert MIGRATIONS == [
       (1, "0001_initial.sql"),
       (2, "0002_user_maps_and_event_key.sql"),
+      (3, "0003_history.sql"),
    ]
-   assert REQUIRED_VERSION == 2
+   assert REQUIRED_VERSION == 3
    pkg = importlib.resources.files("node_monitor.database.migrations")
    assert pkg.joinpath("0001_initial.sql").read_text().strip()
 
@@ -96,7 +100,7 @@ def test_current_version_is_zero_before_migrating(pg_db):
 
 def test_migrate_applies_all_and_is_idempotent(pg_db):
    with connect(pg_db) as conn:
-      assert migrate(conn) == [1, 2]
+      assert migrate(conn) == [1, 2, 3]
       assert migrate(conn) == []
       assert current_version(conn) == REQUIRED_VERSION
       rows = conn.execute(
@@ -108,7 +112,7 @@ def test_migrate_applies_all_and_is_idempotent(pg_db):
 
 def test_migrate_works_on_an_autocommit_connection(pg_db):
    with connect(pg_db, autocommit=True) as conn:
-      assert migrate(conn) == [1, 2]
+      assert migrate(conn) == [1, 2, 3]
       assert conn.autocommit is True
 
 
@@ -116,7 +120,7 @@ def test_check_schema_raises_until_migrated(pg_db):
    with connect(pg_db) as conn:
       with pytest.raises(SchemaOutOfDate) as info:
          check_schema(conn)
-      assert str(info.value) == "schema version 0, need 2: run `node-monitor database migrate`"
+      assert str(info.value) == "schema version 0, need 3: run `node-monitor database migrate`"
       migrate(conn)
       check_schema(conn)
 
@@ -148,7 +152,7 @@ def test_check_schema_that_raises_leaves_the_connection_idle(pg_db):
       with pytest.raises(SchemaOutOfDate):
          check_schema(conn)
       assert conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
-      assert migrate(conn) == [1, 2]
+      assert migrate(conn) == [1, 2, 3]
 
 
 def test_current_version_keeps_the_callers_open_transaction(migrated_db):
@@ -178,7 +182,7 @@ def test_concurrent_migrate_is_serialized(pg_db):
    for t in threads:
       t.join(timeout=60)
    assert errors == []
-   assert sorted(results) == [[], [1, 2]]
+   assert sorted(results) == [[], [1, 2, 3]]
    with connect(pg_db) as conn:
       assert current_version(conn) == REQUIRED_VERSION
 
@@ -187,11 +191,11 @@ def test_failed_migration_rolls_back_and_releases_the_lock(pg_db, monkeypatch):
    real_read = migrate_mod._read_sql
 
    def read(filename):
-      if filename == "0003_broken.sql":
+      if filename == "0004_broken.sql":
          return "CREATE TABLE node_monitor.half_done (x int);\nSELEC broken;"
       return real_read(filename)
 
-   monkeypatch.setattr(migrate_mod, "MIGRATIONS", MIGRATIONS + [(3, "0003_broken.sql")])
+   monkeypatch.setattr(migrate_mod, "MIGRATIONS", MIGRATIONS + [(4, "0004_broken.sql")])
    monkeypatch.setattr(migrate_mod, "_read_sql", read)
    with connect(pg_db) as conn:
       with pytest.raises(psycopg.errors.SyntaxError):
@@ -230,7 +234,9 @@ def test_migration_0002_drops_user_maps_and_dedupes_events(pg_db, monkeypatch):
       before = conn.execute("SELECT id, node, event_type FROM collection_events ORDER BY id")
       ids = before.fetchall()
       assert len(ids) == 5
+      monkeypatch.setattr(migrate_mod, "MIGRATIONS", [m for m in MIGRATIONS if m[0] <= 2])
       assert migrate(conn) == [2]
+      monkeypatch.setattr(migrate_mod, "MIGRATIONS", MIGRATIONS)
       assert "by_category" not in _columns(conn, "user_usage_5m")
       assert "by_dormancy" not in _columns(conn, "user_usage_5m")
       assert {"by_category", "by_dormancy"} <= _columns(conn, "node_usage_5m")
@@ -332,7 +338,7 @@ def test_column_types(migrated_db):
       types = _column_types(conn)
    # Every instant is timestamptz; ints that can grow are bigint; no lossy or untyped
    # column types slip in.
-   allowed = {"text", "bigint", "integer", "double precision", "boolean", "jsonb"}
+   allowed = {"text", "bigint", "integer", "double precision", "boolean", "jsonb", "ARRAY"}
    allowed.add("timestamp with time zone")
    assert {d for d in types.values()} <= allowed
    integer = {k for k, d in types.items() if d == "integer"}
@@ -341,7 +347,7 @@ def test_column_types(migrated_db):
    assert types[("live_processes", "uid")] == "bigint"
    assert types[("live_processes", "ppid")] == "bigint"
    assert all(
-      t in ("live_processes", "node_hardware", "live_nodes", "schema_migrations")
+      t in ("live_processes", "node_hardware", "live_nodes", "schema_migrations", "process_samples")
       for t, _ in integer
    )
    assert types[("live_processes", "start_time")] == "bigint"
@@ -425,3 +431,207 @@ def test_live_processes_stores_an_unsigned_32_bit_uid(migrated_db):
          " VALUES ('s', 'n', now(), 1, 1, 4294967294, 1)"
       )
       assert conn.execute("SELECT uid FROM live_processes").fetchone() == (4294967294,)
+
+
+# --- history tables (M3) ----------------------------------------------------------------
+
+
+def test_migrate_creates_history_tables(migrated_db):
+   with connect(migrated_db) as conn:
+      tables = {
+         r[0]
+         for r in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'node_monitor'"
+         )
+      }
+      assert "process_samples" in tables
+      assert "command_lines" in tables
+      # pg_trgm extension and GIN index for substring search (or fallback if unavailable).
+      has_trgm = (
+         conn.execute(
+            "SELECT count(*) FROM pg_available_extensions WHERE name='pg_trgm'"
+         ).fetchone()[0]
+         == 1
+      )
+      if has_trgm:
+         ext = conn.execute(
+            "SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'"
+         ).fetchone()[0]
+         assert ext == 1
+      idx = conn.execute(
+         "SELECT indexdef FROM pg_indexes"
+         " WHERE schemaname = 'node_monitor' AND tablename = 'command_lines'"
+      ).fetchall()
+      assert any("cmdline" in d[0] for d in idx)
+      if has_trgm:
+         assert any("gin_trgm_ops" in d[0] for d in idx)
+      # column sanity: tags is text[], hourly is bool, retention columns present.
+      cols = _columns(conn, "process_samples")
+      assert {
+         "system",
+         "node",
+         "ts",
+         "pid",
+         "start_time",
+         "username",
+         "uid",
+         "comm",
+         "exe",
+         "argv0",
+         "cmdline",
+         "cmdline_hash",
+         "parent_comm",
+         "parent_exe",
+         "parent_kind",
+         "category",
+         "activity",
+         "tags",
+         "state",
+         "threads",
+         "cpu_seconds",
+         "rss_kb",
+         "gpu_mem_mb",
+         "interactive",
+         "under_screen_or_tmux",
+         "cpu_state",
+         "idle_for_sec",
+         "idle_for_is_lower_bound",
+         "idle_bucket",
+         "owner_presence",
+         "hourly",
+      } <= cols
+      cmd_cols = _columns(conn, "command_lines")
+      assert {
+         "system",
+         "username",
+         "cmdline_hash",
+         "cmdline",
+         "exe",
+         "activity",
+         "category",
+         "tags",
+         "first_seen",
+         "last_seen",
+         "sample_count",
+         "nodes",
+      } <= cmd_cols
+      # types: tags and nodes are text[], hourly is boolean.
+      types = _column_types(conn)
+      assert types[("process_samples", "tags")] == "ARRAY"
+      assert types[("command_lines", "tags")] == "ARRAY"
+      assert types[("command_lines", "nodes")] == "ARRAY"
+      assert types[("process_samples", "hourly")] == "boolean"
+      # no roles in migration code.
+      pkg = importlib.resources.files("node_monitor.database.migrations")
+      text = pkg.joinpath("0003_history.sql").read_text()
+      code = "\n".join(line.split("--", 1)[0] for line in text.splitlines())
+      assert not re.search(r"\b(GRANT|REVOKE|OWNER\s+TO|DEFAULT\s+PRIVILEGES)\b", code, re.I)
+      assert "node_monitor_owner" not in code and "node_monitor_reader" not in code
+
+
+def test_process_samples_partition_naming_daily(migrated_db):
+   with connect(migrated_db, autocommit=True) as conn:
+      # partitioned by ts, daily naming yYYYYMMDD, no DEFAULT partition.
+      assert (
+         conn.execute(
+            "SELECT partstrat, partattrs::text FROM pg_partitioned_table"
+            " WHERE partrelid = 'node_monitor.process_samples'::regclass"
+         ).fetchone()[0]
+         == "r"
+      )
+      # create two daily partitions and verify routing by day.
+      for day in (1, 2):
+         conn.execute(
+            "CREATE TABLE node_monitor.process_samples_y2026110%d"
+            " PARTITION OF node_monitor.process_samples"
+            " FOR VALUES FROM ('2026-11-0%d 00:00+00') TO ('2026-11-0%d 00:00+00')"
+            % (day, day, day + 1)
+         )
+      for ts_str, expected_part in [
+         ("2026-11-01T12:00:00+00:00", "process_samples_y20261101"),
+         ("2026-11-02T00:00:00+00:00", "process_samples_y20261102"),
+      ]:
+         conn.execute(
+            "INSERT INTO node_monitor.process_samples"
+            " (system, node, ts, pid, start_time, hourly) VALUES ('s', 'n', %s, 1, 1, false)",
+            (datetime.fromisoformat(ts_str),),
+         )
+         assert (
+            conn.execute("SELECT count(*) FROM node_monitor.%s" % expected_part).fetchone()[0] == 1
+         )
+      # missing day must fail loudly (no DEFAULT).
+      with pytest.raises(psycopg.errors.CheckViolation):
+         conn.execute(
+            "INSERT INTO node_monitor.process_samples"
+            " (system, node, ts, pid, start_time, hourly) VALUES ('s', 'n', %s, 1, 2, false)",
+            (datetime(2026, 11, 3, tzinfo=timezone.utc),),
+         )
+      # retention helper would drop by daily name: upper bound <= cutoff.
+      assert conn.execute(
+         "SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid"
+         " WHERE i.inhparent = 'node_monitor.process_samples'::regclass ORDER BY c.relname"
+      ).fetchall() == [("process_samples_y20261101",), ("process_samples_y20261102",)]
+
+
+def test_command_lines_upsert_keeps_first_seen(migrated_db):
+   with connect(migrated_db) as conn:
+      conn.execute(
+         "INSERT INTO node_monitor.command_lines"
+         " (system, username, cmdline_hash, cmdline, first_seen, last_seen, sample_count, nodes)"
+         " VALUES ('polaris', 'alice', 'h1', 'cmd one', %s, %s, 1, ARRAY['n1'])",
+         (
+            datetime(2026, 11, 1, 10, tzinfo=timezone.utc),
+            datetime(2026, 11, 1, 10, tzinfo=timezone.utc),
+         ),
+      )
+      # upsert same PK with later first_seen must keep earliest, greatest last_seen,
+      # and bump sample_count and merge nodes.
+      conn.execute(
+         "INSERT INTO node_monitor.command_lines"
+         " (system, username, cmdline_hash, cmdline, first_seen, last_seen, sample_count, nodes)"
+         " VALUES ('polaris', 'alice', 'h1', 'cmd one', %s, %s, 1, ARRAY['n2'])"
+         " ON CONFLICT (system, username, cmdline_hash) DO UPDATE SET"
+         "  cmdline = EXCLUDED.cmdline,"
+         "  first_seen = LEAST(command_lines.first_seen, EXCLUDED.first_seen),"
+         "  last_seen = GREATEST(command_lines.last_seen, EXCLUDED.last_seen),"
+         "  sample_count = command_lines.sample_count + EXCLUDED.sample_count,"
+         "  nodes = (SELECT array_agg(DISTINCT x ORDER BY x)"  # noqa: E501
+         " FROM unnest(command_lines.nodes || EXCLUDED.nodes) AS x)",
+         (
+            datetime(2026, 11, 2, 10, tzinfo=timezone.utc),
+            datetime(2026, 11, 2, 10, tzinfo=timezone.utc),
+         ),
+      )
+      row = conn.execute(
+         "SELECT first_seen, last_seen, sample_count, nodes FROM node_monitor.command_lines"
+         " WHERE system='polaris' AND username='alice' AND cmdline_hash='h1'"
+      ).fetchone()
+      assert row[0] == datetime(2026, 11, 1, 10, tzinfo=timezone.utc)
+      assert row[1] == datetime(2026, 11, 2, 10, tzinfo=timezone.utc)
+      assert row[2] == 2
+      assert sorted(row[3]) == ["n1", "n2"]
+      # third upsert with earlier first_seen moves it back, nodes deduped.
+      conn.execute(
+         "INSERT INTO node_monitor.command_lines"
+         " (system, username, cmdline_hash, cmdline, first_seen, last_seen, sample_count, nodes)"
+         " VALUES ('polaris', 'alice', 'h1', 'cmd one', %s, %s, 1, ARRAY['n1'])"
+         " ON CONFLICT (system, username, cmdline_hash) DO UPDATE SET"
+         "  first_seen = LEAST(command_lines.first_seen, EXCLUDED.first_seen),"
+         "  last_seen = GREATEST(command_lines.last_seen, EXCLUDED.last_seen),"
+         "  sample_count = command_lines.sample_count + EXCLUDED.sample_count,"
+         "  nodes = (SELECT array_agg(DISTINCT x ORDER BY x)"  # noqa: E501
+         " FROM unnest(command_lines.nodes || EXCLUDED.nodes) AS x)",
+         (
+            datetime(2026, 10, 31, 10, tzinfo=timezone.utc),
+            datetime(2026, 10, 31, 11, tzinfo=timezone.utc),
+         ),
+      )
+      row2 = conn.execute(
+         "SELECT first_seen, last_seen, sample_count, nodes FROM node_monitor.command_lines"
+         " WHERE system='polaris' AND username='alice' AND cmdline_hash='h1'"
+      ).fetchone()
+      assert row2[0] == datetime(2026, 10, 31, 10, tzinfo=timezone.utc)
+      # last_seen stays at the greatest seen (Nov 2).
+      assert row2[1] == datetime(2026, 11, 2, 10, tzinfo=timezone.utc)
+      assert row2[2] == 3
+      assert sorted(row2[3]) == ["n1", "n2"]
