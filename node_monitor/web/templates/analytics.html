@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}analytics — node-monitor{% endblock %}
+{% block head %}
+<style>
+.analytics-container { padding: 1rem; max-width: 1200px; margin: 0 auto; }
+.analytics-header { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.analytics-header h1 { font-size: 1.4rem; color: var(--text-color); }
+.range-picker { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+.range-picker button { padding: 4px 10px; border: 1px solid var(--accent-border); background: var(--panel-bg); color: var(--text-dim); border-radius: 4px; cursor: pointer; font-size: 0.82rem; }
+.range-picker button.active { background: #1e40af; color: #fff; border-color: #3b82f6; }
+.chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
+@media (max-width: 900px) { .chart-grid { grid-template-columns: 1fr; } }
+.chart-card { background: var(--panel-bg); border: 1px solid var(--accent-border); border-radius: 8px; padding: 0.75rem; }
+.chart-card h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); margin-bottom: 0.5rem; }
+.chart-wrap { height: 220px; position: relative; }
+.chart-wrap canvas { width: 100% !important; height: 100% !important; }
+.leaderboard-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
+@media (max-width: 900px) { .leaderboard-grid { grid-template-columns: 1fr; } }
+.leaderboard-card { background: var(--panel-bg); border: 1px solid var(--accent-border); border-radius: 8px; padding: 0.75rem; }
+.leaderboard-card h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); margin-bottom: 0.5rem; }
+.lb-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.lb-table th { text-align: left; color: var(--text-dim); font-weight: 600; font-size: 0.72rem; text-transform: uppercase; padding: 0.3rem 0.4rem; border-bottom: 1px solid var(--accent-border); }
+.lb-table td { padding: 0.3rem 0.4rem; border-bottom: 1px solid #1a2235; }
+.lb-pager { display: flex; gap: 0.5rem; align-items: center; justify-content: center; margin-top: 0.5rem; font-size: 0.8rem; }
+.lb-pager button { padding: 3px 10px; border: 1px solid var(--accent-border); background: var(--panel-bg); color: var(--text-dim); border-radius: 4px; cursor: pointer; }
+.lb-pager button:disabled { opacity: 0.4; cursor: default; }
+.coverage-card { background: var(--panel-bg); border: 1px solid var(--accent-border); border-radius: 8px; padding: 0.75rem; margin-bottom: 1rem; }
+.coverage-card h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); margin-bottom: 0.5rem; }
+.coverage-bar-wrap { height: 18px; background: #0f172a; border-radius: 4px; overflow: hidden; display: flex; margin: 0.5rem 0; }
+.coverage-bar-fill { height: 100%; background: #22c55e; transition: width 0.3s; }
+.coverage-stats { font-size: 0.82rem; color: var(--text-dim); display: flex; gap: 1rem; flex-wrap: wrap; }
+.coverage-gaps { margin-top: 0.5rem; }
+.coverage-gap { font-size: 0.78rem; padding: 0.2rem 0; border-bottom: 1px solid #1a2235; display: flex; justify-content: space-between; }
+</style>
+{% endblock %}
+{% block content %}
+<div class="analytics-container">
+  <div class="analytics-header">
+    <h1>Analytics</h1>
+    <a href="/" style="font-size:0.82rem; color:#60a5fa;">Back to live</a>
+  </div>
+
+  <div class="range-picker" data-range-picker data-bucket="1d" data-range="7d">
+    <button data-range="1h">1h</button>
+    <button data-range="24h">24h</button>
+    <button data-range="7d" class="active">7d</button>
+    <button data-range="30d">30d</button>
+    <button data-range="1y">1y</button>
+    <button data-range="2y">2y</button>
+  </div>
+
+  <div class="chart-grid">
+    <div class="chart-card">
+      <h3>Category mix — bucket: <span data-bucket-label>1d</span></h3>
+      <div class="chart-wrap"><canvas id="category-mix-chart" data-chart="category-mix"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h3>Agent adoption</h3>
+      <div class="chart-wrap"><canvas id="agent-adoption-chart" data-chart="agent-adoption"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h3>Dormancy by category</h3>
+      <div class="chart-wrap"><canvas id="dormancy-chart" data-chart="dormancy"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h3>Tag share</h3>
+      <div class="chart-wrap"><canvas id="tag-share-chart" data-chart="tag-share"></canvas></div>
+    </div>
+  </div>
+
+  <div class="leaderboard-grid">
+    <div class="leaderboard-card" data-leaderboard="cpu">
+      <h3>Top CPU</h3>
+      <div data-lb-body="cpu"><div style="color:var(--text-dim); text-align:center; padding:1rem;">loading…</div></div>
+      <div class="lb-pager" data-lb-pager="cpu">
+        <button data-lb-prev="cpu" disabled>Prev</button>
+        <span data-lb-pageinfo="cpu">page 1</span>
+        <button data-lb-next="cpu">Next</button>
+      </div>
+    </div>
+    <div class="leaderboard-card" data-leaderboard="mem">
+      <h3>Top Memory</h3>
+      <div data-lb-body="mem"><div style="color:var(--text-dim); text-align:center; padding:1rem;">loading…</div></div>
+      <div class="lb-pager" data-lb-pager="mem">
+        <button data-lb-prev="mem" disabled>Prev</button>
+        <span data-lb-pageinfo="mem">page 1</span>
+        <button data-lb-next="mem">Next</button>
+      </div>
+    </div>
+    <div class="leaderboard-card" data-leaderboard="dormant">
+      <h3>Top Dormant</h3>
+      <div data-lb-body="dormant"><div style="color:var(--text-dim); text-align:center; padding:1rem;">loading…</div></div>
+      <div class="lb-pager" data-lb-pager="dormant">
+        <button data-lb-prev="dormant" disabled>Prev</button>
+        <span data-lb-pageinfo="dormant">page 1</span>
+        <button data-lb-next="dormant">Next</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="coverage-card" data-coverage-card>
+    <h3>Coverage</h3>
+    <div class="coverage-bar-wrap" data-coverage-bar>
+      <div class="coverage-bar-fill" data-coverage-fill style="width:0%"></div>
+    </div>
+    <div class="coverage-stats" data-coverage-stats>
+      <span data-coverage-uptime>uptime —</span>
+      <span data-coverage-minutes>— minutes</span>
+      <span data-coverage-gaps>— gaps</span>
+    </div>
+    <div class="coverage-gaps" data-coverage-gaps></div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script type="module" src="/static/js/analytics.js"></script>
+{% endblock %}

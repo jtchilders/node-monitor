@@ -322,4 +322,10 @@ def create_app(config: Config | None = None) -> FastAPI:
          return HTMLResponse(f"error: {exc}", status_code=500)
       return HTMLResponse("not found", status_code=404)
 
+   @app.get("/analytics", response_class=HTMLResponse)
+   def analytics_page(request: Request):
+      tmpl = _templates.get_template("analytics.html")
+      html = tmpl.render()
+      return HTMLResponse(html)
+
    return app
