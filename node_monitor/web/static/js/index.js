@@ -1,6 +1,6 @@
 import { ProcessModal } from "./modal.js";
 import { renderProcessTable, filterProcesses } from "./list.js";
-import { aggregateForGroup, createPieChart, updatePieChart } from "./live_charts.js";
+import { aggregateForGroup, createPieChart, updatePieChart, createBarChart, updateBarChart } from "./live_charts.js";
 
 const CATEGORY_COLORS = { ai_agent: "#8b5cf6", editor_server: "#06b6d4", jupyter: "#f59e0b", build: "#ef4444", python: "#3b82f6", shell: "#6b7280", data_transfer: "#10b981", fs_scan: "#a3a3a3", scheduler: "#ec4899", workflow: "#14b8a6", system: "#52525b", other: "#9ca3af" };
 
@@ -10,6 +10,8 @@ let mode = "process"; // process | user
 let selectedNode = "__all";
 let group = "category";
 let pieChart = null;
+let rssChart = null;
+let cpuChart = null;
 let pollTimer = null;
 let abortCtrl = null;
 
@@ -141,6 +143,24 @@ function applyFilter() {
          pieChart = createPieChart(canvasEl, agg, group);
       } else {
          updatePieChart(pieChart, agg, group);
+      }
+   }
+   const rssCanvasEl = document.getElementById("rss-canvas");
+   if (rssCanvasEl) {
+      if (!rssChart) {
+         rssChart = createBarChart(rssCanvasEl, "rss");
+         updateBarChart(rssChart, agg, group, "rss");
+      } else {
+         updateBarChart(rssChart, agg, group, "rss");
+      }
+   }
+   const cpuCanvasEl = document.getElementById("cpu-canvas");
+   if (cpuCanvasEl) {
+      if (!cpuChart) {
+         cpuChart = createBarChart(cpuCanvasEl, "cpu");
+         updateBarChart(cpuChart, agg, group, "cpu");
+      } else {
+         updateBarChart(cpuChart, agg, group, "cpu");
       }
    }
 }

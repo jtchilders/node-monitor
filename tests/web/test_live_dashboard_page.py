@@ -34,3 +34,10 @@ def test_pie_empty_state_hidden_when_data_present(tmp_path):
    client = _client(tmp_path)
    html = client.get("/").text
    assert 'id="pie-empty"' in html
+
+
+def test_index_has_rss_and_cpu_canvases(tmp_path):
+   client = _client(tmp_path)
+   html = client.get("/").text
+   assert 'id="rss-canvas"' in html
+   assert 'id="cpu-canvas"' in html

@@ -117,6 +117,80 @@ export function createPieChart(canvasEl, agg, group) {
    return chart;
 }
 
+export function fmtRss(kb) {
+   if (kb == null) return "-";
+   if (kb < 1024) return kb + " KiB";
+   const mib = kb / 1024;
+   if (mib < 1024) return mib.toFixed(1) + " MiB";
+   return (mib / 1024).toFixed(1) + " GiB";
+}
+
+export function createBarChart(canvasEl, which) {
+   const ChartCtor = window.Chart;
+   return new ChartCtor(canvasEl, {
+      type: "bar",
+      data: {
+         labels: [],
+         datasets: [{data: [], backgroundColor: [], borderWidth: 1, borderColor: "#1e293b"}],
+      },
+      options: {
+         responsive: true,
+         indexAxis: "y",
+         scales: {
+            x: {
+               beginAtZero: true,
+               ticks: {
+                  callback(value) {
+                     if (which === "rss") return fmtRss(value);
+                     return String(Math.round(value)) + "s";
+                  },
+               },
+            },
+         },
+         plugins: {
+            legend: {display: false},
+            tooltip: {
+               callbacks: {
+                  label(ctx) {
+                     const label = String(ctx.label || "");
+                     const val = ctx.parsed.x;
+                     let formatted;
+                     if (which === "rss") formatted = fmtRss(val);
+                     else formatted = String(Math.round(val)) + "s";
+                     return label + ": " + formatted;
+                  },
+               },
+            },
+         },
+      },
+   });
+}
+
+export function updateBarChart(chart, agg, group, which) {
+   const empty = !agg.groups || agg.groups.length === 0;
+   const rssCanvas = document.getElementById("rss-canvas");
+   const rssEmpty = document.getElementById("rss-empty");
+   const cpuCanvas = document.getElementById("cpu-canvas");
+   const cpuEmpty = document.getElementById("cpu-empty");
+   let targetCanvas, targetEmpty;
+   if (which === "rss") { targetCanvas = rssCanvas; targetEmpty = rssEmpty; }
+   else { targetCanvas = cpuCanvas; targetEmpty = cpuEmpty; }
+   if (empty) {
+      if (targetCanvas) targetCanvas.hidden = true;
+      if (targetEmpty) targetEmpty.hidden = false;
+   } else {
+      if (targetCanvas) targetCanvas.hidden = false;
+      if (targetEmpty) targetEmpty.hidden = true;
+   }
+   const labels = agg.groups.map((g) => String(g.key));
+   const data = agg.groups.map((g) => (which === "rss" ? g.rss : g.cpu));
+   const backgroundColor = agg.groups.map((g, i) => colorFor(group, g.key, i));
+   chart.data.labels = labels;
+   chart.data.datasets[0].data = data;
+   chart.data.datasets[0].backgroundColor = backgroundColor;
+   chart.update();
+}
+
 export function updatePieChart(chart, agg, group) {
    const ds = buildPieDataset(agg, group);
    const total = agg.total || ds.data.reduce((a, b) => a + b, 0) || 1;

@@ -1177,3 +1177,4 @@ canvas {
 .dashboard-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
 .dashboard-card { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 0.75rem; min-height: 220px; }
 #pie-canvas { max-height: 280px; }
+#rss-canvas, #cpu-canvas { max-height: 320px; width: 100%; }
