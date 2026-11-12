@@ -14,8 +14,8 @@ const rangeToParams = {
    "2y": { hours: 2 * 365 * 24, bucket: "1w" },
 };
 
-let currentRange = "7d";
-let currentBucket = "1d";
+let currentRange = "1h";
+let currentBucket = "1h";
 let pollTimer = null;
 
 const CATEGORY_COLORS = {
@@ -44,17 +44,23 @@ function fmtDate(d) {
 }
 
 function fmtRange() {
-   const cfg = rangeToParams[currentRange] || rangeToParams["7d"];
+   const cfg = rangeToParams[currentRange] || rangeToParams["1h"];
    const now = new Date();
    const from = new Date(now.getTime() - cfg.hours * 3600 * 1000);
    currentBucket = cfg.bucket;
    return { from: fmtDate(from), to: fmtDate(now), bucket: currentBucket };
 }
 
-async function fetchJson(url) {
-   const r = await fetch(url);
+async function fetchJson(url, { signal } = {}) {
+   const r = await fetch(url, { signal });
    if (!r.ok) throw new Error("fetch failed " + r.status);
    return r.json();
+}
+
+function fetchWithTimeout(url, ms = 15000) {
+   const ctrl = new AbortController();
+   const t = setTimeout(() => ctrl.abort(), ms);
+   return fetchJson(url, { signal: ctrl.signal }).finally(() => clearTimeout(t));
 }
 
 function colorFor(cat) {
@@ -378,6 +384,7 @@ function renderCoverage(data) {
 async function refresh() {
    const { from, to, bucket } = fmtRange();
    const q = "from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to) + "&bucket=" + encodeURIComponent(bucket);
+   const qNoBucket = "from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to);
 
    // Update picker dataset + label
    const picker = document.querySelector("[data-range-picker]");
@@ -388,37 +395,25 @@ async function refresh() {
    const bucketLabel = document.querySelector("[data-bucket-label]");
    if (bucketLabel) bucketLabel.textContent = bucket;
 
-   // Parallel fetches — tolerate partial failure
-   const results = await Promise.allSettled([
-      fetchJson("/api/analytics/category-mix?" + q),
-      fetchJson("/api/analytics/agent-adoption?" + q),
-      fetchJson("/api/analytics/dormancy?" + q),
-      fetchJson("/api/analytics/leaderboard?metric=cpu&limit=50&" + q.replace("bucket=" + bucket, "")),
-      fetchJson("/api/analytics/leaderboard?metric=mem&limit=50&" + q.replace("bucket=" + bucket, "")),
-      fetchJson("/api/analytics/leaderboard?metric=dormant&limit=50&" + q.replace("bucket=" + bucket, "")),
-      fetchJson("/api/analytics/coverage?" + q.replace("&bucket=" + bucket, "").replace("bucket=" + bucket + "&", "")),
-   ]);
-
-   if (results[0].status === "fulfilled") renderCategoryMix(results[0].value.items || []);
-   if (results[1].status === "fulfilled") renderAgentAdoption(results[1].value);
-   if (results[2].status === "fulfilled") renderDormancy(results[2].value.items || []);
-
-   if (results[3].status === "fulfilled") {
-      lbState.cpu.items = results[3].value.items || [];
-      lbState.cpu.page = 1;
-      renderLeaderboard("cpu");
+   // Fetch each endpoint independently so one slow/hung request doesn't block the rest.
+   // 15s per-request timeout; partial results still render.
+   const jobs = [
+      { key: "category-mix", url: "/api/analytics/category-mix?" + q, handler: (v) => renderCategoryMix(v.items || []) },
+      { key: "agent-adoption", url: "/api/analytics/agent-adoption?" + q, handler: (v) => renderAgentAdoption(v) },
+      { key: "dormancy", url: "/api/analytics/dormancy?" + q, handler: (v) => renderDormancy(v.items || []) },
+      { key: "lb-cpu", url: "/api/analytics/leaderboard?metric=cpu&limit=50&" + qNoBucket, handler: (v) => { lbState.cpu.items = v.items || []; lbState.cpu.page = 1; renderLeaderboard("cpu"); } },
+      { key: "lb-mem", url: "/api/analytics/leaderboard?metric=mem&limit=50&" + qNoBucket, handler: (v) => { lbState.mem.items = v.items || []; lbState.mem.page = 1; renderLeaderboard("mem"); } },
+      { key: "lb-dormant", url: "/api/analytics/leaderboard?metric=dormant&limit=50&" + qNoBucket, handler: (v) => { lbState.dormant.items = v.items || []; lbState.dormant.page = 1; renderLeaderboard("dormant"); } },
+      { key: "coverage", url: "/api/analytics/coverage?" + qNoBucket, handler: (v) => renderCoverage(v) },
+   ];
+   const results = await Promise.allSettled(jobs.map((j) => fetchWithTimeout(j.url, 15000).then((v) => ({ key: j.key, value: v, handler: j.handler }))));
+   for (const r of results) {
+      if (r.status === "fulfilled") {
+         try { r.value.handler(r.value.value); } catch (e) { console.error("analytics render", r.value.key, e); }
+      } else {
+         console.warn("analytics fetch failed", r.reason && r.reason.message ? r.reason.message : r.reason);
+      }
    }
-   if (results[4].status === "fulfilled") {
-      lbState.mem.items = results[4].value.items || [];
-      lbState.mem.page = 1;
-      renderLeaderboard("mem");
-   }
-   if (results[5].status === "fulfilled") {
-      lbState.dormant.items = results[5].value.items || [];
-      lbState.dormant.page = 1;
-      renderLeaderboard("dormant");
-   }
-   if (results[6].status === "fulfilled") renderCoverage(results[6].value);
 }
 
 function initRangePicker() {

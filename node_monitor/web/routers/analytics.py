@@ -51,7 +51,7 @@ def _default_range(q) -> tuple[datetime, datetime]:
    to_s = q.get("to")
    now = datetime.now(timezone.utc)
    if from_s is None and to_s is None:
-      return now - timedelta(days=7), now
+      return now - timedelta(hours=1), now
    if from_s is None or to_s is None:
       raise HTTPException(status_code=400, detail="both from and to required together")
    from_ts = _parse_ts(from_s)
@@ -114,14 +114,14 @@ def category_mix(request: Request):
       from_ts, to_ts = _default_range(q)
    else:
       now = datetime.now(timezone.utc)
-      from_ts, to_ts = now - timedelta(days=7), now
+      from_ts, to_ts = now - timedelta(hours=1), now
       # if only bucket given without from/to, use defaults
    # Re-parse if both present (default range logic above)
    if q.get("from") and q.get("to"):
       from_ts, to_ts = _default_range(q)
    elif not q.get("from") and not q.get("to"):
       now = datetime.now(timezone.utc)
-      from_ts, to_ts = now - timedelta(days=7), now
+      from_ts, to_ts = now - timedelta(hours=1), now
 
    bucket = _validate_bucket(bucket_s, from_ts, to_ts)
    trunc_sql = _trunc_expr(bucket)
@@ -164,7 +164,7 @@ def agent_adoption(request: Request):
       from_ts, to_ts = _default_range(q)
    else:
       now = datetime.now(timezone.utc)
-      from_ts, to_ts = now - timedelta(days=7), now
+      from_ts, to_ts = now - timedelta(hours=1), now
 
    # Auto-bucket to day for adoption (users/day)
    bucket = _validate_bucket(None, from_ts, to_ts)
@@ -241,7 +241,7 @@ def dormancy(request: Request):
       from_ts, to_ts = _default_range(q)
    else:
       now = datetime.now(timezone.utc)
-      from_ts, to_ts = now - timedelta(days=7), now
+      from_ts, to_ts = now - timedelta(hours=1), now
 
    bucket = _validate_bucket(q.get("bucket"), from_ts, to_ts)
    trunc_sql = _trunc_expr(bucket)
@@ -302,7 +302,7 @@ def leaderboard(request: Request):
       from_ts, to_ts = _default_range(q)
    else:
       now = datetime.now(timezone.utc)
-      from_ts, to_ts = now - timedelta(days=7), now
+      from_ts, to_ts = now - timedelta(hours=1), now
 
    # Metric expressions
    if metric == "cpu":
@@ -353,7 +353,7 @@ def coverage(request: Request):
       from_ts, to_ts = _default_range(q)
    else:
       now = datetime.now(timezone.utc)
-      from_ts, to_ts = now - timedelta(days=7), now
+      from_ts, to_ts = now - timedelta(hours=1), now
 
    try:
       with web_reader(cfg) as conn:
