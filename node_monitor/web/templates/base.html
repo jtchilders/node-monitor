@@ -8,6 +8,11 @@
 {% block head %}{% endblock %}
 </head>
 <body>
+<nav style="display:flex; gap:1rem; padding:0.4rem 1rem; background:#0f172a; border-bottom:1px solid #1e293b; font-size:0.85rem;">
+  <a href="/" style="color:#e2e8f0; text-decoration:none; font-weight:600;">Live</a>
+  <a href="/analytics" style="color:#94a3b8; text-decoration:none;">Analytics</a>
+  <a href="/commands" style="color:#94a3b8; text-decoration:none;">Commands</a>
+</nav>
 <header id="health-strip" aria-live="polite">
 <span class="health-loading">loading…</span>
 </header>
