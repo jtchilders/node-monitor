@@ -283,9 +283,8 @@ export function createBarChart(canvasEl, which, onSliceClick) {
             y: {
                ticks: {
                   callback(value, index) {
-                     const c = chart;
-                     const labels = (c && c.data && c.data.labels) || [];
-                     const lbl = String(labels[index] || value);
+                     const labels = (this.chart && this.chart.data && this.chart.data.labels) || [];
+                     const lbl = String(labels[index] ?? value);
                      return lbl.length > 14 ? lbl.slice(0, 14) + "…" : lbl;
                   },
                },
@@ -296,9 +295,10 @@ export function createBarChart(canvasEl, which, onSliceClick) {
             tooltip: {
                callbacks: {
                   label(ctx) {
+                     const curChart = ctx.chart;
+                     const curAgg = curChart && curChart._nmAgg;
                      const label = String(ctx.label || "");
                      const val = ctx.parsed.x;
-                     const curAgg = chart._nmAgg;
                      if (curAgg) return otherBarTooltipLabel(label, val, which, curAgg);
                      let formatted;
                      if (which === "rss") formatted = fmtRss(val);
@@ -312,10 +312,11 @@ export function createBarChart(canvasEl, which, onSliceClick) {
    });
    chart._nmAgg = null;
    if (onSliceClick) {
-      chart.options.onClick = (_evt, elements) => {
+      chart.options.onClick = function(_evt, elements) {
          if (!elements || elements.length === 0) return;
          const idx = elements[0].index;
-         const key = chart.data.labels[idx];
+         const ch = this; // Chart instance
+         const key = ch.data.labels[idx];
          onSliceClick(String(key));
       };
    }
@@ -438,9 +439,8 @@ export function createNodeBarChart(canvasEl, groups, metric, onBarClick) {
                ticks: {
                   color: "#e2e8f0",
                   callback(value, index) {
-                     const c = chart;
-                     const labels = (c && c.data && c.data.labels) || [];
-                     const lbl = String(labels[index] || value);
+                     const labels = (this.chart && this.chart.data && this.chart.data.labels) || [];
+                     const lbl = String(labels[index] ?? value);
                      return lbl.length > 16 ? lbl.slice(0, 16) + "…" : lbl;
                   },
                },
@@ -463,8 +463,8 @@ export function createNodeBarChart(canvasEl, groups, metric, onBarClick) {
          },
          onClick(_evt, elements) {
             if (!onBarClick || !elements || elements.length === 0) return;
-            const idx = elements[0].index;
-            const key = chart.data.labels[idx];
+            const ch = this; // Chart instance at click time
+            const key = (ch.data && ch.data.labels ? ch.data.labels[elements[0].index] : elements[0].index);
             onBarClick(String(key));
          },
       },

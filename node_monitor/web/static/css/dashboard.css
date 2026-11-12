@@ -1175,18 +1175,26 @@ canvas {
    grid-template-columns: repeat(3, 1fr);
    gap: 1rem;
    padding: 1rem;
+   align-items: stretch;
 }
 .dashboard-card {
    background: #0f172a;
    border: 1px solid #1e293b;
    border-radius: 8px;
    padding: 0.75rem;
-   min-height: 220px;
+   min-height: 340px;
    overflow: visible;
    position: relative;
+   display: flex;
+   flex-direction: column;
 }
-#pie-canvas { max-height: 280px; }
-#rss-canvas, #cpu-canvas { max-height: 320px; width: 100%; }
+#pie-canvas, #rss-canvas, #cpu-canvas {
+   width: 100% !important;
+   max-height: 200px;
+   height: 200px !important;
+   display: block;
+   flex-shrink: 0;
+}
 
 #node-tabs {
    position: sticky;
@@ -1297,7 +1305,7 @@ canvas {
    border-top-color: #334155;
 }
 .node-bar-wrap {
-   margin-top: 0.75rem;
+   margin-top: auto;
    border-top: 1px solid #1e293b;
    padding-top: 0.5rem;
 }
