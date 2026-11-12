@@ -261,8 +261,10 @@ function applyFilter() {
       if (groupsCountByNode.length === 0) { if (wrap) wrap.hidden = true; }
       else {
          if (wrap) wrap.hidden = false;
-         if (!pieNodeBar) pieNodeBar = createNodeBarChart(pieNodeBarEl, groupsCountByNode, "count", onNodeBarClick);
-         else updateNodeBarChart(pieNodeBar, groupsCountByNode, "count");
+         try {
+            if (!pieNodeBar) pieNodeBar = createNodeBarChart(pieNodeBarEl, groupsCountByNode, "count", onNodeBarClick);
+            else updateNodeBarChart(pieNodeBar, groupsCountByNode, "count");
+         } catch (e) { console.error("pieNodeBar", e); }
       }
    }
    const rssNodeBarEl = document.getElementById("rss-node-bar");
@@ -271,8 +273,10 @@ function applyFilter() {
       if (groupsRssByNode.length === 0) { if (wrap) wrap.hidden = true; }
       else {
          if (wrap) wrap.hidden = false;
-         if (!rssNodeBar) rssNodeBar = createNodeBarChart(rssNodeBarEl, groupsRssByNode, "rss", onNodeBarClick);
-         else updateNodeBarChart(rssNodeBar, groupsRssByNode, "rss");
+         try {
+            if (!rssNodeBar) rssNodeBar = createNodeBarChart(rssNodeBarEl, groupsRssByNode, "rss", onNodeBarClick);
+            else updateNodeBarChart(rssNodeBar, groupsRssByNode, "rss");
+         } catch (e) { console.error("rssNodeBar", e); }
       }
    }
    const cpuNodeBarEl = document.getElementById("cpu-node-bar");
@@ -281,8 +285,10 @@ function applyFilter() {
       if (groupsCpuByNode.length === 0) { if (wrap) wrap.hidden = true; }
       else {
          if (wrap) wrap.hidden = false;
-         if (!cpuNodeBar) cpuNodeBar = createNodeBarChart(cpuNodeBarEl, groupsCpuByNode, "cpu", onNodeBarClick);
-         else updateNodeBarChart(cpuNodeBar, groupsCpuByNode, "cpu");
+         try {
+            if (!cpuNodeBar) cpuNodeBar = createNodeBarChart(cpuNodeBarEl, groupsCpuByNode, "cpu", onNodeBarClick);
+            else updateNodeBarChart(cpuNodeBar, groupsCpuByNode, "cpu");
+         } catch (e) { console.error("cpuNodeBar", e); }
       }
    }
 }
