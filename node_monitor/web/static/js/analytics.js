@@ -52,15 +52,29 @@ function fmtRange() {
 }
 
 async function fetchJson(url, { signal } = {}) {
+   console.debug("[analytics] fetch", url);
    const r = await fetch(url, { signal });
-   if (!r.ok) throw new Error("fetch failed " + r.status);
-   return r.json();
+   console.debug("[analytics] fetch done", url, r.status);
+   if (!r.ok) throw new Error("fetch failed " + r.status + " " + url);
+   const j = await r.json();
+   console.debug("[analytics] fetch json", url, Array.isArray(j.items) ? `items=${j.items.length}` : Object.keys(j).join(","));
+   return j;
 }
 
 function fetchWithTimeout(url, ms = 15000) {
    const ctrl = new AbortController();
-   const t = setTimeout(() => ctrl.abort(), ms);
+   const t = setTimeout(() => { console.warn("[analytics] timeout", url); ctrl.abort(); }, ms);
    return fetchJson(url, { signal: ctrl.signal }).finally(() => clearTimeout(t));
+}
+
+function debugStatus(msg) {
+   console.log("[analytics]", msg);
+   const el = document.getElementById("analytics-debug");
+   if (el) {
+      const line = document.createElement("div");
+      line.textContent = new Date().toISOString().slice(11, 19) + " " + msg;
+      el.appendChild(line);
+   }
 }
 
 function colorFor(cat) {
@@ -78,12 +92,17 @@ function getChartLib() {
 
 function ensureChart(canvasId, config) {
    const canvas = document.getElementById(canvasId);
-   if (!canvas) return null;
+   if (!canvas) {
+      console.warn("[analytics] missing canvas", canvasId);
+      return null;
+   }
    const ChartLib = getChartLib();
    if (!ChartLib) {
+      console.warn("[analytics] Chart.js not loaded for", canvasId);
       canvas.dataset.loaded = "1";
       return null;
    }
+   console.debug("[analytics] ensureChart", canvasId, config.data && config.data.labels ? config.data.labels.length + " labels" : "no labels");
    const existing = CHARTS[canvasId];
    if (existing) {
       existing.data = config.data;
@@ -97,6 +116,7 @@ function ensureChart(canvasId, config) {
 }
 
 function renderCategoryMix(items) {
+   console.debug("[analytics] renderCategoryMix", items.length);
    const labels = items.map((it) => it.bucket);
    const allCats = [...new Set(items.flatMap((it) => Object.keys(it.categories || {})))].sort();
    const datasets = allCats.map((cat) => ({
@@ -124,6 +144,7 @@ function renderCategoryMix(items) {
 }
 
 function renderAgentAdoption(payload) {
+   console.debug("[analytics] renderAgentAdoption", payload);
    const items = payload.items || [];
    const labels = items.map((it) => it.bucket);
    ensureChart("agent-adoption-chart", {
@@ -184,6 +205,7 @@ function renderAgentAdoption(payload) {
 }
 
 function renderDormancy(items) {
+   console.debug("[analytics] renderDormancy", items.length);
    const labels = items.map((it) => it.bucket);
    const allCats = [...new Set(items.flatMap((it) => Object.keys(it.categories || {})))].sort();
    const datasets = allCats.map((cat) => ({
@@ -385,6 +407,8 @@ async function refresh() {
    const { from, to, bucket } = fmtRange();
    const q = "from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to) + "&bucket=" + encodeURIComponent(bucket);
    const qNoBucket = "from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to);
+   debugStatus(`refresh ${currentRange} bucket=${bucket} q=${q.slice(0,80)}...`);
+   console.debug("[analytics] refresh", { from, to, bucket, currentRange });
 
    // Update picker dataset + label
    const picker = document.querySelector("[data-range-picker]");
@@ -409,11 +433,15 @@ async function refresh() {
    const results = await Promise.allSettled(jobs.map((j) => fetchWithTimeout(j.url, 15000).then((v) => ({ key: j.key, value: v, handler: j.handler }))));
    for (const r of results) {
       if (r.status === "fulfilled") {
-         try { r.value.handler(r.value.value); } catch (e) { console.error("analytics render", r.value.key, e); }
+         debugStatus(`ok ${r.value.key}`);
+         try { r.value.handler(r.value.value); } catch (e) { console.error("analytics render", r.value.key, e); debugStatus(`render err ${r.value.key}: ${e.message}`); }
       } else {
-         console.warn("analytics fetch failed", r.reason && r.reason.message ? r.reason.message : r.reason);
+         const msg = r.reason && r.reason.message ? r.reason.message : String(r.reason);
+         console.warn("analytics fetch failed", msg);
+         debugStatus(`fail ${msg}`);
       }
    }
+   debugStatus(`refresh done ${results.filter(r=>r.status==="fulfilled").length}/${results.length} ok`);
 }
 
 function initRangePicker() {
@@ -443,6 +471,8 @@ function initRangePicker() {
 }
 
 function init() {
+   console.debug("[analytics] init Chart=", !!getChartLib(), "range=", currentRange);
+   debugStatus(`init range=${currentRange} bucket=${currentBucket} Chart=${!!getChartLib()}`);
    initRangePicker();
    bindLeaderboardPager();
    refresh();
