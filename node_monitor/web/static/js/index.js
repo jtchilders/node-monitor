@@ -243,6 +243,54 @@ function applyFilter() {
    }
 }
 
+function positionHelpTooltip(icon) {
+   const tooltip = icon.querySelector(".help-tooltip");
+   if (!tooltip) return;
+   // reset to default centered-below
+   tooltip.style.left = "50%";
+   tooltip.style.right = "auto";
+   tooltip.style.top = "calc(100% + 8px)";
+   tooltip.style.bottom = "auto";
+   tooltip.style.transform = "translateX(-50%)";
+   if (icon.dataset) delete icon.dataset.flip;
+   // force layout then measure
+   const rect = tooltip.getBoundingClientRect();
+   const vw = window.innerWidth;
+   const vh = window.innerHeight;
+   const pad = 8;
+   if (rect.left < pad) {
+      tooltip.style.left = "0";
+      tooltip.style.transform = "none";
+   } else if (rect.right > vw - pad) {
+      tooltip.style.left = "auto";
+      tooltip.style.right = "0";
+      tooltip.style.transform = "none";
+   }
+   const rect2 = tooltip.getBoundingClientRect();
+   if (rect2.bottom > vh - pad) {
+      tooltip.style.top = "auto";
+      tooltip.style.bottom = "calc(100% + 8px)";
+      if (icon.dataset) icon.dataset.flip = "top";
+   }
+}
+
+function initHelpTooltips() {
+   const icons = document.querySelectorAll(".help-icon");
+   for (const icon of icons) {
+      const handler = () => positionHelpTooltip(icon);
+      icon.addEventListener("mouseenter", handler);
+      icon.addEventListener("focus", handler);
+      // also handle keyboard focus via focusin
+      icon.addEventListener("focusin", handler);
+   }
+   window.addEventListener("resize", () => {
+      for (const icon of document.querySelectorAll(".help-icon")) {
+         // re-position any currently hovered/focused
+         if (icon.matches(":hover") || icon.matches(":focus-within") || document.activeElement === icon) positionHelpTooltip(icon);
+      }
+   });
+}
+
 function init() {
    try {
       const saved = sessionStorage.getItem("nm:live:group");
@@ -309,6 +357,7 @@ function init() {
       const card = ev.target.closest("[data-node]");
       if (card) window.location.href = "/node/" + encodeURIComponent(card.dataset.node);
    });
+   initHelpTooltips();
    if (window.__INITIAL_DATA__ && window.__INITIAL_DATA__.processes) {
       allProcesses = window.__INITIAL_DATA__.processes;
       applyFilter();

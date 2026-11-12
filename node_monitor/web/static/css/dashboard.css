@@ -1243,8 +1243,7 @@ canvas {
    position: relative;
    user-select: none;
 }
-.help-icon::after {
-   content: attr(data-tooltip);
+.help-tooltip {
    position: absolute;
    left: 50%;
    top: calc(100% + 8px);
@@ -1282,17 +1281,20 @@ canvas {
    transition: opacity 0.15s, visibility 0.15s;
    z-index: 96;
 }
-.help-icon:hover::after,
-.help-icon:focus::after,
-.help-icon:focus-visible::after {
-   opacity: 1;
-   visibility: visible;
-}
+.help-icon:hover .help-tooltip,
+.help-icon:focus .help-tooltip,
+.help-icon:focus-visible .help-tooltip,
 .help-icon:hover::before,
 .help-icon:focus::before,
 .help-icon:focus-visible::before {
    opacity: 1;
    visibility: visible;
+}
+.help-icon[data-flip="top"]::before {
+   top: auto;
+   bottom: calc(100% + 2px);
+   border-bottom-color: transparent;
+   border-top-color: #334155;
 }
 
 @media (max-width: 640px) {
