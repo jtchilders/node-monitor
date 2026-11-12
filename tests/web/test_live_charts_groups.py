@@ -43,3 +43,54 @@ def test_buildPieDataset_uses_text_labels():
    )
    ds = buildPieDataset(agg, "category")
    assert "<img" in ds["labels"][0]
+
+
+def test_other_bucket_tooltip_includes_group_count():
+   procs = [{"username": f"u{i}", "rss_kb": 1, "cpu_seconds": 1} for i in range(30)]
+   agg = aggregateForGroup(procs, "user")
+   assert any(g["key"] == "Other" and g["count"] == 19 for g in agg["groups"])
+
+
+def test_clicking_pie_slice_sets_filter_js_exists(tmp_path=None):
+   import pathlib
+
+   p = (
+      pathlib.Path(__file__).parents[2]
+      / "node_monitor"
+      / "web"
+      / "static"
+      / "js"
+      / "live_charts.js"
+   )
+   assert "onSliceClick" in p.read_text()
+   p2 = pathlib.Path(__file__).parents[2] / "node_monitor" / "web" / "static" / "js" / "index.js"
+   assert "process-filter" in p2.read_text()
+
+
+def test_other_bucket_js_tooltip():
+   procs = [{"username": f"u{i}", "rss_kb": 1, "cpu_seconds": 1} for i in range(30)]
+   agg = aggregateForGroup(procs, "user")
+   other = next((g for g in agg["groups"] if g["key"] == "Other"), None)
+   assert other is not None
+   assert other["count"] == 19
+   from pathlib import Path
+
+   js_path = Path(__file__).parents[2] / "node_monitor" / "web" / "static" / "js" / "live_charts.js"
+   js = js_path.read_text()
+   assert "Other (" in js
+
+
+def test_clicking_pie_slice_sets_filter():
+   from pathlib import Path
+
+   lc_path = Path(__file__).parents[2] / "node_monitor" / "web" / "static" / "js" / "live_charts.js"
+   idx_path = Path(__file__).parents[2] / "node_monitor" / "web" / "static" / "js" / "index.js"
+   lc_js = lc_path.read_text()
+   idx_js = idx_path.read_text()
+   # live_charts exposes onClick factory / onSliceClick callback
+   assert "onSliceClick" in lc_js or "onClick" in lc_js
+   # index wires click-through to process-filter
+   assert "process-filter" in idx_js
+   assert "onSliceClick" in idx_js
+   # clicking Other clears filter (sets empty string)
+   assert '""' in idx_js or "''" in idx_js

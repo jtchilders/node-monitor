@@ -39,7 +39,7 @@ export function aggregateForGroup(processes, group) {
       capped = true;
       const head = groups.slice(0, maxItems - 1);
       const tail = groups.slice(maxItems - 1);
-      const other = {key:"Other",count:0,rss:0,cpu:0};
+      const other = {key:"Other",count:0,rss:0,cpu:0,groupCount:tail.length};
       for (const g of tail) { other.count += g.count; other.rss += g.rss; other.cpu += g.cpu; }
       groups = [...head, other];
    }
@@ -62,7 +62,35 @@ export function buildBarDatasets(agg, group) {
    return {labels, rssData, cpuData, backgroundColor};
 }
 
-export function createPieChart(canvasEl, agg, group) {
+function otherTooltipLabel(label, value, total, agg) {
+   if (label === "Other" && agg && agg.capped) {
+      const otherEntry = agg.groups.find((g) => g.key === "Other");
+      const groupCount = (otherEntry && otherEntry.groupCount) || (agg.total - (agg.groups.length - 1));
+      const rssStr = fmtRss(otherEntry ? otherEntry.rss : 0);
+      const cpuStr = String(Math.round(otherEntry ? otherEntry.cpu : 0)) + "s";
+      return "Other (" + String(groupCount) + " groups): " + String(value) + " (" + ((value / total) * 100).toFixed(1) + "%) rss " + rssStr + " cpu " + cpuStr;
+   }
+   return label + ": " + String(value) + " (" + ((value / total) * 100).toFixed(1) + "%)";
+}
+
+function otherBarTooltipLabel(label, val, which, agg) {
+   if (label === "Other" && agg && agg.capped) {
+      const otherEntry = agg.groups.find((g) => g.key === "Other");
+      const groupCount = (otherEntry && otherEntry.groupCount) || 0;
+      const rssStr = fmtRss(otherEntry ? otherEntry.rss : 0);
+      const cpuStr = String(Math.round(otherEntry ? otherEntry.cpu : 0)) + "s";
+      let formatted;
+      if (which === "rss") formatted = fmtRss(val);
+      else formatted = String(Math.round(val)) + "s";
+      return "Other (" + String(groupCount) + " groups): " + formatted + " rss " + rssStr + " cpu " + cpuStr;
+   }
+   let formatted;
+   if (which === "rss") formatted = fmtRss(val);
+   else formatted = String(Math.round(val)) + "s";
+   return label + ": " + formatted;
+}
+
+export function createPieChart(canvasEl, agg, group, onSliceClick) {
    const ds = buildPieDataset(agg, group);
    const total = agg.total || ds.data.reduce((a, b) => a + b, 0) || 1;
    const empty = !agg.groups || agg.groups.length === 0;
@@ -85,6 +113,13 @@ export function createPieChart(canvasEl, agg, group) {
       options: {
          responsive: true,
          cutout: "55%",
+         onClick(_evt, elements) {
+            if (!onSliceClick || !elements || elements.length === 0) return;
+            const idx = elements[0].index;
+            const curAgg = chart._nmAgg || agg;
+            const key = (curAgg.groups[idx] && curAgg.groups[idx].key) || (chart.data.labels[idx]);
+            onSliceClick(String(key));
+         },
          plugins: {
             legend: {
                position: "right",
@@ -106,14 +141,16 @@ export function createPieChart(canvasEl, agg, group) {
                   label(ctx) {
                      const label = String(ctx.label || "");
                      const value = ctx.parsed;
-                     const pct = ((value / total) * 100).toFixed(1);
-                     return label + ": " + String(value) + " (" + pct + "%)";
+                     return otherTooltipLabel(label, value, total, agg);
                   },
                },
             },
          },
       },
    });
+   // keep agg reference for update
+   chart._nmAgg = agg;
+   chart._nmOnSliceClick = onSliceClick;
    return chart;
 }
 
@@ -125,9 +162,9 @@ export function fmtRss(kb) {
    return (mib / 1024).toFixed(1) + " GiB";
 }
 
-export function createBarChart(canvasEl, which) {
+export function createBarChart(canvasEl, which, onSliceClick) {
    const ChartCtor = window.Chart;
-   return new ChartCtor(canvasEl, {
+   const chart = new ChartCtor(canvasEl, {
       type: "bar",
       data: {
          labels: [],
@@ -146,6 +183,16 @@ export function createBarChart(canvasEl, which) {
                   },
                },
             },
+            y: {
+               ticks: {
+                  callback(value, index) {
+                     const c = chart;
+                     const labels = (c && c.data && c.data.labels) || [];
+                     const lbl = String(labels[index] || value);
+                     return lbl.length > 14 ? lbl.slice(0, 14) + "…" : lbl;
+                  },
+               },
+            },
          },
          plugins: {
             legend: {display: false},
@@ -154,6 +201,8 @@ export function createBarChart(canvasEl, which) {
                   label(ctx) {
                      const label = String(ctx.label || "");
                      const val = ctx.parsed.x;
+                     const curAgg = chart._nmAgg;
+                     if (curAgg) return otherBarTooltipLabel(label, val, which, curAgg);
                      let formatted;
                      if (which === "rss") formatted = fmtRss(val);
                      else formatted = String(Math.round(val)) + "s";
@@ -164,6 +213,16 @@ export function createBarChart(canvasEl, which) {
          },
       },
    });
+   chart._nmAgg = null;
+   if (onSliceClick) {
+      chart.options.onClick = (_evt, elements) => {
+         if (!elements || elements.length === 0) return;
+         const idx = elements[0].index;
+         const key = chart.data.labels[idx];
+         onSliceClick(String(key));
+      };
+   }
+   return chart;
 }
 
 export function updateBarChart(chart, agg, group, which) {
@@ -185,6 +244,14 @@ export function updateBarChart(chart, agg, group, which) {
    const labels = agg.groups.map((g) => String(g.key));
    const data = agg.groups.map((g) => (which === "rss" ? g.rss : g.cpu));
    const backgroundColor = agg.groups.map((g, i) => colorFor(group, g.key, i));
+   chart._nmAgg = agg;
+   if (chart.options.plugins && chart.options.plugins.tooltip && chart.options.plugins.tooltip.callbacks) {
+      chart.options.plugins.tooltip.callbacks.label = function (ctx) {
+         const label = String(ctx.label || "");
+         const val = ctx.parsed.x;
+         return otherBarTooltipLabel(label, val, which, agg);
+      };
+   }
    chart.data.labels = labels;
    chart.data.datasets[0].data = data;
    chart.data.datasets[0].backgroundColor = backgroundColor;
@@ -204,15 +271,14 @@ export function updatePieChart(chart, agg, group) {
       if (pieCanvas) pieCanvas.hidden = false;
       if (pieEmpty) pieEmpty.hidden = true;
    }
-   // update tooltip total via options
    if (chart.options.plugins && chart.options.plugins.tooltip && chart.options.plugins.tooltip.callbacks) {
       chart.options.plugins.tooltip.callbacks.label = function (ctx) {
          const label = String(ctx.label || "");
          const value = ctx.parsed;
-         const pct = ((value / total) * 100).toFixed(1);
-         return label + ": " + String(value) + " (" + pct + "%)";
+         return otherTooltipLabel(label, value, total, agg);
       };
    }
+   chart._nmAgg = agg;
    chart.data.labels = ds.labels;
    chart.data.datasets[0].data = ds.data;
    chart.data.datasets[0].backgroundColor = ds.backgroundColor;

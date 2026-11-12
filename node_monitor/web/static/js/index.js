@@ -1,6 +1,6 @@
 import { ProcessModal } from "./modal.js";
 import { renderProcessTable, filterProcesses } from "./list.js";
-import { aggregateForGroup, createPieChart, updatePieChart, createBarChart, updateBarChart, colorFor } from "./live_charts.js";
+import { GROUP_DEFS, aggregateForGroup, createPieChart, updatePieChart, createBarChart, updateBarChart, colorFor } from "./live_charts.js";
 
 const CATEGORY_COLORS = { ai_agent: "#8b5cf6", editor_server: "#06b6d4", jupyter: "#f59e0b", build: "#ef4444", python: "#3b82f6", shell: "#6b7280", data_transfer: "#10b981", fs_scan: "#a3a3a3", scheduler: "#ec4899", workflow: "#14b8a6", system: "#52525b", other: "#9ca3af" };
 
@@ -103,36 +103,58 @@ function applyFilter() {
    const legend = document.getElementById("category-legend");
    if (legend) {
       legend.textContent = "";
-      const total = filtered.length || 1;
-      for (const g of agg.groups) {
+      if (agg.groups.length === 0) {
          const span = document.createElement("span");
          span.className = "legend-item";
-         const box = document.createElement("i");
-         box.className = "color-box";
-         box.style.background = colorFor(group, g.key);
-         span.appendChild(box);
-         span.appendChild(document.createTextNode(" " + String(g.key) + " " + String(g.count)));
+         span.textContent = "—";
          legend.appendChild(span);
+      } else {
+         for (const g of agg.groups) {
+            const span = document.createElement("span");
+            span.className = "legend-item";
+            const box = document.createElement("i");
+            box.className = "color-box";
+            box.style.background = colorFor(group, g.key);
+            span.appendChild(box);
+            span.appendChild(document.createTextNode(" " + String(g.key) + " " + String(g.count)));
+            legend.appendChild(span);
+         }
       }
       const catBar = bar?.querySelector(".category-bar");
       if (catBar) {
          catBar.textContent = "";
-         for (const g of agg.groups) {
-            const seg = document.createElement("div");
-            seg.className = "category-seg";
-            seg.dataset.category = String(g.key);
-            seg.dataset.count = String(g.count);
-            seg.style.width = ((g.count * 100 / total) + "%");
-            seg.style.background = colorFor(group, g.key);
-            catBar.appendChild(seg);
+         if (agg.groups.length === 0) {
+            catBar.style.width = "0%";
+         } else {
+            const total = filtered.length || 1;
+            for (const g of agg.groups) {
+               const seg = document.createElement("div");
+               seg.className = "category-seg";
+               seg.dataset.category = String(g.key);
+               seg.dataset.count = String(g.count);
+               seg.style.width = ((g.count * 100 / total) + "%");
+               seg.style.background = colorFor(group, g.key);
+               catBar.appendChild(seg);
+            }
          }
       }
    }
    void CATEGORY_COLORS;
+   function onSliceClick(key) {
+      const input = document.getElementById("process-filter");
+      if (!input) return;
+      if (key === "Other") {
+         input.value = "";
+      } else {
+         input.value = key;
+      }
+      input.dispatchEvent(new Event("input", {bubbles: true}));
+      applyFilter();
+   }
    const canvasEl = document.getElementById("pie-canvas");
    if (canvasEl) {
       if (!pieChart) {
-         pieChart = createPieChart(canvasEl, agg, group);
+         pieChart = createPieChart(canvasEl, agg, group, onSliceClick);
       } else {
          updatePieChart(pieChart, agg, group);
       }
@@ -140,7 +162,7 @@ function applyFilter() {
    const rssCanvasEl = document.getElementById("rss-canvas");
    if (rssCanvasEl) {
       if (!rssChart) {
-         rssChart = createBarChart(rssCanvasEl, "rss");
+         rssChart = createBarChart(rssCanvasEl, "rss", onSliceClick);
          updateBarChart(rssChart, agg, group, "rss");
       } else {
          updateBarChart(rssChart, agg, group, "rss");
@@ -149,7 +171,7 @@ function applyFilter() {
    const cpuCanvasEl = document.getElementById("cpu-canvas");
    if (cpuCanvasEl) {
       if (!cpuChart) {
-         cpuChart = createBarChart(cpuCanvasEl, "cpu");
+         cpuChart = createBarChart(cpuCanvasEl, "cpu", onSliceClick);
          updateBarChart(cpuChart, agg, group, "cpu");
       } else {
          updateBarChart(cpuChart, agg, group, "cpu");
@@ -160,11 +182,19 @@ function applyFilter() {
 function init() {
    try {
       const saved = sessionStorage.getItem("nm:live:group");
-      if (saved) group = saved;
+      if (saved && GROUP_DEFS[saved]) group = saved;
    } catch (_e) {}
    try {
       const savedNode = sessionStorage.getItem("nm:live:node");
-      if (savedNode) selectedNode = savedNode;
+      if (savedNode) {
+         if (savedNode === "__all") selectedNode = "__all";
+         else {
+            const tabsEl = document.getElementById("node-tabs");
+            const valid = tabsEl && tabsEl.querySelector('[data-node="' + savedNode.replace(/"/g, '\\"') + '"]');
+            if (valid) selectedNode = savedNode;
+            else selectedNode = "__all";
+         }
+      }
    } catch (_e) {}
    const groupSelect = document.getElementById("group-select");
    if (groupSelect) {
