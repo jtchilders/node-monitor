@@ -1,8 +1,6 @@
 import { ProcessModal } from "./modal.js";
 import { renderProcessTable, filterProcesses } from "./list.js";
-import { GROUP_DEFS, aggregateForGroup, createPieChart, updatePieChart, createBarChart, updateBarChart, colorFor } from "./live_charts.js";
-
-const CATEGORY_COLORS = { ai_agent: "#8b5cf6", editor_server: "#06b6d4", jupyter: "#f59e0b", build: "#ef4444", python: "#3b82f6", shell: "#6b7280", data_transfer: "#10b981", fs_scan: "#a3a3a3", scheduler: "#ec4899", workflow: "#14b8a6", system: "#52525b", other: "#9ca3af" };
+import { GROUP_DEFS, CATEGORY_COLORS, aggregateForGroup, createPieChart, updatePieChart, createBarChart, updateBarChart, colorFor } from "./live_charts.js";
 
 let allProcesses = [];
 let filtered = [];
@@ -77,7 +75,6 @@ async function refresh() {
             }
          }
       }
-      void usersData;
    } catch (e) {
       if (e.name !== "AbortError") showDisconnected(true);
    }
@@ -139,7 +136,6 @@ function applyFilter() {
          }
       }
    }
-   void CATEGORY_COLORS;
    function onSliceClick(key) {
       const input = document.getElementById("process-filter");
       if (!input) return;
@@ -148,7 +144,6 @@ function applyFilter() {
       } else {
          input.value = key;
       }
-      input.dispatchEvent(new Event("input", {bubbles: true}));
       applyFilter();
    }
    const canvasEl = document.getElementById("pie-canvas");
@@ -199,6 +194,10 @@ function init() {
    const groupSelect = document.getElementById("group-select");
    if (groupSelect) {
       groupSelect.value = group;
+      if (groupSelect.value !== group) {
+         group = "category";
+         groupSelect.value = "category";
+      }
       groupSelect.addEventListener("change", () => {
          group = groupSelect.value;
          try { sessionStorage.setItem("nm:live:group", group); } catch (_e) {}
@@ -207,8 +206,7 @@ function init() {
    }
    const filterInput = document.getElementById("process-filter");
    if (filterInput) {
-      filterInput.addEventListener("input", debounce((e) => {
-         void e;
+      filterInput.addEventListener("input", debounce(() => {
          applyFilter();
       }, 200));
    }
@@ -248,7 +246,6 @@ function init() {
    }
    pollTimer = setInterval(refresh, 30000);
    refresh();
-   void pollTimer;
 }
 
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);

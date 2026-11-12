@@ -43,7 +43,6 @@ export function aggregateForGroup(processes, group) {
       for (const g of tail) { other.count += g.count; other.rss += g.rss; other.cpu += g.cpu; }
       groups = [...head, other];
    }
-   void MAX_BARS;
    return {groups, total, capped};
 }
 

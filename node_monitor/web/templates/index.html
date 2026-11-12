@@ -24,7 +24,7 @@
    </div>
 </header>
 
-<div id="node-tabs" class="tab-bar" style="position:sticky; top:var(--header-height); z-index:90; background:var(--panel-bg); border-bottom:1px solid var(--accent-border); padding:0.25rem 1rem;">
+<div id="node-tabs" class="tab-bar" style="background:var(--panel-bg); border-bottom:1px solid var(--accent-border); padding:0.25rem 1rem;">
    <button class="tab-btn active" data-node="__all">All nodes</button>
    {% for n in nodes %}<button class="tab-btn" data-node="{{ n.label }}">{{ n.label }}</button>{% endfor %}
 </div>
