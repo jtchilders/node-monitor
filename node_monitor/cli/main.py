@@ -17,6 +17,9 @@ import click
 import psycopg
 
 from node_monitor.cli import live
+from node_monitor.cli.commands_cli import commands as commands_group
+from node_monitor.cli.history import history
+from node_monitor.cli.reclassify import reclassify
 from node_monitor.collector.daemon import Daemon
 from node_monitor.collector.instance import (
    AlreadyRunning,
@@ -75,6 +78,10 @@ cli.add_command(live.status)
 cli.add_command(live.nodes)
 for _command in (live.top, live.users, live.user, live.idle):
    cli.add_command(_command)
+
+cli.add_command(history)
+cli.add_command(commands_group)
+cli.add_command(reclassify)
 
 
 @cli.group()

@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}commands — node-monitor{% endblock %}
+{% block head %}
+<style>
+.commands-container { padding: 1rem; max-width: 1000px; margin: 0 auto; }
+.commands-header { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.commands-header h1 { font-size: 1.4rem; color: var(--text-color); }
+.search-box { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+.search-box input[type="text"] { flex: 1; min-width: 200px; padding: 6px 10px; border: 1px solid var(--accent-border); border-radius: 4px; background: var(--panel-bg); color: var(--text-color); font-size: 0.9rem; }
+.search-box button { padding: 6px 14px; border: 1px solid var(--accent-border); background: var(--panel-bg); color: var(--text-color); border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+.search-box button.primary { background: #1e40af; color: #fff; border-color: #3b82f6; }
+.mode-toggle { display: flex; gap: 0.3rem; align-items: center; font-size: 0.82rem; color: var(--text-dim); }
+.mode-toggle label { cursor: pointer; display: flex; align-items: center; gap: 0.2rem; }
+.filters { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+.filters input { padding: 4px 8px; border: 1px solid var(--accent-border); border-radius: 4px; background: var(--panel-bg); color: var(--text-dim); font-size: 0.82rem; width: 140px; }
+.results-meta { font-size: 0.82rem; color: var(--text-dim); margin-bottom: 0.5rem; }
+.cmd-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.cmd-table th { text-align: left; color: var(--text-dim); font-weight: 600; font-size: 0.72rem; text-transform: uppercase; padding: 0.3rem 0.4rem; border-bottom: 1px solid var(--accent-border); }
+.cmd-table td { padding: 0.3rem 0.4rem; border-bottom: 1px solid #1a2235; vertical-align: top; word-break: break-all; }
+.cmdline-cell { font-family: monospace; white-space: pre-wrap; word-break: break-all; }
+.pager { display: flex; gap: 0.5rem; align-items: center; justify-content: center; margin-top: 0.75rem; font-size: 0.82rem; }
+.pager button { padding: 3px 10px; border: 1px solid var(--accent-border); background: var(--panel-bg); color: var(--text-dim); border-radius: 4px; cursor: pointer; }
+.pager button:disabled { opacity: 0.4; cursor: default; }
+</style>
+{% endblock %}
+{% block content %}
+<div class="commands-container">
+  <div class="commands-header">
+    <h1>Commands</h1>
+    <a href="/" style="font-size:0.82rem; color:#60a5fa;">Back to live</a>
+    <a href="/analytics" style="font-size:0.82rem; color:#60a5fa;">Analytics</a>
+  </div>
+
+  <div class="search-box">
+    <input type="text" data-search-input placeholder="search commands…" />
+    <button class="primary" data-search-btn>Search</button>
+    <div class="mode-toggle" data-mode-toggle>
+      <label><input type="radio" name="search-mode" value="substring" checked /> substring</label>
+      <label><input type="radio" name="search-mode" value="regex" /> regex</label>
+    </div>
+  </div>
+
+  <div class="filters" data-filters>
+    <input type="text" data-filter-user placeholder="user" />
+    <input type="text" data-filter-activity placeholder="activity" />
+    <input type="text" data-filter-tag placeholder="tag" />
+  </div>
+
+  <div class="results-meta" data-results-meta></div>
+  <div data-results></div>
+  <div class="pager" data-pager>
+    <button data-prev disabled>Prev</button>
+    <span data-pageinfo>page 1</span>
+    <button data-next>Next</button>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script type="module" src="/static/js/commands.js"></script>
+{% endblock %}

@@ -90,13 +90,31 @@ node-monitor top --sort rss --limit 10
 node-monitor idle --min-idle 2h --format csv
 ```
 
+## History and analytics (M3)
+
+Collector stores notable processes (cpu≥0.1s/rss≥1 GiB/ai_agent/tagged) each minute and every user process at minute 0 into `process_samples` (daily partitions, 30d), and distinct redacted cmdlines into `command_lines` (730d). Tags (e.g. `agent.skip_permissions`) are table-driven in `pipeline/tags.py`.
+
+| Command | Shows |
+| --- | --- |
+| `node-monitor history --user X\|--node Y [--bucket 5m\|1h\|1d] [--format table\|json\|csv]` | 5m/1m roll-ups for a user or node (ISO timestamps) |
+| `node-monitor commands search PATTERN [--regex] [--user --activity --tag] [--limit]` | search `command_lines` (ILIKE escaped / `~` regex); bad regex exits 2 |
+| `node-monitor reclassify [--dry-run] [--apply]` | re-run classify+tags over `process_samples`+`command_lines` batched, report delta; writes only with `--apply` |
+
+`history` reads via `web.database_url`; `reclassify` writes via `database.url` (owner).
+
+```bash
+node-monitor commands search "claude" --limit 20
+node-monitor commands search "claude.*skip" --regex
+node-monitor reclassify --dry-run
+```
+
 ## Web dashboard
 
 ```bash
 node-monitor web --port 9998   # loopback only, read-only role
 ```
 
-Opens `http://127.0.0.1:9998/` — live overview (`/`), per-node (`/node/{node}`), per-user (`/user/{username}`), all polling every 30 s with a disconnected banner on failure. `web.database_url` must be set (reader role). Reach it from your laptop via `ssh -L 9998:localhost:9998 polaris-login-04`.
+Opens `http://127.0.0.1:9998/` — live overview (`/`), per-node (`/node/{node}`), per-user (`/user/{username}`), history (`/analytics`, `/commands`), all polling every 30 s with a disconnected banner on failure. `web.database_url` must be set (reader role). Reach it from your laptop via `ssh -L 9998:localhost:9998 polaris-login-04`.
 
 Vendor: Vue `3.4.38` + Chart.js `4.4.9` under `node_monitor/web/static/vendor/` (no CDN).
 

@@ -147,7 +147,8 @@ def processes(
    limit_sql, limit_params = _limit(limit)
    query = sql.SQL(
       "SELECT p.system, p.node, COALESCE(ln.label, n.label, p.node) AS label, p.username, p.pid,"
-      " p.start_time, p.category, p.activity, p.cpu_seconds, p.rss_kb, p.gpu_mem_mb, p.threads, p.state,"
+      " p.start_time, p.category, p.activity, p.cpu_seconds, p.rss_kb,"  # noqa: E501
+      " p.gpu_mem_mb, p.threads, p.state,"
       " p.cpu_state, p.idle_for_sec, p.idle_for_is_lower_bound, p.idle_bucket,"
       " p.owner_presence, p.cmdline, p.ts"
       " FROM live_processes p"

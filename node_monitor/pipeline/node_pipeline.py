@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 
 from node_monitor.config import ClassificationConfig, CollectionConfig, NodeConfig, RedactionConfig
@@ -9,15 +10,54 @@ from node_monitor.pipeline.enrich import enrich_census
 from node_monitor.pipeline.node_metrics import MinuteAggregator
 from node_monitor.pipeline.records import (
    COLLECTION_EVENT,
+   COMMAND_LINES,
    LIVE_NODE,
    LIVE_PROCESSES,
    NODE_HARDWARE,
    NODE_METRICS_1M,
+   PROCESS_SAMPLES,
    Record,
 )
 from node_monitor.pipeline.redact import Redactor
+from node_monitor.pipeline.tags import tags_for
 from node_monitor.pipeline.timestamps import require_aware
 from node_monitor.pipeline.usage import UsageAggregator
+
+PROCESS_SAMPLE_COLUMNS = (
+   "pid",
+   "start_time",
+   "username",
+   "uid",
+   "comm",
+   "exe",
+   "argv0",
+   "cmdline",
+   "cmdline_hash",
+   "ppid",
+   "parent_comm",
+   "parent_exe",
+   "parent_kind",
+   "category",
+   "activity",
+   "tags",
+   "state",
+   "threads",
+   "cpu_seconds",
+   "rss_kb",
+   "gpu_mem_mb",
+   "interactive",
+   "under_screen_or_tmux",
+   "cpu_state",
+   "idle_for_sec",
+   "idle_for_is_lower_bound",
+   "idle_bucket",
+   "owner_presence",
+   "hourly",
+)
+
+
+def _cmdline_hash(cmdline: str) -> str:
+   return hashlib.sha256(cmdline.encode()).hexdigest()
 
 
 class NodePipeline:
@@ -33,6 +73,8 @@ class NodePipeline:
       self._system = system
       self._node = node
       self._min_user_uid = classification.min_user_uid
+      self._notable_cpu = classification.notable_cpu_seconds_per_min
+      self._notable_rss_kb = int(classification.notable_rss_mb * 1024)
       self._redactor = Redactor(redaction.extra_patterns)
       self._minutes = MinuteAggregator(collection.counter_interval_sec)
       self._usage = UsageAggregator(collection.summary_interval_sec, collection.census_interval_sec)
@@ -135,6 +177,19 @@ class NodePipeline:
          self._row(label=self._node.label, updated_at=recv, session_state=state, **extra),
       )
 
+   def _is_notable(self, proc: dict) -> bool:
+      cpu = proc.get("cpu_seconds")
+      if cpu is not None and cpu >= self._notable_cpu:
+         return True
+      rss = proc.get("rss_kb")
+      if rss is not None and rss >= self._notable_rss_kb:
+         return True
+      if proc.get("category") == "ai_agent":
+         return True
+      if proc.get("tags"):
+         return True
+      return False
+
    def _census(self, msg, recv):
       rows = msg.get("processes")
       if rows is None:
@@ -153,10 +208,60 @@ class NodePipeline:
       enriched = enrich_census(
          rows, redactor=self._redactor, min_user_uid=self._min_user_uid, gpu_status=gpu_status
       )
+      # Add cmdline_hash and tags to enriched rows.
+      for proc in enriched:
+         cmdline = proc.get("cmdline") or ""
+         proc["cmdline_hash"] = _cmdline_hash(cmdline)
+         argv = cmdline.split() if cmdline else []
+         proc["tags"] = tags_for(proc.get("activity"), argv)
       out = [Record(LIVE_PROCESSES, self._row(ts=recv, processes=enriched))]
       out += self._usage_records(self._usage.add_census(enriched, recv, gpu_status))
       self._minutes.add_census(msg, recv)
+      # History: notable + hourly samples and command_lines sightings.
+      out += self._history_records(enriched, recv)
       return out
+
+   def _history_records(self, enriched: list[dict], recv: datetime) -> list[Record]:
+      hourly = recv.minute == 0
+      samples: list[Record] = []
+      for proc in enriched:
+         is_hourly = hourly and bool(proc.get("is_user_process"))
+         if not (self._is_notable(proc) or is_hourly):
+            continue
+         row = self._row(ts=recv, hourly=is_hourly)
+         for col in PROCESS_SAMPLE_COLUMNS:
+            if col == "hourly":
+               continue
+            row[col] = proc.get(col)
+         row["hourly"] = is_hourly
+         samples.append(Record(PROCESS_SAMPLES, row))
+      # command_lines: per distinct (username, cmdline_hash)
+      seen: set[tuple] = set()
+      cmdlines: list[Record] = []
+      for proc in enriched:
+         key = (proc.get("username"), proc.get("cmdline_hash"))
+         if key in seen:
+            continue
+         seen.add(key)
+         cmdlines.append(
+            Record(
+               COMMAND_LINES,
+               self._row(
+                  username=proc.get("username"),
+                  cmdline_hash=proc.get("cmdline_hash"),
+                  cmdline=proc.get("cmdline"),
+                  exe=proc.get("exe"),
+                  activity=proc.get("activity"),
+                  category=proc.get("category"),
+                  tags=proc.get("tags"),
+                  first_seen=recv,
+                  last_seen=recv,
+                  sample_count=1,
+                  nodes=[self._node.host],
+               ),
+            )
+         )
+      return samples + cmdlines
 
    def on_event(self, kind: str, detail: dict, recv: datetime) -> list[Record]:
       require_aware(recv)

@@ -23,18 +23,23 @@ from node_monitor.database.connect import DatabaseUnavailable, connect, is_unava
 from node_monitor.database.maintenance import (
    PARTITION_KEY,
    PARTITIONED,
+   ensure_daily_partition,
    ensure_partition,
    partition_name,
+   partition_name_daily,
 )
 from node_monitor.pipeline.enrich import LIVE_PROCESS_COLUMNS
 from node_monitor.pipeline.node_metrics import NODE_METRICS_COLUMNS
+from node_monitor.pipeline.node_pipeline import PROCESS_SAMPLE_COLUMNS
 from node_monitor.pipeline.records import (
    COLLECTION_EVENT,
+   COMMAND_LINES,
    LIVE_NODE,
    LIVE_PROCESSES,
    NODE_HARDWARE,
    NODE_METRICS_1M,
    NODE_USAGE_5M,
+   PROCESS_SAMPLES,
    USER_USAGE_5M,
    Record,
 )
@@ -52,6 +57,8 @@ _TABLE = {
    USER_USAGE_5M: "user_usage_5m",
    NODE_USAGE_5M: "node_usage_5m",
    COLLECTION_EVENT: "collection_events",
+   PROCESS_SAMPLES: "process_samples",
+   COMMAND_LINES: "command_lines",
 }
 
 # Summary table -> (columns after system/node, primary key).
@@ -154,6 +161,40 @@ _EVENT_SQL = sql.SQL(
 
 _PROCESS_SQL = _insert("live_processes", _IDENTITY + ("ts",) + LIVE_PROCESS_COLUMNS)
 
+_PROCESS_SAMPLE_IDENTITY = ("system", "node")
+_PROCESS_SAMPLE_COLUMNS = PROCESS_SAMPLE_COLUMNS
+_COMMAND_LINE_COLUMNS = (
+   "system",
+   "username",
+   "cmdline_hash",
+   "cmdline",
+   "exe",
+   "activity",
+   "category",
+   "tags",
+   "first_seen",
+   "last_seen",
+   "sample_count",
+   "nodes",
+)
+
+_PROCESS_SAMPLE_SQL = sql.SQL(
+   "{} ON CONFLICT (system, node, ts, pid, start_time) DO NOTHING"
+).format(_insert("process_samples", _PROCESS_SAMPLE_IDENTITY + ("ts",) + _PROCESS_SAMPLE_COLUMNS))
+
+_COMMAND_LINE_SQL = sql.SQL(
+   "{} ON CONFLICT (system, username, cmdline_hash) DO UPDATE SET"
+   " cmdline = EXCLUDED.cmdline,"
+   " exe = EXCLUDED.exe,"
+   " activity = EXCLUDED.activity,"
+   " category = EXCLUDED.category,"
+   " tags = EXCLUDED.tags,"
+   " first_seen = LEAST(command_lines.first_seen, EXCLUDED.first_seen),"
+   " last_seen = GREATEST(command_lines.last_seen, EXCLUDED.last_seen),"
+   " sample_count = command_lines.sample_count + EXCLUDED.sample_count,"
+   " nodes = (SELECT ARRAY(SELECT DISTINCT UNNEST(command_lines.nodes || EXCLUDED.nodes)))"
+).format(_insert("command_lines", _COMMAND_LINE_COLUMNS))
+
 # The upsert both orders snapshots and locks the node's row, so the DELETE and INSERT that
 # follow cannot interleave with another writer's snapshot of the same node.
 _SNAPSHOT_SQL = """
@@ -212,6 +253,10 @@ class _Plan:
    events: list = field(default_factory=list)
    # (table, partition name) -> a time in that partition's month.
    months: dict = field(default_factory=dict)
+   # (table, daily partition name) -> a time in that partition's day.
+   daily: dict = field(default_factory=dict)
+   process_samples: list = field(default_factory=list)
+   command_lines: list = field(default_factory=list)
    beyond: Counter = field(default_factory=Counter)
 
 
@@ -327,6 +372,10 @@ class DatabaseWriter:
          table: now - timedelta(days=getattr(self._retention, attr))
          for table, attr in PARTITIONED.items()
       }
+      # Daily table cutoffs (not in PARTITIONED monthly dict).
+      daily_cutoffs = {
+         "process_samples": now - timedelta(days=self._retention.process_samples_days),
+      }
       plan = _Plan()
       for rec in records:
          table = _TABLE[rec.kind]
@@ -336,16 +385,23 @@ class DatabaseWriter:
             ts = row.get(column)
             if ts is None:
                raise ValueError(f"{rec.kind} record without {column}")
-            # A naive time would be read in the server's zone: refuse it before comparing.
             require_aware(ts)
             if ts < cutoffs[table]:
                plan.beyond[table] += 1
                continue
             plan.months.setdefault((table, partition_name(table, ts)), ts)
+         elif table == "process_samples":
+            ts = row.get("ts")
+            if ts is None:
+               raise ValueError(f"{rec.kind} record without ts")
+            require_aware(ts)
+            if ts < daily_cutoffs["process_samples"]:
+               plan.beyond[table] += 1
+               continue
+            plan.daily.setdefault((table, partition_name_daily(table, ts)), ts)
          if rec.kind == LIVE_PROCESSES:
             key = (row["system"], row["node"])
             current = plan.snapshots.get(key)
-            # Later in the batch wins a tie, as it would across batches.
             if current is None or row["ts"] >= current["ts"]:
                plan.snapshots[key] = row
          elif rec.kind == LIVE_NODE:
@@ -366,6 +422,13 @@ class DatabaseWriter:
                   to_db_value({} if detail is None else detail),
                )
             )
+         elif rec.kind == PROCESS_SAMPLES:
+            plan.process_samples.append(row)
+         elif rec.kind == COMMAND_LINES:
+            for col in ("first_seen", "last_seen"):
+               if row.get(col) is not None:
+                  require_aware(row[col])
+            plan.command_lines.append(row)
          else:
             columns = _SUMMARIES[table][0]
             plan.summaries.setdefault(table, []).append(
@@ -381,6 +444,9 @@ class DatabaseWriter:
          for (table, name), ts in sorted(plan.months.items()):
             if ensure_partition(conn, table, ts):
                created.append(name)
+         for (table, name), ts in sorted(plan.daily.items()):
+            if ensure_daily_partition(conn, table, ts):
+               created.append(name)
       return created
 
    def _apply(self, conn, plan):
@@ -391,6 +457,24 @@ class DatabaseWriter:
          for table, params in plan.summaries.items():
             cur.executemany(_SUMMARY_SQL[table], params)
             written[table] += cur.rowcount
+         if plan.process_samples:
+            cur.executemany(
+               _PROCESS_SAMPLE_SQL,
+               [
+                  [
+                     to_db_value(r.get(c))
+                     for c in _PROCESS_SAMPLE_IDENTITY + ("ts",) + _PROCESS_SAMPLE_COLUMNS
+                  ]
+                  for r in plan.process_samples
+               ],
+            )
+            written["process_samples"] += cur.rowcount
+         if plan.command_lines:
+            cur.executemany(
+               _COMMAND_LINE_SQL,
+               [[to_db_value(r.get(c)) for c in _COMMAND_LINE_COLUMNS] for r in plan.command_lines],
+            )
+            written["command_lines"] += cur.rowcount
          if plan.events:
             cur.executemany(_EVENT_SQL, plan.events)
             written["collection_events"] += cur.rowcount

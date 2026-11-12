@@ -42,6 +42,8 @@ class CollectionConfig:
 class ClassificationConfig:
    active_cpu_seconds_per_min: float = 0.1
    min_user_uid: int = 1000
+   notable_cpu_seconds_per_min: float = 0.1
+   notable_rss_mb: float = 1024
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,8 @@ class RetentionConfig:
    node_metrics_days: int = 730
    usage_summary_days: int = 730
    collection_events_days: int = 180
+   process_samples_days: int = 30
+   command_lines_days: int = 730
 
 
 @dataclass(frozen=True)
@@ -107,9 +111,9 @@ TOP_LEVEL_KEYS = {
 }
 # Spec keys that M1+ consumes; accepted so one config file serves every milestone.
 _COLLECTION_FUTURE = {"hourly_census"}
-_CLASSIFICATION_FUTURE = {"notable_cpu_seconds_per_min", "notable_rss_mb"}
+_CLASSIFICATION_FUTURE: set[str] = set()
 # Retention for these arrives with the process tables in M3.
-_RETENTION_FUTURE = {"process_samples_days", "command_lines_days"}
+_RETENTION_FUTURE: set[str] = set()
 _NODE_KEYS = {"host", "label", "ssh_target"}
 
 
@@ -311,7 +315,13 @@ def load_config(path: str | None = None) -> Config:
    _check_url("web.database_url", web.database_url)
    _positive_finite("database", "connect_timeout_sec", database.connect_timeout_sec)
    _positive_int("spool", "max_bytes", spool.max_bytes)
-   for key in ("node_metrics_days", "usage_summary_days", "collection_events_days"):
+   for key in (
+      "node_metrics_days",
+      "usage_summary_days",
+      "collection_events_days",
+      "process_samples_days",
+      "command_lines_days",
+   ):
       _positive_int("retention", key, getattr(retention, key))
    if not isinstance(web.host, str) or not web.host:
       raise ConfigError(f"web.host must be a non-empty string, got {web.host!r}")

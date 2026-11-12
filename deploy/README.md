@@ -64,6 +64,12 @@ curl -s http://127.0.0.1:9998/api/health | python3 -m json.tool
 
 Loopback only, read-only role (`web.database_url`). Vendor pins `vue@3.4.38` + `chart.js@4.4.9` (no CDN).
 
+## After M3 — history
+
+- `database migrate` creates `process_samples` (daily, 30d) and `command_lines` (730d) + `pg_trgm` GIN for `/api/commands/search`.
+- `/analytics` APIs cap to 730 points via auto-bucket; `/commands` ILIKE escapes `%`/`_`, regex via `~`.
+- Smoke steps are in `docs/m3-smoke.md`.
+
 ## Pitfalls
 
 - Do not run a soak and the daemon at the same time: they take over each other's probes on
