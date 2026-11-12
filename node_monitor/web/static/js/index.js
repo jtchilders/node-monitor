@@ -47,9 +47,18 @@ async function refresh() {
       if (signal.aborted) return;
       const strip = document.getElementById("health-strip");
       if (strip && health) {
+         const age = health.heartbeat_age_s;
+         let cls = "freshness-indicator ";
+         if (!health.ok || (age != null && age > 120)) cls += "red";
+         else if (age != null && age >= 60) cls += "yellow";
+         else cls += "green";
+         strip.className = cls;
          strip.textContent = "";
+         const dot = document.createElement("span");
+         dot.className = "dot";
+         strip.appendChild(dot);
          const hbEl = document.createElement("span");
-         hbEl.textContent = health.ok ? "ok heartbeat " + (health.heartbeat_age_s ?? "") + "s" : "degraded heartbeat " + (health.heartbeat_age_s ?? "none") + "s";
+         hbEl.textContent = health.ok ? "ok heartbeat " + (age ?? "") + "s" : "degraded heartbeat " + (age ?? "none") + "s";
          strip.appendChild(hbEl);
          for (const n of health.nodes || []) {
             const el = document.createElement("span");
@@ -76,7 +85,11 @@ async function refresh() {
          }
       }
    } catch (e) {
-      if (e.name !== "AbortError") showDisconnected(true);
+      if (e.name !== "AbortError") {
+         showDisconnected(true);
+         const strip = document.getElementById("health-strip");
+         if (strip) strip.className = "freshness-indicator disconnected";
+      }
    }
 }
 

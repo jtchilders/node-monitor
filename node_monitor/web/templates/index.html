@@ -7,7 +7,7 @@
 <header class="header-bar">
    <div class="header-left">
       <h1>Polaris Login Nodes</h1>
-      <div class="freshness-indicator" id="health-strip" data-heartbeat-age="{{ heartbeat_age_s if heartbeat_age_s is not none else '' }}" data-ok="{{ ok }}">
+      <div class="freshness-indicator {% if ok %}green{% else %}red{% endif %}" id="health-strip" data-heartbeat-age="{{ heartbeat_age_s if heartbeat_age_s is not none else '' }}" data-ok="{{ ok }}">
          <span class="dot"></span>
          <span id="health-text">
          {% if heartbeat_age_s is not none %}heartbeat {{ heartbeat_age_s }}s ago{% if heartbeat_state %} — {{ heartbeat_state }}{% endif %}{% else %}no heartbeat{% endif %}
@@ -39,6 +39,8 @@
 <div class="legend" id="category-legend" style="padding:0.5rem 1rem; background:var(--panel-bg); border-bottom:1px solid var(--accent-border);">
 {% for cat, cnt in category_counts.items() %}
    <span class="legend-item"><i class="color-box" style="background: {{ category_colors[cat] if cat in category_colors else '#9ca3af' }}"></i>{{ cat }} {{ cnt }}</span>
+{% else %}
+   <span class="legend-item"><i class="color-box" style="background: #9ca3af"></i>No data</span>
 {% endfor %}
 </div>
 
