@@ -176,6 +176,12 @@ function applyFilter() {
       }
       applyFilter();
    }
+   const pieTotalEl = document.getElementById("pie-total");
+   if (pieTotalEl) {
+      if (filtered.length === 0) pieTotalEl.textContent = "No processes";
+      else if (selectedNode === "__all") pieTotalEl.textContent = String(filtered.length) + " processes";
+      else pieTotalEl.textContent = String(filtered.length) + " processes on " + selectedNode;
+   }
    const canvasEl = document.getElementById("pie-canvas");
    if (canvasEl) {
       if (!pieChart) {
@@ -207,7 +213,7 @@ function applyFilter() {
    const cpuTotalEl = document.getElementById("cpu-total");
    if (cpuTotalEl) {
       if (filtered.length === 0) cpuTotalEl.textContent = "No processes";
-      else cpuTotalEl.textContent = formatResourceLabel(totalCpu, 0, "cpu") + (hasAvail ? " · " + String(Object.keys(nodeCaps).length) + " nodes" : "");
+      else cpuTotalEl.textContent = formatResourceLabel(totalCpu, 0, "cpu");
    }
    const rssCanvasEl = document.getElementById("rss-canvas");
    const rssEmptyEl = document.getElementById("rss-empty");
