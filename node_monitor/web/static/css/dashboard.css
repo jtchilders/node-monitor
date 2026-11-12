@@ -1196,6 +1196,8 @@ canvas {
    gap: 0.5rem;
 }
 
+.resource-total { font-size: 0.75rem; color: var(--text-dim); text-align: center; padding: 0.25rem 0; }
+
 #group-select {
    background: #1e293b;
    color: var(--text-color);

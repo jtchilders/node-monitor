@@ -1,6 +1,6 @@
 import { ProcessModal } from "./modal.js";
 import { renderProcessTable, filterProcesses } from "./list.js";
-import { GROUP_DEFS, CATEGORY_COLORS, aggregateForGroup, createPieChart, updatePieChart, createBarChart, updateBarChart, colorFor } from "./live_charts.js";
+import { GROUP_DEFS, CATEGORY_COLORS, aggregateForGroup, createPieChart, updatePieChart, createBarChart, updateBarChart, colorFor, buildResourcePieDataset, formatResourceLabel, createResourcePieChart, updateResourcePieChart } from "./live_charts.js";
 
 let allProcesses = [];
 let filtered = [];
@@ -12,6 +12,7 @@ let rssChart = null;
 let cpuChart = null;
 let pollTimer = null;
 let abortCtrl = null;
+let nodeCaps = {};
 
 function debounce(fn, ms) {
    let t = null;
@@ -38,12 +39,28 @@ async function refresh() {
    abortCtrl = new AbortController();
    const signal = abortCtrl.signal;
    try {
-      const [health, procs, usersData, eventsData] = await Promise.all([
+      const [health, procs, usersData, eventsData, nodesData] = await Promise.all([
          fetchJson("/api/health", signal),
          fetchJson("/api/live/processes", signal),
          fetchJson("/api/live/users", signal),
          fetchJson("/api/live/events?limit=20", signal),
+         fetchJson("/api/live/nodes", signal).catch(() => ({items: []})),
       ]);
+      if (nodesData && nodesData.items) {
+         nodeCaps = {};
+         for (const n of nodesData.items) {
+            const lbl = n.label || n.node;
+            if (lbl) nodeCaps[lbl] = n;
+         }
+      }
+      // also hydrate from SSR per-node-cards if no nodesData (fallback)
+      if (Object.keys(nodeCaps).length === 0) {
+         const cards = document.querySelectorAll("#per-node-cards [data-node]");
+         for (const c of cards) {
+            const lbl = c.dataset.node;
+            if (lbl && !nodeCaps[lbl]) nodeCaps[lbl] = {label: lbl, mem_total_kb: null};
+         }
+      }
       if (signal.aborted) return;
       const strip = document.getElementById("health-strip");
       if (strip && health) {
@@ -167,22 +184,53 @@ function applyFilter() {
          updatePieChart(pieChart, agg, group);
       }
    }
+   // node capacity totals for labels
+   let totalAvailMem = 0;
+   let hasAvail = false;
+   if (selectedNode === "__all") {
+      for (const lbl of Object.keys(nodeCaps)) {
+         const v = nodeCaps[lbl] && nodeCaps[lbl].mem_total_kb;
+         if (v) { totalAvailMem += v; hasAvail = true; }
+      }
+   } else {
+      const cap = nodeCaps[selectedNode];
+      if (cap && cap.mem_total_kb) { totalAvailMem = cap.mem_total_kb; hasAvail = true; }
+   }
+   const totalUsedMem = filtered.reduce((s, p) => s + (p.rss_kb || 0), 0);
+   const rssTotalEl = document.getElementById("rss-total");
+   if (rssTotalEl) {
+      if (hasAvail) rssTotalEl.textContent = formatResourceLabel(totalUsedMem, totalAvailMem, "memory");
+      else if (filtered.length > 0) rssTotalEl.textContent = formatResourceLabel(totalUsedMem, 0, "memory");
+      else rssTotalEl.textContent = "No processes";
+   }
+   const totalCpu = filtered.reduce((s, p) => s + (p.cpu_seconds || 0), 0);
+   const cpuTotalEl = document.getElementById("cpu-total");
+   if (cpuTotalEl) {
+      if (filtered.length === 0) cpuTotalEl.textContent = "No processes";
+      else cpuTotalEl.textContent = formatResourceLabel(totalCpu, 0, "cpu") + (hasAvail ? " · " + String(Object.keys(nodeCaps).length) + " nodes" : "");
+   }
    const rssCanvasEl = document.getElementById("rss-canvas");
+   const rssEmptyEl = document.getElementById("rss-empty");
+   const cpuCanvasEl = document.getElementById("cpu-canvas");
+   const cpuEmptyEl = document.getElementById("cpu-empty");
+   const rssEmpty = !agg.groups || agg.groups.length === 0;
+   const cpuEmpty = rssEmpty;
    if (rssCanvasEl) {
+      if (rssEmpty) { rssCanvasEl.hidden = true; if (rssEmptyEl) rssEmptyEl.hidden = false; }
+      else { rssCanvasEl.hidden = false; if (rssEmptyEl) rssEmptyEl.hidden = true; }
       if (!rssChart) {
-         rssChart = createBarChart(rssCanvasEl, "rss", onSliceClick);
-         updateBarChart(rssChart, agg, group, "rss");
+         rssChart = createResourcePieChart(rssCanvasEl, agg, group, "rss", onSliceClick);
       } else {
-         updateBarChart(rssChart, agg, group, "rss");
+         updateResourcePieChart(rssChart, agg, group, "rss");
       }
    }
-   const cpuCanvasEl = document.getElementById("cpu-canvas");
    if (cpuCanvasEl) {
+      if (cpuEmpty) { cpuCanvasEl.hidden = true; if (cpuEmptyEl) cpuEmptyEl.hidden = false; }
+      else { cpuCanvasEl.hidden = false; if (cpuEmptyEl) cpuEmptyEl.hidden = true; }
       if (!cpuChart) {
-         cpuChart = createBarChart(cpuCanvasEl, "cpu", onSliceClick);
-         updateBarChart(cpuChart, agg, group, "cpu");
+         cpuChart = createResourcePieChart(cpuCanvasEl, agg, group, "cpu", onSliceClick);
       } else {
-         updateBarChart(cpuChart, agg, group, "cpu");
+         updateResourcePieChart(cpuChart, agg, group, "cpu");
       }
    }
 }
