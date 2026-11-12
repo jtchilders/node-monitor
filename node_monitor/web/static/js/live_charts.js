@@ -123,12 +123,15 @@ export function createPieChart(canvasEl, agg, group, onSliceClick) {
             legend: {
                position: "right",
                labels: {
+                  color: "#e2e8f0",
                   generateLabels(chartInstance) {
                      const ds0 = chartInstance.data.datasets[0] || {data: []};
                      const lbs = chartInstance.data.labels || [];
                      return lbs.map((label, i) => ({
                         text: String(label),
                         fillStyle: (ds0.backgroundColor && ds0.backgroundColor[i]) || "#9ca3af",
+                        fontColor: "#e2e8f0",
+                        strokeStyle: (ds0.backgroundColor && ds0.backgroundColor[i]) || "#9ca3af",
                         hidden: false,
                         index: i,
                      }));
@@ -199,10 +202,10 @@ export function createResourcePieChart(canvasEl, agg, group, weightKey, onSliceC
             onSliceClick(String(key));
          },
          plugins: {
-            legend: {position: "right", labels: {generateLabels(chartInstance) {
+            legend: {position: "right", labels: {color: "#e2e8f0", generateLabels(chartInstance) {
                const ds0 = chartInstance.data.datasets[0] || {data: []};
                const lbs = chartInstance.data.labels || [];
-               return lbs.map((label, i) => ({text: String(label), fillStyle: (ds0.backgroundColor && ds0.backgroundColor[i]) || "#9ca3af", hidden: false, index: i}));
+               return lbs.map((label, i) => ({text: String(label), fillStyle: (ds0.backgroundColor && ds0.backgroundColor[i]) || "#9ca3af", fontColor: "#e2e8f0", strokeStyle: (ds0.backgroundColor && ds0.backgroundColor[i]) || "#9ca3af", hidden: false, index: i}));
             }}},
             tooltip: {callbacks: {label(ctx) {
                const label = String(ctx.label || "");
