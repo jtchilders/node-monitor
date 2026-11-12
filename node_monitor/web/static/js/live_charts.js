@@ -4,7 +4,7 @@ export const CATEGORY_COLORS = {ai_agent:"#8b5cf6",editor_server:"#06b6d4",jupyt
 
 export const GROUP_DEFS = {category:{label:"Category",key:(p)=>p.category||"other"},activity:{label:"Activity",key:(p)=>p.activity||"other"},user:{label:"User",key:(p)=>p.username||"unknown"},node:{label:"Node",key:(p)=>p.label||p.node||"unknown"},presence:{label:"Presence",key:(p)=>p.owner_presence||"unknown"}};
 
-const MAX_SLICES = 12;
+const MAX_SLICES = 8;
 const MAX_BARS = 12;
 
 function djb2(s) {
@@ -39,9 +39,18 @@ export function aggregateForGroup(processes, group) {
       capped = true;
       const head = groups.slice(0, maxItems - 1);
       const tail = groups.slice(maxItems - 1);
-      const other = {key:"Other",count:0,rss:0,cpu:0,groupCount:tail.length};
-      for (const g of tail) { other.count += g.count; other.rss += g.rss; other.cpu += g.cpu; }
-      groups = [...head, other];
+      // If head already contains an "other" bucket (natural group), merge tail into it
+      // to avoid duplicate "other" vs "Other" slices (e.g. activity grouping)
+      const existingOther = head.find((g) => String(g.key).toLowerCase() === "other");
+      if (existingOther) {
+         for (const g of tail) { existingOther.count += g.count; existingOther.rss += g.rss; existingOther.cpu += g.cpu; }
+         existingOther.groupCount = (existingOther.groupCount || 0) + tail.length;
+         groups = head;
+      } else {
+         const other = {key:"Other",count:0,rss:0,cpu:0,groupCount:tail.length};
+         for (const g of tail) { other.count += g.count; other.rss += g.rss; other.cpu += g.cpu; }
+         groups = [...head, other];
+      }
    }
    return {groups, total, capped};
 }

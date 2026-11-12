@@ -26,7 +26,7 @@ def test_aggregate_counts_and_sums():
 def test_aggregate_caps_at_12_with_other():
    procs = [{"username": f"u{i}", "rss_kb": 1, "cpu_seconds": 1} for i in range(20)]
    agg = aggregateForGroup(procs, "user")
-   assert len(agg["groups"]) == 12 and agg["groups"][-1]["key"] == "Other" and agg["capped"] is True
+   assert len(agg["groups"]) == 8 and agg["groups"][-1]["key"] == "Other" and agg["capped"] is True
 
 
 def test_colorFor_category_reuses_CATEGORY_COLORS():
@@ -48,7 +48,7 @@ def test_buildPieDataset_uses_text_labels():
 def test_other_bucket_tooltip_includes_group_count():
    procs = [{"username": f"u{i}", "rss_kb": 1, "cpu_seconds": 1} for i in range(30)]
    agg = aggregateForGroup(procs, "user")
-   assert any(g["key"] == "Other" and g["count"] == 19 for g in agg["groups"])
+   assert any(g["key"] == "Other" and g["count"] == 23 for g in agg["groups"])
 
 
 def test_clicking_pie_slice_sets_filter_js_exists(tmp_path=None):
@@ -72,7 +72,7 @@ def test_other_bucket_js_tooltip():
    agg = aggregateForGroup(procs, "user")
    other = next((g for g in agg["groups"] if g["key"] == "Other"), None)
    assert other is not None
-   assert other["count"] == 19
+   assert other["count"] == 23
    from pathlib import Path
 
    js_path = Path(__file__).parents[2] / "node_monitor" / "web" / "static" / "js" / "live_charts.js"
@@ -124,4 +124,15 @@ def test_buildResourcePieDataset_empty():
    agg = {"groups": [], "total": 0, "capped": False}
    ds = buildResourcePieDataset(agg, "category", "rss")
    assert ds["labels"] == [] and ds["data"] == []
+
+
+def test_activity_other_merges_with_overflow_other():
+   # Activity's natural "other" + capping "Other" must collapse to one slice
+   procs = [{"activity": "other", "rss_kb": 100, "cpu_seconds": 10} for _ in range(5)]
+   procs += [{"activity": f"act{i}", "rss_kb": 1, "cpu_seconds": 1} for i in range(15)]
+   agg = aggregateForGroup(procs, "activity")
+   other_slices = [g for g in agg["groups"] if g["key"].lower() == "other"]
+   assert len(other_slices) == 1, f"expected one 'other' slice, got {other_slices}"
+   # head had "other" plus overflow folded in, so its count > 5
+   assert other_slices[0]["count"] > 5
 

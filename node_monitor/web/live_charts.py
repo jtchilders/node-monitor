@@ -30,7 +30,7 @@ CATEGORY_COLORS = {
    "other": "#9ca3af",
 }
 
-MAX_SLICES = 12
+MAX_SLICES = 8
 MAX_BARS = 12
 
 
@@ -78,13 +78,23 @@ def aggregate_for_group(processes, group):
       capped = True
       head = groups[: max_items - 1]
       tail = groups[max_items - 1 :]
-      other = {
-         "key": "Other",
-         "count": sum(g["count"] for g in tail),
-         "rss": sum(g["rss"] for g in tail),
-         "cpu": sum(g["cpu"] for g in tail),
-      }
-      groups = head + [other]
+      # Merge into existing "other" if present to avoid duplicate other/Other
+      existing = next((g for g in head if str(g["key"]).lower() == "other"), None)
+      if existing is not None:
+         for g in tail:
+            existing["count"] += g["count"]
+            existing["rss"] += g["rss"]
+            existing["cpu"] += g["cpu"]
+         existing["groupCount"] = existing.get("groupCount", 0) + len(tail)
+         groups = head
+      else:
+         other = {
+            "key": "Other",
+            "count": sum(g["count"] for g in tail),
+            "rss": sum(g["rss"] for g in tail),
+            "cpu": sum(g["cpu"] for g in tail),
+         }
+         groups = head + [other]
    return {"groups": groups, "total": total, "capped": capped}
 
 
