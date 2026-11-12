@@ -1182,7 +1182,8 @@ canvas {
    border-radius: 8px;
    padding: 0.75rem;
    min-height: 220px;
-   overflow: hidden;
+   overflow: visible;
+   position: relative;
 }
 #pie-canvas { max-height: 280px; }
 #rss-canvas, #cpu-canvas { max-height: 320px; width: 100%; }
@@ -1263,7 +1264,7 @@ canvas {
    opacity: 0;
    visibility: hidden;
    transition: opacity 0.15s, visibility 0.15s;
-   z-index: 50;
+   z-index: 95;
    pointer-events: none;
    text-transform: none;
    letter-spacing: normal;
@@ -1279,7 +1280,7 @@ canvas {
    opacity: 0;
    visibility: hidden;
    transition: opacity 0.15s, visibility 0.15s;
-   z-index: 51;
+   z-index: 96;
 }
 .help-icon:hover::after,
 .help-icon:focus::after,
