@@ -1,12 +1,12 @@
 import { ProcessModal } from "./modal.js";
 import { renderProcessTable, filterProcesses } from "./list.js";
-import { aggregateForGroup, createPieChart, updatePieChart, createBarChart, updateBarChart } from "./live_charts.js";
+import { aggregateForGroup, createPieChart, updatePieChart, createBarChart, updateBarChart, colorFor } from "./live_charts.js";
 
 const CATEGORY_COLORS = { ai_agent: "#8b5cf6", editor_server: "#06b6d4", jupyter: "#f59e0b", build: "#ef4444", python: "#3b82f6", shell: "#6b7280", data_transfer: "#10b981", fs_scan: "#a3a3a3", scheduler: "#ec4899", workflow: "#14b8a6", system: "#52525b", other: "#9ca3af" };
 
 let allProcesses = [];
 let filtered = [];
-let mode = "process"; // process | user
+let mode = "process";
 let selectedNode = "__all";
 let group = "category";
 let pieChart = null;
@@ -46,8 +46,7 @@ async function refresh() {
          fetchJson("/api/live/users", signal),
          fetchJson("/api/live/events?limit=20", signal),
       ]);
-
-      // health strip update
+      if (signal.aborted) return;
       const strip = document.getElementById("health-strip");
       if (strip && health) {
          strip.textContent = "";
@@ -62,14 +61,10 @@ async function refresh() {
             strip.appendChild(el);
          }
       }
-
       allProcesses = procs.items || [];
+      if (signal.aborted) return;
       applyFilter();
-
-      // disconnected banner off on success
       showDisconnected(false);
-
-      // events
       const evEl = document.getElementById("recent-events");
       if (evEl && eventsData) {
          const ul = evEl.querySelector("ul");
@@ -82,6 +77,7 @@ async function refresh() {
             }
          }
       }
+      void usersData;
    } catch (e) {
       if (e.name !== "AbortError") showDisconnected(true);
    }
@@ -101,42 +97,38 @@ function applyFilter() {
          onRowClick: (proc) => ProcessModal.open({ system: proc.system || "polaris", node: proc.node, pid: proc.pid, start_time: proc.start_time }),
       });
    }
-   // category bar + legend: recompute from filtered
+   const agg = aggregateForGroup(filtered, group);
    const bar = document.getElementById("category-mix");
    if (bar) bar.dataset.total = String(filtered.length);
-   const counts = {};
-   for (const p of filtered) counts[p.category || "other"] = (counts[p.category || "other"] || 0) + 1;
    const legend = document.getElementById("category-legend");
    if (legend) {
       legend.textContent = "";
       const total = filtered.length || 1;
-      for (const [cat, cnt] of Object.entries(counts).sort((a,b) => b[1]-a[1])) {
+      for (const g of agg.groups) {
          const span = document.createElement("span");
          span.className = "legend-item";
          const box = document.createElement("i");
          box.className = "color-box";
-         box.style.background = CATEGORY_COLORS[cat] || "#9ca3af";
+         box.style.background = colorFor(group, g.key);
          span.appendChild(box);
-         span.appendChild(document.createTextNode(" " + cat + " " + cnt));
+         span.appendChild(document.createTextNode(" " + String(g.key) + " " + String(g.count)));
          legend.appendChild(span);
       }
-      // update category bar segments
       const catBar = bar?.querySelector(".category-bar");
       if (catBar) {
          catBar.textContent = "";
-         for (const [cat, cnt] of Object.entries(counts)) {
+         for (const g of agg.groups) {
             const seg = document.createElement("div");
             seg.className = "category-seg";
-            seg.dataset.category = cat;
-            seg.dataset.count = String(cnt);
-            seg.style.width = ((cnt * 100 / total) + "%");
-            seg.style.background = CATEGORY_COLORS[cat] || "#9ca3af";
+            seg.dataset.category = String(g.key);
+            seg.dataset.count = String(g.count);
+            seg.style.width = ((g.count * 100 / total) + "%");
+            seg.style.background = colorFor(group, g.key);
             catBar.appendChild(seg);
          }
       }
    }
-   // pie chart
-   const agg = aggregateForGroup(filtered, group);
+   void CATEGORY_COLORS;
    const canvasEl = document.getElementById("pie-canvas");
    if (canvasEl) {
       if (!pieChart) {
@@ -166,10 +158,13 @@ function applyFilter() {
 }
 
 function init() {
-   // restore group from sessionStorage
    try {
       const saved = sessionStorage.getItem("nm:live:group");
       if (saved) group = saved;
+   } catch (_e) {}
+   try {
+      const savedNode = sessionStorage.getItem("nm:live:node");
+      if (savedNode) selectedNode = savedNode;
    } catch (_e) {}
    const groupSelect = document.getElementById("group-select");
    if (groupSelect) {
@@ -180,16 +175,13 @@ function init() {
          applyFilter();
       });
    }
-
-   // filter debounced
    const filterInput = document.getElementById("process-filter");
    if (filterInput) {
       filterInput.addEventListener("input", debounce((e) => {
+         void e;
          applyFilter();
       }, 200));
    }
-
-   // toggle user/process — either button switches
    function setMode(newMode) {
       mode = newMode;
       document.querySelectorAll("[data-mode]").forEach(b => b.classList.toggle("active", b.dataset.mode === mode));
@@ -197,13 +189,16 @@ function init() {
    }
    document.getElementById("toggle-mode-process")?.addEventListener("click", () => setMode("process"));
    document.getElementById("toggle-mode-user")?.addEventListener("click", () => setMode("user"));
-   // node tabs — also link to detail on double-click
    const tabs = document.getElementById("node-tabs");
    if (tabs) {
+      if (selectedNode !== "__all") {
+         tabs.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.node === selectedNode));
+      }
       tabs.addEventListener("click", (ev) => {
          const btn = ev.target.closest("[data-node]");
          if (!btn) return;
          selectedNode = btn.dataset.node;
+         try { sessionStorage.setItem("nm:live:node", selectedNode); } catch (_e) {}
          tabs.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b === btn));
          applyFilter();
       });
@@ -213,22 +208,17 @@ function init() {
          window.location.href = "/node/" + encodeURIComponent(btn.dataset.node);
       });
    }
-   // make per-node cards clickable to node detail
    document.getElementById("per-node-cards")?.addEventListener("click", (ev) => {
       const card = ev.target.closest("[data-node]");
       if (card) window.location.href = "/node/" + encodeURIComponent(card.dataset.node);
    });
-
-   // initial from server-rendered initial data if present
    if (window.__INITIAL_DATA__ && window.__INITIAL_DATA__.processes) {
       allProcesses = window.__INITIAL_DATA__.processes;
       applyFilter();
    }
-
-   // poll every 30s
    pollTimer = setInterval(refresh, 30000);
-   // also fetch now to hydrate
    refresh();
+   void pollTimer;
 }
 
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
