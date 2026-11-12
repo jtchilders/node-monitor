@@ -18,7 +18,7 @@ export function colorFor(group, key, index) {
    return PALETTE[djb2(String(key)) % PALETTE.length];
 }
 
-export function aggregateForGroup(processes, group) {
+export function aggregateForGroup(processes, group, weightKey) {
    if (!processes || processes.length === 0) return {groups:[],total:0,capped:false};
    const def = GROUP_DEFS[group];
    const keyFn = def ? def.key : (p) => p[group] || "unknown";
@@ -31,7 +31,10 @@ export function aggregateForGroup(processes, group) {
       b.rss += p.rss_kb || 0;
       b.cpu += p.cpu_seconds || 0;
    }
-   let groups = [...buckets.values()].sort((a,b) => b.count - a.count || b.rss - a.rss);
+   let groups;
+   if (weightKey === "rss") groups = [...buckets.values()].sort((a,b) => b.rss - a.rss || b.count - a.count);
+   else if (weightKey === "cpu") groups = [...buckets.values()].sort((a,b) => b.cpu - a.cpu || b.count - a.count);
+   else groups = [...buckets.values()].sort((a,b) => b.count - a.count || b.rss - a.rss);
    const total = processes.length;
    const maxItems = MAX_SLICES;
    let capped = false;

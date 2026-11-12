@@ -125,6 +125,8 @@ function applyFilter() {
       });
    }
    const agg = aggregateForGroup(filtered, group);
+   const aggRss = aggregateForGroup(filtered, group, "rss");
+   const aggCpu = aggregateForGroup(filtered, group, "cpu");
    const bar = document.getElementById("category-mix");
    if (bar) bar.dataset.total = String(filtered.length);
    const legend = document.getElementById("category-legend");
@@ -219,24 +221,24 @@ function applyFilter() {
    const rssEmptyEl = document.getElementById("rss-empty");
    const cpuCanvasEl = document.getElementById("cpu-canvas");
    const cpuEmptyEl = document.getElementById("cpu-empty");
-   const rssEmpty = !agg.groups || agg.groups.length === 0;
-   const cpuEmpty = rssEmpty;
+   const rssEmpty = !aggRss.groups || aggRss.groups.length === 0;
+   const cpuEmpty = !aggCpu.groups || aggCpu.groups.length === 0;
    if (rssCanvasEl) {
       if (rssEmpty) { rssCanvasEl.hidden = true; if (rssEmptyEl) rssEmptyEl.hidden = false; }
       else { rssCanvasEl.hidden = false; if (rssEmptyEl) rssEmptyEl.hidden = true; }
       if (!rssChart) {
-         rssChart = createResourcePieChart(rssCanvasEl, agg, group, "rss", onSliceClick);
+         rssChart = createResourcePieChart(rssCanvasEl, aggRss, group, "rss", onSliceClick);
       } else {
-         updateResourcePieChart(rssChart, agg, group, "rss");
+         updateResourcePieChart(rssChart, aggRss, group, "rss");
       }
    }
    if (cpuCanvasEl) {
       if (cpuEmpty) { cpuCanvasEl.hidden = true; if (cpuEmptyEl) cpuEmptyEl.hidden = false; }
       else { cpuCanvasEl.hidden = false; if (cpuEmptyEl) cpuEmptyEl.hidden = true; }
       if (!cpuChart) {
-         cpuChart = createResourcePieChart(cpuCanvasEl, agg, group, "cpu", onSliceClick);
+         cpuChart = createResourcePieChart(cpuCanvasEl, aggCpu, group, "cpu", onSliceClick);
       } else {
-         updateResourcePieChart(cpuChart, agg, group, "cpu");
+         updateResourcePieChart(cpuChart, aggCpu, group, "cpu");
       }
    }
 }

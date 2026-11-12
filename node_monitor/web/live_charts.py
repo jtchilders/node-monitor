@@ -57,7 +57,7 @@ GROUP_DEFS = {
 }
 
 
-def aggregate_for_group(processes, group):
+def aggregate_for_group(processes, group, weight_key=None):
    if not processes:
       return {"groups": [], "total": 0, "capped": False}
    buckets = {}
@@ -70,7 +70,12 @@ def aggregate_for_group(processes, group):
       b["count"] += 1
       b["rss"] += p.get("rss_kb") or 0
       b["cpu"] += p.get("cpu_seconds") or 0
-   groups = sorted(buckets.values(), key=lambda g: (-g["count"], -g["rss"]))
+   if weight_key == "rss":
+      groups = sorted(buckets.values(), key=lambda g: (-g["rss"], -g["count"]))
+   elif weight_key == "cpu":
+      groups = sorted(buckets.values(), key=lambda g: (-g["cpu"], -g["count"]))
+   else:
+      groups = sorted(buckets.values(), key=lambda g: (-g["count"], -g["rss"]))
    total = len(processes)
    max_items = MAX_SLICES
    capped = False
