@@ -30,7 +30,7 @@ CATEGORY_COLORS = {
    "other": "#9ca3af",
 }
 
-MAX_SLICES = 8
+MAX_SLICES = 15
 MAX_BARS = 12
 
 

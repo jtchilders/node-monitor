@@ -26,7 +26,7 @@ def test_aggregate_counts_and_sums():
 def test_aggregate_caps_at_12_with_other():
    procs = [{"username": f"u{i}", "rss_kb": 1, "cpu_seconds": 1} for i in range(20)]
    agg = aggregateForGroup(procs, "user")
-   assert len(agg["groups"]) == 8 and agg["groups"][-1]["key"] == "Other" and agg["capped"] is True
+   assert len(agg["groups"]) == 15 and agg["groups"][-1]["key"] == "Other" and agg["capped"] is True
 
 
 def test_colorFor_category_reuses_CATEGORY_COLORS():
@@ -48,7 +48,7 @@ def test_buildPieDataset_uses_text_labels():
 def test_other_bucket_tooltip_includes_group_count():
    procs = [{"username": f"u{i}", "rss_kb": 1, "cpu_seconds": 1} for i in range(30)]
    agg = aggregateForGroup(procs, "user")
-   assert any(g["key"] == "Other" and g["count"] == 23 for g in agg["groups"])
+   assert any(g["key"] == "Other" and g["count"] == 16 for g in agg["groups"])
 
 
 def test_clicking_pie_slice_sets_filter_js_exists(tmp_path=None):
@@ -72,7 +72,7 @@ def test_other_bucket_js_tooltip():
    agg = aggregateForGroup(procs, "user")
    other = next((g for g in agg["groups"] if g["key"] == "Other"), None)
    assert other is not None
-   assert other["count"] == 23
+   assert other["count"] == 16
    from pathlib import Path
 
    js_path = Path(__file__).parents[2] / "node_monitor" / "web" / "static" / "js" / "live_charts.js"
