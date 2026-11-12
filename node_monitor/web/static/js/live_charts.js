@@ -61,3 +61,86 @@ export function buildBarDatasets(agg, group) {
    const backgroundColor = agg.groups.map((g, i) => colorFor(group, g.key, i));
    return {labels, rssData, cpuData, backgroundColor};
 }
+
+export function createPieChart(canvasEl, agg, group) {
+   const ds = buildPieDataset(agg, group);
+   const total = agg.total || ds.data.reduce((a, b) => a + b, 0) || 1;
+   const empty = !agg.groups || agg.groups.length === 0;
+   const pieCanvas = document.getElementById("pie-canvas");
+   const pieEmpty = document.getElementById("pie-empty");
+   if (empty) {
+      if (pieCanvas) pieCanvas.hidden = true;
+      if (pieEmpty) pieEmpty.hidden = false;
+   } else {
+      if (pieCanvas) pieCanvas.hidden = false;
+      if (pieEmpty) pieEmpty.hidden = true;
+   }
+   const ChartCtor = window.Chart;
+   const chart = new ChartCtor(canvasEl, {
+      type: "doughnut",
+      data: {
+         labels: ds.labels,
+         datasets: [{data: ds.data, backgroundColor: ds.backgroundColor}],
+      },
+      options: {
+         responsive: true,
+         cutout: "55%",
+         plugins: {
+            legend: {
+               position: "right",
+               labels: {
+                  generateLabels(chartInstance) {
+                     const ds0 = chartInstance.data.datasets[0] || {data: []};
+                     const lbs = chartInstance.data.labels || [];
+                     return lbs.map((label, i) => ({
+                        text: String(label),
+                        fillStyle: (ds0.backgroundColor && ds0.backgroundColor[i]) || "#9ca3af",
+                        hidden: false,
+                        index: i,
+                     }));
+                  },
+               },
+            },
+            tooltip: {
+               callbacks: {
+                  label(ctx) {
+                     const label = String(ctx.label || "");
+                     const value = ctx.parsed;
+                     const pct = ((value / total) * 100).toFixed(1);
+                     return label + ": " + String(value) + " (" + pct + "%)";
+                  },
+               },
+            },
+         },
+      },
+   });
+   return chart;
+}
+
+export function updatePieChart(chart, agg, group) {
+   const ds = buildPieDataset(agg, group);
+   const total = agg.total || ds.data.reduce((a, b) => a + b, 0) || 1;
+   const empty = !agg.groups || agg.groups.length === 0;
+   const pieCanvas = document.getElementById("pie-canvas");
+   const pieEmpty = document.getElementById("pie-empty");
+   if (empty) {
+      if (pieCanvas) pieCanvas.hidden = true;
+      if (pieEmpty) pieEmpty.hidden = false;
+   } else {
+      if (pieCanvas) pieCanvas.hidden = false;
+      if (pieEmpty) pieEmpty.hidden = true;
+   }
+   // update tooltip total via options
+   if (chart.options.plugins && chart.options.plugins.tooltip && chart.options.plugins.tooltip.callbacks) {
+      chart.options.plugins.tooltip.callbacks.label = function (ctx) {
+         const label = String(ctx.label || "");
+         const value = ctx.parsed;
+         const pct = ((value / total) * 100).toFixed(1);
+         return label + ": " + String(value) + " (" + pct + "%)";
+      };
+   }
+   chart.data.labels = ds.labels;
+   chart.data.datasets[0].data = ds.data;
+   chart.data.datasets[0].backgroundColor = ds.backgroundColor;
+   chart.update();
+}

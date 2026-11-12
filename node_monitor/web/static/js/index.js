@@ -1,6 +1,6 @@
-import { DotsCanvas } from "./dots.js";
 import { ProcessModal } from "./modal.js";
 import { renderProcessTable, filterProcesses } from "./list.js";
+import { aggregateForGroup, createPieChart, updatePieChart } from "./live_charts.js";
 
 const CATEGORY_COLORS = { ai_agent: "#8b5cf6", editor_server: "#06b6d4", jupyter: "#f59e0b", build: "#ef4444", python: "#3b82f6", shell: "#6b7280", data_transfer: "#10b981", fs_scan: "#a3a3a3", scheduler: "#ec4899", workflow: "#14b8a6", system: "#52525b", other: "#9ca3af" };
 
@@ -8,7 +8,8 @@ let allProcesses = [];
 let filtered = [];
 let mode = "process"; // process | user
 let selectedNode = "__all";
-let dotsCanvas = null;
+let group = "category";
+let pieChart = null;
 let pollTimer = null;
 let abortCtrl = null;
 
@@ -60,7 +61,6 @@ async function refresh() {
          }
       }
 
-      // update processes for dots + table (shared filtered set)
       allProcesses = procs.items || [];
       applyFilter();
 
@@ -92,8 +92,6 @@ function applyFilter() {
       base = base.filter(p => (p.label || p.node) === selectedNode || p.node === selectedNode);
    }
    filtered = filterProcesses(base, q);
-   const dotsEl = document.getElementById("dots-container");
-   if (dotsEl && dotsCanvas) dotsCanvas.setProcesses(filtered);
    const tableEl = document.getElementById("process-table-container");
    if (tableEl) {
       renderProcessTable(tableEl, filtered, {
@@ -135,18 +133,31 @@ function applyFilter() {
          }
       }
    }
+   // pie chart
+   const agg = aggregateForGroup(filtered, group);
+   const canvasEl = document.getElementById("pie-canvas");
+   if (canvasEl) {
+      if (!pieChart) {
+         pieChart = createPieChart(canvasEl, agg, group);
+      } else {
+         updatePieChart(pieChart, agg, group);
+      }
+   }
 }
 
 function init() {
-   // init dots canvas
-   const dotsEl = document.getElementById("dots-container");
-   if (dotsEl) {
-      dotsCanvas = new DotsCanvas(dotsEl, {
-         processes: allProcesses,
-         colorBy: "category",
-         sizeBy: "rss",
-         onHover: () => {},
-         onClick: (proc) => ProcessModal.open({ system: proc.system || "polaris", node: proc.node, pid: proc.pid, start_time: proc.start_time }),
+   // restore group from sessionStorage
+   try {
+      const saved = sessionStorage.getItem("nm:live:group");
+      if (saved) group = saved;
+   } catch (_e) {}
+   const groupSelect = document.getElementById("group-select");
+   if (groupSelect) {
+      groupSelect.value = group;
+      groupSelect.addEventListener("change", () => {
+         group = groupSelect.value;
+         try { sessionStorage.setItem("nm:live:group", group); } catch (_e) {}
+         applyFilter();
       });
    }
 
