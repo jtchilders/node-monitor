@@ -115,8 +115,47 @@ function ensureChart(canvasId, config) {
    return chart;
 }
 
+function showEmpty(canvasId, msg = "No data for this range") {
+   const canvas = document.getElementById(canvasId);
+   if (!canvas) return;
+   const wrap = canvas.closest(".chart-wrap");
+   if (!wrap) return;
+   // Destroy existing chart if any so empty message doesn't stack
+   if (CHARTS[canvasId]) {
+      try { CHARTS[canvasId].destroy(); } catch (_e) {}
+      delete CHARTS[canvasId];
+   }
+   let empty = wrap.querySelector(".chart-empty");
+   if (!empty) {
+      empty = document.createElement("div");
+      empty.className = "chart-empty";
+      empty.style.cssText = "position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:0.85rem;text-align:center;padding:1rem;";
+      wrap.style.position = "relative";
+      wrap.appendChild(empty);
+   }
+   empty.textContent = msg;
+   empty.hidden = false;
+   canvas.style.opacity = "0.15";
+}
+
+function hideEmpty(canvasId) {
+   const canvas = document.getElementById(canvasId);
+   if (!canvas) return;
+   const wrap = canvas.closest(".chart-wrap");
+   if (!wrap) return;
+   const empty = wrap.querySelector(".chart-empty");
+   if (empty) empty.hidden = true;
+   canvas.style.opacity = "";
+}
+
 function renderCategoryMix(items) {
    console.debug("[analytics] renderCategoryMix", items.length);
+   if (!items || items.length === 0) {
+      showEmpty("category-mix-chart", "No category data for this range (process_samples empty — collector history not yet populated)");
+      debugStatus("category-mix empty");
+      return;
+   }
+   hideEmpty("category-mix-chart");
    const labels = items.map((it) => it.bucket);
    const allCats = [...new Set(items.flatMap((it) => Object.keys(it.categories || {})))].sort();
    const datasets = allCats.map((cat) => ({
@@ -146,6 +185,16 @@ function renderCategoryMix(items) {
 function renderAgentAdoption(payload) {
    console.debug("[analytics] renderAgentAdoption", payload);
    const items = payload.items || [];
+   if (!items || items.length === 0) {
+      showEmpty("agent-adoption-chart", "No adoption data for this range");
+   } else {
+      hideEmpty("agent-adoption-chart");
+   }
+   if (!payload.tag_share || payload.tag_share.length === 0) {
+      showEmpty("tag-share-chart", "No tag data for this range");
+   } else {
+      hideEmpty("tag-share-chart");
+   }
    const labels = items.map((it) => it.bucket);
    ensureChart("agent-adoption-chart", {
       type: "line",
@@ -206,6 +255,12 @@ function renderAgentAdoption(payload) {
 
 function renderDormancy(items) {
    console.debug("[analytics] renderDormancy", items.length);
+   if (!items || items.length === 0) {
+      showEmpty("dormancy-chart", "No dormancy data for this range");
+      debugStatus("dormancy empty");
+      return;
+   }
+   hideEmpty("dormancy-chart");
    const labels = items.map((it) => it.bucket);
    const allCats = [...new Set(items.flatMap((it) => Object.keys(it.categories || {})))].sort();
    const datasets = allCats.map((cat) => ({
