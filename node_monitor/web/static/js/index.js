@@ -2,6 +2,8 @@ import { DotsCanvas } from "./dots.js";
 import { ProcessModal } from "./modal.js";
 import { renderProcessTable, filterProcesses } from "./list.js";
 
+const CATEGORY_COLORS = { ai_agent: "#8b5cf6", editor_server: "#06b6d4", jupyter: "#f59e0b", build: "#ef4444", python: "#3b82f6", shell: "#6b7280", data_transfer: "#10b981", fs_scan: "#a3a3a3", scheduler: "#ec4899", workflow: "#14b8a6", system: "#52525b", other: "#9ca3af" };
+
 let allProcesses = [];
 let filtered = [];
 let mode = "process"; // process | user
@@ -94,14 +96,45 @@ function applyFilter() {
    if (dotsEl && dotsCanvas) dotsCanvas.setProcesses(filtered);
    const tableEl = document.getElementById("process-table-container");
    if (tableEl) {
-      const items = mode === "process" ? filtered : filtered; // toggle changes grouping, but keep same set for now
-      renderProcessTable(tableEl, items, {
+      renderProcessTable(tableEl, filtered, {
+         mode,
          onRowClick: (proc) => ProcessModal.open({ system: proc.system || "polaris", node: proc.node, pid: proc.pid, start_time: proc.start_time }),
       });
    }
-   // category bar update: sum = filtered length
+   // category bar + legend: recompute from filtered
    const bar = document.getElementById("category-mix");
    if (bar) bar.dataset.total = String(filtered.length);
+   const counts = {};
+   for (const p of filtered) counts[p.category || "other"] = (counts[p.category || "other"] || 0) + 1;
+   const legend = document.getElementById("category-legend");
+   if (legend) {
+      legend.textContent = "";
+      const total = filtered.length || 1;
+      for (const [cat, cnt] of Object.entries(counts).sort((a,b) => b[1]-a[1])) {
+         const span = document.createElement("span");
+         span.className = "legend-item";
+         const box = document.createElement("i");
+         box.className = "color-box";
+         box.style.background = CATEGORY_COLORS[cat] || "#9ca3af";
+         span.appendChild(box);
+         span.appendChild(document.createTextNode(" " + cat + " " + cnt));
+         legend.appendChild(span);
+      }
+      // update category bar segments
+      const catBar = bar?.querySelector(".category-bar");
+      if (catBar) {
+         catBar.textContent = "";
+         for (const [cat, cnt] of Object.entries(counts)) {
+            const seg = document.createElement("div");
+            seg.className = "category-seg";
+            seg.dataset.category = cat;
+            seg.dataset.count = String(cnt);
+            seg.style.width = ((cnt * 100 / total) + "%");
+            seg.style.background = CATEGORY_COLORS[cat] || "#9ca3af";
+            catBar.appendChild(seg);
+         }
+      }
+   }
 }
 
 function init() {
@@ -125,16 +158,14 @@ function init() {
       }, 200));
    }
 
-   // toggle user/process
-   const toggle = document.getElementById("toggle-mode");
-   if (toggle) {
-      toggle.addEventListener("click", () => {
-         mode = mode === "process" ? "user" : "process";
-         toggle.textContent = mode === "process" ? "Toggle to user" : "Toggle to process";
-         toggle.dataset.mode = mode;
-         applyFilter();
-      });
+   // toggle user/process — either button switches
+   function setMode(newMode) {
+      mode = newMode;
+      document.querySelectorAll("[data-mode]").forEach(b => b.classList.toggle("active", b.dataset.mode === mode));
+      applyFilter();
    }
+   document.getElementById("toggle-mode-process")?.addEventListener("click", () => setMode("process"));
+   document.getElementById("toggle-mode-user")?.addEventListener("click", () => setMode("user"));
    // node tabs — also link to detail on double-click
    const tabs = document.getElementById("node-tabs");
    if (tabs) {

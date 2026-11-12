@@ -37,7 +37,29 @@ const HEADERS = [
    { label: "Command", key: null, val: null },
 ];
 
+const USER_HEADERS = [
+   { label: "User", key: "user", val: (r) => r.username || "" },
+   { label: "Procs", key: "procs", val: (r) => r.count ?? 0 },
+   { label: "RSS", key: "rss", val: (r) => r.rss_kb ?? -1 },
+   { label: "CPU", key: "cpu", val: (r) => r.cpu_seconds ?? -1 },
+   { label: "Nodes", key: null, val: null },
+];
+
+function aggregateByUser(processes) {
+   const m = new Map();
+   for (const p of processes) {
+      const u = p.username || "unknown";
+      let a = m.get(u);
+      if (!a) m.set(u, a = { username: u, count: 0, rss_kb: 0, cpu_seconds: 0, nodes: new Set() });
+      a.count += 1; a.rss_kb += p.rss_kb || 0; a.cpu_seconds += p.cpu_seconds || 0;
+      if (p.node || p.label) a.nodes.add(p.node || p.label);
+   }
+   for (const a of m.values()) a.nodes = [...a.nodes].join(", ");
+   return [...m.values()];
+}
+
 export function renderProcessTable(container, processes, opts = {}) {
+   if (opts.mode === "user") return renderUserTable(container, processes, opts);
    const onRowClick = opts.onRowClick || null;
    container.textContent = "";
 
@@ -131,6 +153,56 @@ export function filterProcesses(processes, query) {
          (p.node && p.node.toLowerCase().includes(q))
       );
    });
+}
+
+function renderUserTable(container, processes, opts = {}) {
+   const onRowClick = opts.onRowClick || null;
+   container.textContent = "";
+   const rows = aggregateByUser(processes);
+   if (!rows.length) {
+      const empty = document.createElement("div");
+      empty.style.cssText = "padding:1rem; text-align:center; color:var(--text-dim);";
+      empty.textContent = "No processes to display";
+      container.appendChild(empty); return;
+   }
+   let _uKey = _sortKey;
+   if (!USER_HEADERS.some(x => x.key === _uKey)) { _uKey = "rss"; _sortKey = "rss"; _sortDesc = true; }
+   const sorted = [...rows].sort((a,b) => {
+      const h = USER_HEADERS.find(x => x.key === _uKey);
+      if (!h?.val) return 0;
+      const av = h.val(a), bv = h.val(b);
+      const cmp = typeof av === "number" && typeof bv === "number" ? av-bv : String(av).localeCompare(String(bv));
+      return _sortDesc ? -cmp : cmp;
+   });
+   const table = document.createElement("table");
+   table.className = "jobs-table";
+   const thead = document.createElement("thead");
+   const hr = document.createElement("tr");
+   for (const h of USER_HEADERS) {
+      const th = document.createElement("th");
+      th.textContent = h.label;
+      if (h.key) {
+         th.style.cursor = "pointer";
+         if (h.key === _sortKey) { th.textContent += _sortDesc ? " ▼" : " ▲"; th.style.color = "var(--text-color)"; }
+         th.addEventListener("click", () => {
+            if (_sortKey === h.key) _sortDesc = !_sortDesc; else { _sortKey = h.key; _sortDesc = true; }
+            // pass mode through so next render stays in user view
+            renderUserTable(container, processes, { ...opts, mode: "user" });
+         });
+      }
+      hr.appendChild(th);
+   }
+   thead.appendChild(hr); table.appendChild(thead);
+   const tbody = document.createElement("tbody");
+   for (const r of sorted) {
+      const tr = document.createElement("tr");
+      tr.style.cursor = "pointer";
+      tr.addEventListener("click", () => { window.location.href = "/user/" + encodeURIComponent(r.username); });
+      const cells = [r.username, String(r.count), formatRss(r.rss_kb), String(Math.round(r.cpu_seconds)), r.nodes];
+      for (const v of cells) { const td = document.createElement("td"); td.textContent = v; tr.appendChild(td); }
+      tbody.appendChild(tr);
+   }
+   table.appendChild(tbody); container.appendChild(table);
 }
 
 export default { renderProcessTable, filterProcesses, formatRss, formatIdle };
