@@ -85,9 +85,9 @@ def test_empty_filter_shows_empty_state(tmp_path):
    # a11y: empty divs role=status and canvases role=img with aria-label
    assert 'role="status"' in html
    assert 'role="img"' in html
-   assert html.count('aria-label') >= 3
+   assert html.count("aria-label") >= 3
    # select has aria-label
-   assert 'id="group-select"' in html and 'aria-label' in html
+   assert 'id="group-select"' in html and "aria-label" in html
 
 
 def test_group_persists_in_sessionStorage(tmp_path):
