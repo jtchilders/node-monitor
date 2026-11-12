@@ -121,6 +121,47 @@ def build_bar_datasets(agg, group):
    }
 
 
+def build_resource_pie_dataset(agg, group, weight_key):
+   if not agg or not agg.get("groups"):
+      return {"labels": [], "data": [], "backgroundColor": []}
+   labels = [str(g["key"]) for g in agg["groups"]]
+   if weight_key == "rss":
+      data = [g.get("rss") or 0 for g in agg["groups"]]
+   elif weight_key == "cpu":
+      data = [g.get("cpu") or 0 for g in agg["groups"]]
+   else:
+      data = [g.get("count") or 0 for g in agg["groups"]]
+   background_color = [color_for(group, g["key"], i) for i, g in enumerate(agg["groups"])]
+   return {"labels": labels, "data": data, "backgroundColor": background_color}
+
+
+def format_resource_label(total_used, total_available, kind):
+   if kind == "memory":
+      # reuse fmt logic
+      def _fmt(kb):
+         if kb is None:
+            return "-"
+         if kb < 1024:
+            return f"{kb} KiB"
+         mib = kb / 1024
+         if mib < 1024:
+            return f"{mib:.1f} MiB"
+         return f"{mib / 1024:.1f} GiB"
+
+      used_str = _fmt(total_used or 0)
+      avail_str = _fmt(total_available or 0)
+      pct = 0
+      if total_available and total_available > 0:
+         pct = round((total_used or 0) / total_available * 100)
+      return f"{used_str} used of {avail_str} ({pct}%)"
+   if kind == "cpu":
+      return f"{round(total_used or 0)}s CPU"
+   return str(total_used or 0)
+
+
+buildResourcePieDataset = build_resource_pie_dataset
+formatResourceLabel = format_resource_label
+
 # snake_case aliases matching test imports if needed
 aggregateForGroup = aggregate_for_group
 colorFor = color_for

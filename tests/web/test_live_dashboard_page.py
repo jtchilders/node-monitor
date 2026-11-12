@@ -1,6 +1,8 @@
 """Task 2: pie breakdown — test index page has pie canvas and group select.
 Task 4: layout restructure — dashboard on top, process list below."""
 
+import pathlib
+
 import yaml
 from fastapi.testclient import TestClient
 
@@ -105,3 +107,77 @@ def test_group_persists_in_sessionStorage(tmp_path):
    client = _client(tmp_path)
    html = client.get("/").text
    assert 'aria-label="Group by"' in html or 'aria-label="Group by' in html
+
+
+def test_legend_text_is_white_readable(tmp_path):
+   import re
+   from pathlib import Path
+
+   client = _client(tmp_path)
+   html = client.get("/").text
+   css_path = Path(__file__).parents[2] / "node_monitor/web/static/css/dashboard.css"
+   css = css_path.read_text()
+   assert "legend-item" in css
+   assert "legend-item" in html or "category-legend" in html
+   m = re.search(r"\.legend-item\s*\{[^}]*\}", css, re.S)
+   assert m, "no .legend-item rule found"
+   block = m.group(0)
+   assert "color" in block.lower(), "legend-item missing color property"
+   assert any(c in block for c in ("#e2e8f0", "var(--text-color)", "#fff", "white")), (
+      "legend-item color not white-readable"
+   )
+
+
+def test_health_strip_color_coded(tmp_path):
+   from pathlib import Path
+
+   client = _client(tmp_path)
+   html = client.get("/").text
+   assert 'id="health-strip"' in html
+   assert any(
+      x in html
+      for x in (
+         "freshness-indicator green",
+         "freshness-indicator red",
+         "freshness-indicator yellow",
+      )
+   ), "SSR health-strip missing green/red/yellow class"
+   js_path = Path(__file__).parents[2] / "node_monitor/web/static/js/index.js"
+   js = js_path.read_text()
+   assert "freshness-indicator" in js
+   assert "green" in js.lower()
+   assert "red" in js.lower()
+   assert "heartbeat_age_s" in js
+   assert "disconnected" in js.lower() or "yellow" in js.lower()
+
+
+def test_group_select_inside_node_tabs(tmp_path):
+   client = _client(tmp_path)
+   html = client.get("/").text
+   assert (
+      html.index('id="node-tabs"')
+      < html.index('id="group-select"')
+      < html.index('id="live-dashboard"')
+   )  # noqa: E501
+
+
+def test_process_table_scrollable(tmp_path):
+   from pathlib import Path
+
+   html = _client(tmp_path).get("/").text  # noqa: F841
+   css = (Path(__file__).parents[2] / "node_monitor/web/static/css/dashboard.css").read_text()
+   assert "process-table-container" in css and ("max-height" in css or "45vh" in css)
+
+
+def test_resource_pies_present(tmp_path):
+   html = _client(tmp_path).get("/").text
+   assert 'id="rss-total"' in html and 'id="cpu-total"' in html
+   assert 'id="rss-canvas"' in html and 'role="img"' in html
+   css_path = pathlib.Path(__file__).parents[2] / "node_monitor/web/static/css/dashboard.css"
+   css = css_path.read_text()
+   assert "resource-total" in css
+   js_path2 = pathlib.Path(__file__).parents[2] / "node_monitor/web/static/js/index.js"
+   js = js_path2.read_text()
+   assert "rss-total" in js and "cpu-total" in js
+   assert "buildResourcePieDataset" in js or "createResourcePieChart" in js
+

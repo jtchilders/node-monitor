@@ -7,7 +7,7 @@
 <header class="header-bar">
    <div class="header-left">
       <h1>Polaris Login Nodes</h1>
-      <div class="freshness-indicator" id="health-strip" data-heartbeat-age="{{ heartbeat_age_s if heartbeat_age_s is not none else '' }}" data-ok="{{ ok }}">
+      <div class="freshness-indicator {% if ok %}green{% else %}red{% endif %}" id="health-strip" data-heartbeat-age="{{ heartbeat_age_s if heartbeat_age_s is not none else '' }}" data-ok="{{ ok }}">
          <span class="dot"></span>
          <span id="health-text">
          {% if heartbeat_age_s is not none %}heartbeat {{ heartbeat_age_s }}s ago{% if heartbeat_state %} — {{ heartbeat_state }}{% endif %}{% else %}no heartbeat{% endif %}
@@ -24,9 +24,10 @@
    </div>
 </header>
 
-<div id="node-tabs" class="tab-bar" style="background:var(--panel-bg); border-bottom:1px solid var(--accent-border); padding:0.25rem 1rem;">
+<div id="node-tabs" class="tab-bar" style="background:var(--panel-bg); border-bottom:1px solid var(--accent-border); padding:0.25rem 1rem; display:flex; align-items:center; gap:0.5rem;">
    <button class="tab-btn active" data-node="__all">All nodes</button>
    {% for n in nodes %}<button class="tab-btn" data-node="{{ n.label }}">{{ n.label }}</button>{% endfor %}
+   <select id="group-select" aria-label="Group by" style="margin-left:auto"><option value="category" selected>Category</option><option value="activity">Activity</option><option value="user">User</option><option value="node">Node</option><option value="presence">Presence</option></select>
 </div>
 
 <div id="category-mix" class="canvas-container" style="padding:0; background:var(--panel-bg);">
@@ -39,10 +40,12 @@
 <div class="legend" id="category-legend" style="padding:0.5rem 1rem; background:var(--panel-bg); border-bottom:1px solid var(--accent-border);">
 {% for cat, cnt in category_counts.items() %}
    <span class="legend-item"><i class="color-box" style="background: {{ category_colors[cat] if cat in category_colors else '#9ca3af' }}"></i>{{ cat }} {{ cnt }}</span>
+{% else %}
+   <span class="legend-item"><i class="color-box" style="background: #9ca3af"></i>No data</span>
 {% endfor %}
 </div>
 
-<div id="live-dashboard" class="dashboard-grid" aria-live="polite"><div class="dashboard-card" id="pie-card"><div class="panel-header"><h2>Breakdown</h2><select id="group-select" aria-label="Group by"><option value="category" selected>Category</option><option value="activity">Activity</option><option value="user">User</option><option value="node">Node</option><option value="presence">Presence</option></select></div><canvas id="pie-canvas" role="img" aria-label="Process breakdown pie chart"></canvas><div id="pie-empty" hidden role="status">No processes match filter</div></div><div class="dashboard-card" id="rss-card"><h3>Memory (RSS)</h3><canvas id="rss-canvas" role="img" aria-label="Memory usage by group"></canvas><div id="rss-empty" hidden role="status">No processes</div></div><div class="dashboard-card" id="cpu-card"><h3>CPU time</h3><canvas id="cpu-canvas" role="img" aria-label="CPU time by group"></canvas><div id="cpu-empty" hidden role="status">No processes</div></div></div>
+<div id="live-dashboard" class="dashboard-grid" aria-live="polite"><div class="dashboard-card" id="pie-card"><div class="panel-header"><h2>Breakdown</h2></div><canvas id="pie-canvas" role="img" aria-label="Process breakdown pie chart"></canvas><div id="pie-empty" hidden role="status">No processes match filter</div></div><div class="dashboard-card" id="rss-card"><h3>Memory (RSS)</h3><div class="resource-total" id="rss-total" style="font-size:0.75rem; color:var(--text-dim); text-align:center; padding:0.25rem 0;"></div><canvas id="rss-canvas" role="img" aria-label="Memory usage by group"></canvas><div id="rss-empty" hidden role="status">No processes</div></div><div class="dashboard-card" id="cpu-card"><h3>CPU time</h3><div class="resource-total" id="cpu-total" style="font-size:0.75rem; color:var(--text-dim); text-align:center; padding:0.25rem 0;"></div><canvas id="cpu-canvas" role="img" aria-label="CPU time by group"></canvas><div id="cpu-empty" hidden role="status">No processes</div></div></div>
 
 <main class="main-content">
    <section class="panel jobs-panel" style="margin:1rem;">

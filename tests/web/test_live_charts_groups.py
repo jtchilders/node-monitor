@@ -94,3 +94,34 @@ def test_clicking_pie_slice_sets_filter():
    assert "onSliceClick" in idx_js
    # clicking Other clears filter (sets empty string)
    assert '""' in idx_js or "''" in idx_js
+def test_buildResourcePieDataset_weights_by_rss():
+   from node_monitor.web.live_charts import buildResourcePieDataset
+
+   procs = [
+      {"category": "a", "rss_kb": 100, "cpu_seconds": 1},
+      {"category": "b", "rss_kb": 900, "cpu_seconds": 9},
+   ]
+   agg = aggregateForGroup(procs, "category")
+   ds = buildResourcePieDataset(agg, "category", "rss")
+   # b has larger rss; counts equal so sorted by rss desc => b first
+   # So data[0] should be 900 for b
+   assert ds["data"][0] == 900
+   ds_cpu = buildResourcePieDataset(agg, "category", "cpu")
+   assert ds_cpu["data"][0] == 9
+
+
+def test_formatResourceLabel_memory():
+   from node_monitor.web.live_charts import formatResourceLabel
+
+   label = formatResourceLabel(4096 * 1024, 64 * 1024 * 1024, "memory")
+   assert "GiB" in label
+   assert "used of" in label
+
+
+def test_buildResourcePieDataset_empty():
+   from node_monitor.web.live_charts import buildResourcePieDataset
+
+   agg = {"groups": [], "total": 0, "capped": False}
+   ds = buildResourcePieDataset(agg, "category", "rss")
+   assert ds["labels"] == [] and ds["data"] == []
+

@@ -153,6 +153,89 @@ export function createPieChart(canvasEl, agg, group, onSliceClick) {
    return chart;
 }
 
+export function buildResourcePieDataset(agg, group, weightKey) {
+   if (!agg || !agg.groups || agg.groups.length === 0) return {labels: [], data: [], backgroundColor: []};
+   const labels = agg.groups.map((g) => String(g.key));
+   const data = agg.groups.map((g) => {
+      if (weightKey === "rss") return g.rss || 0;
+      if (weightKey === "cpu") return g.cpu || 0;
+      return g.count || 0;
+   });
+   const backgroundColor = agg.groups.map((g, i) => colorFor(group, g.key, i));
+   return {labels, data, backgroundColor};
+}
+
+export function formatResourceLabel(totalUsed, totalAvailable, kind) {
+   if (kind === "memory") {
+      const usedStr = fmtRss(totalUsed || 0);
+      const availStr = fmtRss(totalAvailable || 0);
+      let pct = 0;
+      if (totalAvailable && totalAvailable > 0) pct = Math.round((totalUsed / totalAvailable) * 100);
+      return usedStr + " used of " + availStr + " (" + String(pct) + "%)";
+   }
+   if (kind === "cpu") {
+      const secs = Math.round(totalUsed || 0);
+      return String(secs) + "s CPU";
+   }
+   return String(totalUsed || 0);
+}
+
+export function createResourcePieChart(canvasEl, agg, group, weightKey, onSliceClick) {
+   const ds = buildResourcePieDataset(agg, group, weightKey);
+   const empty = !agg.groups || agg.groups.length === 0;
+   // hide/show handled by caller via rss/cpu empty divs, but also hide canvas if empty
+   const ChartCtor = window.Chart;
+   const chart = new ChartCtor(canvasEl, {
+      type: "doughnut",
+      data: {labels: ds.labels, datasets: [{data: ds.data, backgroundColor: ds.backgroundColor}]},
+      options: {
+         responsive: true,
+         cutout: "55%",
+         onClick(_evt, elements) {
+            if (!onSliceClick || !elements || elements.length === 0) return;
+            const idx = elements[0].index;
+            const curAgg = chart._nmAgg || agg;
+            const key = (curAgg.groups[idx] && curAgg.groups[idx].key) || chart.data.labels[idx];
+            onSliceClick(String(key));
+         },
+         plugins: {
+            legend: {position: "right", labels: {generateLabels(chartInstance) {
+               const ds0 = chartInstance.data.datasets[0] || {data: []};
+               const lbs = chartInstance.data.labels || [];
+               return lbs.map((label, i) => ({text: String(label), fillStyle: (ds0.backgroundColor && ds0.backgroundColor[i]) || "#9ca3af", hidden: false, index: i}));
+            }}},
+            tooltip: {callbacks: {label(ctx) {
+               const label = String(ctx.label || "");
+               const value = ctx.parsed;
+               const curAgg = chart._nmAgg || agg;
+               const total = ds.data.reduce((a,b) => a+b, 0) || 1;
+               // enrich Other tooltip if capped
+               if (label === "Other" && curAgg && curAgg.capped) {
+                  const otherEntry = curAgg.groups.find((g) => g.key === "Other");
+                  const groupCount = (otherEntry && otherEntry.groupCount) || 0;
+                  return "Other (" + String(groupCount) + " groups): " + String(value) + " (" + ((value/total)*100).toFixed(1) + "%)";
+               }
+               return label + ": " + String(value) + " (" + ((value/total)*100).toFixed(1) + "%)";
+            }}},
+         },
+      },
+   });
+   chart._nmAgg = agg;
+   chart._nmOnSliceClick = onSliceClick;
+   chart._nmWeightKey = weightKey;
+   return chart;
+}
+
+export function updateResourcePieChart(chart, agg, group, weightKey) {
+   const ds = buildResourcePieDataset(agg, group, weightKey);
+   chart._nmAgg = agg;
+   chart._nmWeightKey = weightKey;
+   chart.data.labels = ds.labels;
+   chart.data.datasets[0].data = ds.data;
+   chart.data.datasets[0].backgroundColor = ds.backgroundColor;
+   chart.update();
+}
+
 export function fmtRss(kb) {
    if (kb == null) return "-";
    if (kb < 1024) return kb + " KiB";
