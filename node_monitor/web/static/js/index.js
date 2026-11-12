@@ -1,6 +1,6 @@
 import { ProcessModal } from "./modal.js";
 import { renderProcessTable, filterProcesses } from "./list.js";
-import { GROUP_DEFS, CATEGORY_COLORS, aggregateForGroup, createPieChart, updatePieChart, createBarChart, updateBarChart, colorFor, buildResourcePieDataset, formatResourceLabel, createResourcePieChart, updateResourcePieChart } from "./live_charts.js";
+import { GROUP_DEFS, CATEGORY_COLORS, aggregateForGroup, createPieChart, updatePieChart, createBarChart, updateBarChart, colorFor, buildResourcePieDataset, formatResourceLabel, createResourcePieChart, updateResourcePieChart, aggregateByNode, createNodeBarChart, updateNodeBarChart } from "./live_charts.js";
 
 let allProcesses = [];
 let filtered = [];
@@ -10,6 +10,9 @@ let group = "category";
 let pieChart = null;
 let rssChart = null;
 let cpuChart = null;
+let pieNodeBar = null;
+let rssNodeBar = null;
+let cpuNodeBar = null;
 let pollTimer = null;
 let abortCtrl = null;
 let nodeCaps = {};
@@ -239,6 +242,47 @@ function applyFilter() {
          cpuChart = createResourcePieChart(cpuCanvasEl, aggCpu, group, "cpu", onSliceClick);
       } else {
          updateResourcePieChart(cpuChart, aggCpu, group, "cpu");
+      }
+   }
+   function onNodeBarClick(nodeKey) {
+      const tabs = document.getElementById("node-tabs");
+      selectedNode = nodeKey;
+      try { sessionStorage.setItem("nm:live:node", selectedNode); } catch (_e) {}
+      if (tabs) tabs.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.node === selectedNode));
+      applyFilter();
+   }
+   const baseForNodeBars = filterProcesses(allProcesses, q);
+   const groupsCountByNode = aggregateByNode(baseForNodeBars, "count");
+   const groupsRssByNode = aggregateByNode(baseForNodeBars, "rss");
+   const groupsCpuByNode = aggregateByNode(baseForNodeBars, "cpu");
+   const pieNodeBarEl = document.getElementById("pie-node-bar");
+   if (pieNodeBarEl) {
+      const wrap = pieNodeBarEl.closest(".node-bar-wrap");
+      if (groupsCountByNode.length === 0) { if (wrap) wrap.hidden = true; }
+      else {
+         if (wrap) wrap.hidden = false;
+         if (!pieNodeBar) pieNodeBar = createNodeBarChart(pieNodeBarEl, groupsCountByNode, "count", onNodeBarClick);
+         else updateNodeBarChart(pieNodeBar, groupsCountByNode, "count");
+      }
+   }
+   const rssNodeBarEl = document.getElementById("rss-node-bar");
+   if (rssNodeBarEl) {
+      const wrap = rssNodeBarEl.closest(".node-bar-wrap");
+      if (groupsRssByNode.length === 0) { if (wrap) wrap.hidden = true; }
+      else {
+         if (wrap) wrap.hidden = false;
+         if (!rssNodeBar) rssNodeBar = createNodeBarChart(rssNodeBarEl, groupsRssByNode, "rss", onNodeBarClick);
+         else updateNodeBarChart(rssNodeBar, groupsRssByNode, "rss");
+      }
+   }
+   const cpuNodeBarEl = document.getElementById("cpu-node-bar");
+   if (cpuNodeBarEl) {
+      const wrap = cpuNodeBarEl.closest(".node-bar-wrap");
+      if (groupsCpuByNode.length === 0) { if (wrap) wrap.hidden = true; }
+      else {
+         if (wrap) wrap.hidden = false;
+         if (!cpuNodeBar) cpuNodeBar = createNodeBarChart(cpuNodeBarEl, groupsCpuByNode, "cpu", onNodeBarClick);
+         else updateNodeBarChart(cpuNodeBar, groupsCpuByNode, "cpu");
       }
    }
 }

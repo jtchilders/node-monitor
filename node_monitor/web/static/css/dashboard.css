@@ -1296,6 +1296,24 @@ canvas {
    border-bottom-color: transparent;
    border-top-color: #334155;
 }
+.node-bar-wrap {
+   margin-top: 0.75rem;
+   border-top: 1px solid #1e293b;
+   padding-top: 0.5rem;
+}
+.node-bar-title {
+   font-size: 0.68rem;
+   font-weight: 600;
+   text-transform: uppercase;
+   letter-spacing: 0.05em;
+   color: var(--text-dim);
+   text-align: center;
+   margin-bottom: 0.3rem;
+}
+.node-bar-canvas-wrap {
+   height: 140px;
+   position: relative;
+}
 
 @media (max-width: 640px) {
    .dashboard-grid { grid-template-columns: 1fr; }

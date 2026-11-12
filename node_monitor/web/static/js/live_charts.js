@@ -381,3 +381,105 @@ export function updatePieChart(chart, agg, group) {
    chart.data.datasets[0].backgroundColor = ds.backgroundColor;
    chart.update();
 }
+
+export function aggregateByNode(processes, sortBy) {
+   if (!processes || processes.length === 0) return [];
+   const buckets = new Map();
+   for (const p of processes) {
+      const k = p.label || p.node || "unknown";
+      let b = buckets.get(k);
+      if (!b) { b = {key: k, count: 0, rss: 0, cpu: 0}; buckets.set(k, b); }
+      b.count += 1;
+      b.rss += p.rss_kb || 0;
+      b.cpu += p.cpu_seconds || 0;
+   }
+   let groups = [...buckets.values()];
+   if (sortBy === "rss") groups.sort((a,b) => b.rss - a.rss || b.count - a.count);
+   else if (sortBy === "cpu") groups.sort((a,b) => b.cpu - a.cpu || b.count - a.count);
+   else groups.sort((a,b) => b.count - a.count || b.rss - a.rss);
+   return groups;
+}
+
+export function buildNodeBarDataset(groups, metric) {
+   const labels = groups.map((g) => String(g.key));
+   const data = groups.map((g) => {
+      if (metric === "rss") return g.rss || 0;
+      if (metric === "cpu") return g.cpu || 0;
+      return g.count || 0;
+   });
+   const backgroundColor = groups.map((g) => colorFor("node", g.key, 0));
+   return {labels, data, backgroundColor};
+}
+
+export function createNodeBarChart(canvasEl, groups, metric, onBarClick) {
+   const ds = buildNodeBarDataset(groups, metric);
+   const ChartCtor = window.Chart;
+   const chart = new ChartCtor(canvasEl, {
+      type: "bar",
+      data: {labels: ds.labels, datasets: [{data: ds.data, backgroundColor: ds.backgroundColor, borderWidth: 1, borderColor: "#1e293b"}]},
+      options: {
+         responsive: true,
+         maintainAspectRatio: false,
+         indexAxis: "y",
+         scales: {
+            x: {
+               beginAtZero: true,
+               ticks: {
+                  color: "#94a3b8",
+                  callback(value) {
+                     if (metric === "rss") return fmtRss(value);
+                     if (metric === "cpu") return String(Math.round(value)) + "s";
+                     return String(value);
+                  },
+               },
+               grid: {color: "#1e293b"},
+            },
+            y: {
+               ticks: {
+                  color: "#e2e8f0",
+                  callback(value, index) {
+                     const c = chart;
+                     const labels = (c && c.data && c.data.labels) || [];
+                     const lbl = String(labels[index] || value);
+                     return lbl.length > 16 ? lbl.slice(0, 16) + "…" : lbl;
+                  },
+               },
+               grid: {display: false},
+            },
+         },
+         plugins: {
+            legend: {display: false},
+            tooltip: {
+               callbacks: {
+                  label(ctx) {
+                     const label = String(ctx.label || "");
+                     const val = ctx.parsed.x;
+                     if (metric === "rss") return label + ": " + fmtRss(val);
+                     if (metric === "cpu") return label + ": " + String(Math.round(val)) + "s";
+                     return label + ": " + String(val);
+                  },
+               },
+            },
+         },
+         onClick(_evt, elements) {
+            if (!onBarClick || !elements || elements.length === 0) return;
+            const idx = elements[0].index;
+            const key = chart.data.labels[idx];
+            onBarClick(String(key));
+         },
+      },
+   });
+   chart._nmGroups = groups;
+   chart._nmMetric = metric;
+   return chart;
+}
+
+export function updateNodeBarChart(chart, groups, metric) {
+   const ds = buildNodeBarDataset(groups, metric);
+   chart._nmGroups = groups;
+   chart._nmMetric = metric;
+   chart.data.labels = ds.labels;
+   chart.data.datasets[0].data = ds.data;
+   chart.data.datasets[0].backgroundColor = ds.backgroundColor;
+   chart.update();
+}

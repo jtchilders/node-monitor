@@ -174,6 +174,41 @@ def format_resource_label(total_used, total_available, kind):
    return str(total_used or 0)
 
 
+def aggregate_by_node(processes, sort_by=None):
+   if not processes:
+      return []
+   buckets = {}
+   for p in processes:
+      k = p.get("label") or p.get("node") or "unknown"
+      b = buckets.get(k)
+      if b is None:
+         buckets[k] = {"key": k, "count": 0, "rss": 0, "cpu": 0}
+         b = buckets[k]
+      b["count"] += 1
+      b["rss"] += p.get("rss_kb") or 0
+      b["cpu"] += p.get("cpu_seconds") or 0
+   groups = list(buckets.values())
+   if sort_by == "rss":
+      groups.sort(key=lambda g: (-g["rss"], -g["count"]))
+   elif sort_by == "cpu":
+      groups.sort(key=lambda g: (-g["cpu"], -g["count"]))
+   else:
+      groups.sort(key=lambda g: (-g["count"], -g["rss"]))
+   return groups
+
+
+def build_node_bar_dataset(groups, metric):
+   labels = [str(g["key"]) for g in groups]
+   if metric == "rss":
+      data = [g.get("rss") or 0 for g in groups]
+   elif metric == "cpu":
+      data = [g.get("cpu") or 0 for g in groups]
+   else:
+      data = [g.get("count") or 0 for g in groups]
+   background_color = [color_for("node", g["key"], 0) for g in groups]
+   return {"labels": labels, "data": data, "backgroundColor": background_color}
+
+
 buildResourcePieDataset = build_resource_pie_dataset
 formatResourceLabel = format_resource_label
 
@@ -182,3 +217,5 @@ aggregateForGroup = aggregate_for_group
 colorFor = color_for
 buildPieDataset = build_pie_dataset
 buildBarDatasets = build_bar_datasets
+aggregateByNode = aggregate_by_node
+buildNodeBarDataset = build_node_bar_dataset
